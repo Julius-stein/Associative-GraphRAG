@@ -1,0 +1,17 @@
+"""Minimal logging helpers for long-running retrieval / generation jobs."""
+
+from datetime import datetime
+
+
+def log(message):
+    """Print a timestamped log line that is easy to scan in terminal runs."""
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"[{timestamp}] {message}", flush=True)
+
+
+def shorten(text, limit=120):
+    """Collapse whitespace and trim long previews for logs and debug output."""
+    text = " ".join(str(text).split())
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."

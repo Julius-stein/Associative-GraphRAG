@@ -1041,6 +1041,7 @@ def _build_theme_groups(query, root_regions, bridge_regions, theme_regions, chun
 def build_answer_facet_groups(
     *,
     query,
+    query_contract=None,
     root_chunk_ids,
     graph,
     final_nodes,
@@ -1055,7 +1056,7 @@ def build_answer_facet_groups(
     group_limit,
 ):
     """Build one-contract-only facet groups from the final subgraph."""
-    contract = detect_query_contract(query)
+    contract = query_contract or detect_query_contract(query)
     root_regions, bridge_regions, theme_regions = collect_overlapping_regions(
         query=query,
         root_chunk_ids=root_chunk_ids,

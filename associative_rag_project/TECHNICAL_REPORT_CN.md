@@ -1,6 +1,12 @@
-# Associative RAG 项目技术报告（中文，当前代码版）
+# Associative RAG 技术报告（算法实现版）
 
-对应的主要文件如下：
+本文只描述当前代码怎样运行，不讨论方案取舍。重点是：
+
+- 输入数据如何进入系统
+- 每一步生成什么中间结构
+- 每个关键函数的候选构造、过滤、排序和输出
+
+相关代码：
 
 - [main.py](/Users/Admin/projects/Association/associative_rag_project/main.py)
 - [pipeline.py](/Users/Admin/projects/Association/associative_rag_project/pipeline.py)
@@ -9,727 +15,1275 @@
 - [organization.py](/Users/Admin/projects/Association/associative_rag_project/organization.py)
 - [context.py](/Users/Admin/projects/Association/associative_rag_project/context.py)
 - [llm_client.py](/Users/Admin/projects/Association/associative_rag_project/llm_client.py)
-- [judge.py](/Users/Admin/projects/Association/associative_rag_project/judge.py)
 - [data.py](/Users/Admin/projects/Association/associative_rag_project/data.py)
-- [config.py](/Users/Admin/projects/Association/associative_rag_project/config.py)
 
-## 1. 系统目标
+## 1. 主调用链
 
-当前系统面向 Query-Focused Summarization。核心目标不是做开放式长回答，而是：
+CLI 在 [main.py](/Users/Admin/projects/Association/associative_rag_project/main.py)。
 
-1. 从 corpus 中找出与 query 最相关的原始 chunk。
-2. 将这些 chunk 投影到图结构中，形成 grounded roots。
-3. 在图和 provenance 两条结构上做联想扩展，尽量把相关证据带展开。
-4. 将最终子图组织成适合回答当前 query 的 facet groups。
-5. 将 facet groups 和 source chunks 打包成 evidence package。
-6. 让生成模型基于 evidence package 写出 query-focused answer。
-7. 用 LLM judge 从多个维度做双向对比评测。
+`run-all` 的实际调用顺序：
 
-项目当前的基本分工很明确：
+1. `command_run_all(...)`
+2. `retrieve_corpus_queries(...)`
+3. `run_query(...)`
+4. `generate_answers(...)`
+5. `run_winrate_judgement(...)`
 
-- 检索与联想阶段主要追求 recall 和 evidence coverage。
-- 组织阶段主要决定答案应当围绕哪些 facet 展开。
-- 生成阶段主要决定“同一包证据如何被写出来”。
+其中 retrieval 主路径全部在 `run_query(...)` 中完成。
 
-## 2. 端到端流程
+`run_query(...)` 的顺序：
 
-完整流水线在 [pipeline.py](/Users/Admin/projects/Association/associative_rag_project/pipeline.py) 的 `run_query(...)` 中串起来，顺序如下：
+1. `chunk_retriever.search(query, top_k)`
+2. `detect_query_contract(query)`
+3. `_select_contract_root_chunks(...)`
+4. `score_root_nodes(...)`
+5. `score_root_edges(...)`
+6. `expand_associative_graph(...)`
+7. `build_answer_facet_groups(...)`
+8. `build_prompt_context(...)`
 
-1. `chunk_retriever.search(...)`
-   从 chunk 索引中拿 query 的 candidate chunks。
-2. `select_diverse_root_chunks(...)`
-   从 candidate 中挑出少量但更分散的 root chunks。
-3. `score_root_nodes(...)` / `score_root_edges(...)`
-   对 roots 投影出的节点和边做轻量打分。
-4. `expand_associative_graph(...)`
-   在图和 chunk 侧做多轮联想扩展。
-5. `build_answer_facet_groups(...)`
-   识别 query contract，并把最终子图组织成 facet groups。
-6. `build_prompt_context(...)`
-   为 LLM 生成最终 evidence package。
-7. `build_generation_prompt(...)`
-   按 query 类型拼出最终生成 prompt。
-8. `generate_answers(...)`
-   调用 LLM 生成答案。
+## 2. 输入结构
 
-## 3. CLI 与默认参数
+### 2.1 corpus
 
-CLI 在 [main.py](/Users/Admin/projects/Association/associative_rag_project/main.py) 中定义，支持：
+[data.py](/Users/Admin/projects/Association/associative_rag_project/data.py) 中：
 
-- `retrieve`
-- `answer`
-- `judge`
-- `run`
-- `run-all`
+- `load_graph_corpus(corpus_dir)` 读取 `graph_chunk_entity_relation.graphml`
+- 同时读取 `kv_store_text_chunks.json`
 
-当前默认超参数如下。
+graph 中用到的字段：
 
-### 3.1 检索层默认
+- node: `source_id`, `entity_type`, `description`
+- edge: `source_id`, `keywords`, `description`, `weight`
 
-- `retrieval_mode = dense`
-- `top_chunks = 5`
-- `chunk_candidate_multiplier = 3`
-- `adaptive_candidate_pool_size = 30`
-- `dense_weight = 0.75`
-- `bm25_weight = 0.25`
+chunk store 中用到的字段：
 
-解释：
+- `content`
+- `full_doc_id`
+- `chunk_order_index`
 
-- 默认第一跳是 dense retrieval。
-- 实际最终 roots 默认是 `5` 个。
-- 但第一轮候选池会放大到至少 `top_chunks * 3`，并且不少于 `30`，方便后面估计 retrieval cliff、candidate dispersion 等特征。
-- `dense_weight / bm25_weight` 只有在 `hybrid` 模式下才真正生效。
+### 2.2 provenance 映射
 
-### 3.2 root graph 默认
+`build_chunk_mappings(...)` 会构建四个双向映射：
 
-- `top_root_nodes = 12`
-- `top_root_edges = 16`
+- `chunk_to_nodes`
+- `chunk_to_edges`
+- `node_to_chunks`
+- `edge_to_chunks`
 
-解释：
+其中：
 
-- roots 投影到图以后，不是所有 root-induced nodes/edges 都平等进入后续联想。
-- 系统会先对 root nodes 和 root edges 做轻量打分，再截断到这两个上限。
+- node 的 `source_id` 决定它来自哪些 chunks
+- edge 的 `source_id` 决定它来自哪些 chunks
 
-### 3.3 联想层默认
+### 2.3 chunk 邻接
 
-- `max_hop = 4`
-- `path_budget = 12`
-- `semantic_edge_budget = 20`
-- `semantic_node_budget = 12`
-- `semantic_edge_min_score = 0.03`
-- `semantic_node_min_score = 0.03`
-- `association_rounds = 2`
+`build_chunk_neighborhoods(chunk_store, radius=1)`：
 
-解释：
+- 对每个 `full_doc_id` 内的 chunks 按 `chunk_order_index` 排序
+- 每个 chunk 与前后 `radius` 个 chunk 建邻接
 
-- 结构联想的 graph shortest path 最多看 4 跳。
-- 每轮会做桥接型扩展和覆盖型扩展。
-- 默认总共做 2 轮。
+所以 `chunk_neighbors` 表示“同一文档中的局部 band 邻接”。
 
-### 3.4 组织与上下文默认
+## 3. query 标准化
 
-- `group_limit = 8`
-- `max_source_chunks = 14`
-- `max_source_word_budget = 4500`
+`load_query_rows(...)` 支持两种输入：
 
-解释：
+- rewrites file
+- questions file
 
-- 最终 facet groups 最多保留 8 个。
-- 最终送进 prompt 的 source chunks 最多 14 个。
-- source 文本预算上限是 4500 词左右。
+最终每条 query row 的结构是：
 
-### 3.5 adaptive control 默认
+```python
+{
+    "group_id": "...",
+    "variant_id": "base",
+    "query": "...",
+    "base_query": "..."
+}
+```
 
-- `adaptive_control = False`
+## 4. 检索层
 
-解释：
+实现文件：[retrieval.py](/Users/Admin/projects/Association/associative_rag_project/retrieval.py)
 
-- 代码里已经有 adaptive controller，但默认关闭。
-- 当前主实验默认仍然使用固定预算。
-- 即便关闭，系统仍会计算 adaptive features，方便后续分析和日志记录。
+### 4.1 BM25
 
-### 3.6 `query_style` 默认状态
+`BM25Index.build(chunk_store)`：
 
-当前代码里 `query_style` 有三类：
+1. 对每个 chunk 的 `content` 做 tokenize
+2. 记录 term frequency
+3. 建立 postings
+4. 记录 `doc_lengths`
+5. 计算 `avgdl`
 
-- `balanced`
-- `synthesis`
-- `concrete`
+`BM25Index.search(query, top_k)`：
 
-但在默认配置下，最终写入结果文件的往往是：
+1. tokenize query
+2. 对每个 term 取 postings
+3. 用 BM25 公式累积分数
+4. 按分数降序截断
+5. 用 top1 分数归一化为 `score_norm`
 
-- `query_style = "disabled"`
+输出：
 
-原因不是系统没有这条逻辑，而是：
+```python
+{
+    "chunk_id": ...,
+    "score": ...,
+    "score_norm": ...,
+}
+```
 
-- `query_style` 的判定属于 adaptive controller 的一部分
-- 当前默认 `adaptive_control = False`
-- 因此 pipeline 会保留 adaptive profile 用于分析，但在最终记录里把实际生效的 style 标为 `disabled`
+### 4.2 Dense
 
-换句话说：
+`DenseChunkIndex.load(vdb_file)`：
 
-- 系统内部仍然会估计 query 更像 `synthesis / concrete / balanced`
-- 但默认实验中，这个 style 不作为正式启用的控制信号
-- 只有开启 adaptive control 后，`query_style` 才会真正作为运行时策略的一部分传到生成层
+1. 读取 `vdb_chunks.json`
+2. 解码 embedding matrix
+3. 计算每行向量范数
+4. 构建 `normalized_matrix`
 
-## 4. 数据输入假设
+`DenseChunkIndex.search(query_vector, top_k)`：
 
-相关逻辑在 [data.py](/Users/Admin/projects/Association/associative_rag_project/data.py)。
+1. 对 query vector 归一化
+2. 与 `normalized_matrix` 做点积
+3. 取 top-k
+4. 归一化为 `dense_score_norm`
 
-每个 corpus 目录至少需要：
+### 4.3 Hybrid
 
-- `graph_chunk_entity_relation.graphml`
-- `kv_store_text_chunks.json`
+`HybridChunkRetriever.search(query, top_k)`：
 
-若使用 dense 或 hybrid，还需要：
+1. 视 `mode` 决定是否调用 bm25 / dense
+2. 按 `chunk_id` 合并结果
+3. 如果是 hybrid，使用
 
-- `vdb_chunks.json`
+```python
+retrieval_score = dense_weight * dense_score_norm + bm25_weight * bm25_score_norm
+```
 
-问题文件支持：
+4. 按 `retrieval_score` 排序
 
-- `.txt`
-- `.json`
+## 5. query contract 检测
 
-baseline 默认通过 corpus 名自动解析，也可以手动传入。
+实现文件：[organization.py](/Users/Admin/projects/Association/associative_rag_project/organization.py)
 
-## 5. Chunk 检索
+函数：
 
-相关逻辑在 [retrieval.py](/Users/Admin/projects/Association/associative_rag_project/retrieval.py)。
+- `detect_query_contract(query)`
 
-### 5.1 BM25
-
-[BM25Index](/Users/Admin/projects/Association/associative_rag_project/retrieval.py) 是标准 in-memory BM25：
-
-- 预先 tokenize 每个 chunk
-- 记录 postings
-- 记录文档长度
-- 查询时返回 `score` 和 `score_norm`
-
-### 5.2 Dense
-
-[DenseChunkIndex](/Users/Admin/projects/Association/associative_rag_project/retrieval.py)：
-
-- 从 `vdb_chunks.json` 读取 embedding matrix
-- 归一化后做 cosine similarity top-k
-- 返回 `dense_score` 和 `dense_score_norm`
-
-### 5.3 Hybrid
-
-[HybridChunkRetriever](/Users/Admin/projects/Association/associative_rag_project/retrieval.py) 支持：
-
-- `bm25`
-- `dense`
-- `hybrid`
-
-`hybrid` 融合公式为：
-
-`retrieval_score = dense_weight * dense_score_norm + bm25_weight * bm25_score_norm`
-
-当前默认仍是 `dense`。
-
-## 6. Root Chunk 选择
-
-当前 root 选择逻辑在 [select_diverse_root_chunks(...)](/Users/Admin/projects/Association/associative_rag_project/retrieval.py)。
-
-这一步是当前实现非常关键的设计点。系统不再单纯按 retrieval rank 取前 `k`，而是做一个简单但可解释的 diversity-first 策略。
-
-### 6.1 当前默认规则
-
-函数默认参数为：
-
-- `same_doc_window = 1`
-- `max_same_doc_roots = 1`
-- `relaxed_max_same_doc_roots = 2`
-- `max_provenance_overlap = 0.55`
-- `relaxed_max_provenance_overlap = 0.85`
-
-### 6.2 选择逻辑
-
-第一阶段：
-
-- 按 `base_score` 排序，优先保最强 anchor。
-- 尽量一篇文档只保一个 root。
-- 禁止选取同一文档相邻 band 的 chunk。
-- 如果某个候选与已选 roots 的 provenance overlap 太高，则先 defer。
-
-第二阶段：
-
-- 若第一阶段还没选满 `top_k`，则对 deferred 候选做 relaxed pass。
-- relaxed pass 允许有限度地补回同文档 root 和较高 overlap root。
-
-### 6.3 设计目的
-
-这一步的目的不是“均匀抽样”，而是：
-
-- 避免最强文档连续占满起始预算。
-- 尽量把起点分散到多个证据簇。
-- 为后续 association 和 organization 留出更宽的 coverage 空间。
-
-## 7. 图联想：当前是 2 x 2 结构
-
-相关逻辑在 [association.py](/Users/Admin/projects/Association/associative_rag_project/association.py)。
-
-当前实现把联想明确拆成两个结构、两种目标，因此是一个 2 x 2 方案：
-
-- graph-bridge association
-- chunk-bridge association
-- graph-coverage association
-- chunk-coverage association
-
-也就是：
-
-- 一边在 graph 结构上找桥。
-- 一边在 chunk / provenance 邻接上找桥。
-- 一边补结构连接。
-- 一边补新证据带和新关系。
-
-### 7.1 结构桥接
-
-桥接型扩展的目标是把当前分散的证据区域连起来。
-
-[bridge_association(...)](/Users/Admin/projects/Association/associative_rag_project/association.py) 会同时做两件事：
-
-1. `_graph_bridge_association(...)`
-   用 shortest paths 连接不同的 root components。
-2. `_chunk_bridge_association(...)`
-   从 chunk 邻域和 provenance 邻域里找能触达当前 frontier、并引入新图内容的 chunk。
-
-这意味着系统不只把“图上的最短路”当桥，也把“chunk 侧的局部带状扩展”当桥。
-
-### 7.2 覆盖扩展
-
-覆盖型扩展的目标是引入新的证据维度，而不是只补结构。
-
-这部分会综合考虑：
-
-- 新引入的 supporting chunks 数量
-- 关系类型的丰富度
-- 与 root evidence 的对齐程度
-- 当前 frontier 的连接性
-
-### 7.3 多轮联想
-
-默认 `association_rounds = 2`。
-
-每一轮都不是只在最初 roots 上操作，而是在“当前已经扩展出来的子图”上继续做：
-
-1. structural association
-2. semantic / coverage association
-
-这也是为什么当前系统的 association 更像逐轮扩展，而不是单次 hop-based 搜索。
-
-## 8. 组织阶段：先选一个 query contract
-
-相关逻辑在 [organization.py](/Users/Admin/projects/Association/associative_rag_project/organization.py)。
-
-组织阶段的第一步是 `detect_query_contract(query)`。当前系统要求每个 query 只选一个 contract：
+输出只可能是：
 
 - `section-grounded`
 - `mechanism-grounded`
 - `comparison-grounded`
 - `theme-grounded`
 
-### 8.1 contract 识别方式
+### 5.1 判定规则
 
-当前是词法启发式，不是训练分类器。
+判定顺序是硬编码的：
 
-主要线索包括：
+1. 如果 query 命中 `SECTION_EXPLICIT_PHRASES`，直接判 `section-grounded`
+2. 否则如果命中 `COMPARISON_PHRASES`，判 `comparison-grounded`
+3. 否则如果命中 section list pattern，再判 `section-grounded`
+4. 否则检查 mechanism 显式 cue
+5. 否则检查 `how...` / `in what ways...` 与 `MECHANISM_LINK_VERBS` 的组合
+6. 否则检查 `THEME_REASON_CUES`
+7. 最后默认 `theme-grounded`
 
-- 明确 section / parts / passages / periods 等表述
-- compare / difference / versus 等对比表述
-- how + affect/change/influence/lead to 等机制表述
-- reasons / themes / patterns / role / examples 等 broad theme 表述
+这里没有训练分类器，也没有调用 LLM。
 
-这一步的设计目标是：
+## 6. root 选择
 
-- 先粗分 query 需要的答案组织方式。
-- 再用该 contract 去组织 facet groups 和约束生成阶段。
+实现文件：[retrieval.py](/Users/Admin/projects/Association/associative_rag_project/retrieval.py)
 
-## 9. Evidence Regions 与 Facet Groups
+主函数：
 
-组织阶段不是直接把 final graph 的 connected components 原样塞给 LLM。
+- `select_diverse_root_chunks(...)`
 
-系统会先构建若干 `EvidenceRegion`，来源包括：
+### 6.1 候选构造
 
-- root-anchored regions
-- bridge-derived regions
-- theme / relation regions
+对于每个 `candidate_hit`，函数先补一组派生字段：
 
-每个 region 会记录：
+- `base_score = _root_base_score(item)`
+- `full_doc_id`
+- `chunk_order_index`
+- `graph_nodes`
+- `graph_edges`
+- `relation_categories`
+
+其中：
+
+- `_root_base_score(...)` 优先使用 `dense_score_norm`，没有 dense 时回退到 `score_norm`
+- `_chunk_graph_signature(...)` 返回该 chunk 覆盖到的 nodes 和 edges
+- `_chunk_relation_categories(...)` 从 chunk 覆盖到的 edges 上提取 relation category
+
+### 6.2 初始排序
+
+候选先按以下 key 排序：
+
+```python
+(-base_score, -len(graph_nodes), chunk_id)
+```
+
+即：
+
+1. retrieval stronger first
+2. 节点覆盖更多者优先
+3. 最后按 chunk_id 稳定排序
+
+### 6.3 第一阶段选择
+
+`selected` 初始为空，`deferred` 初始为空。
+
+第一阶段逐个扫描候选：
+
+1. 第一个候选直接进入 `selected`
+2. 之后对每个候选计算：
+   - `same_doc_count`
+   - `same_band`
+   - `overlaps`
+   - `max_overlap`
+
+其中：
+
+- `same_doc_count`：当前文档已经选了几个 roots
+- `same_band`：是否与已选 root 在同文档且 `chunk_order_index` 距离不超过 `same_doc_window`
+- `max_overlap`：与任何已选 root 的 provenance overlap 最大值
+
+provenance overlap 定义为：
+
+```python
+len((nodes_a ∪ edges_a) ∩ (nodes_b ∪ edges_b)) / len((nodes_a ∪ edges_a) ∪ (nodes_b ∪ edges_b))
+```
+
+第一阶段拒绝条件：
+
+- `same_doc_count >= max_same_doc_roots`
+- 或 `same_band == True`
+- 或 `max_overlap > max_provenance_overlap`
+
+被拒绝的进入 `deferred`。
+
+### 6.4 信息熵增益
+
+系统在 root selection 内保留了 relation entropy。
+
+函数：
+
+- `relation_entropy(categories)`
+
+对于 deferred 候选和 relaxed 阶段选中的候选，都会计算：
+
+```python
+before = relation_entropy(selected_relation_categories)
+after = relation_entropy(selected_relation_categories + candidate["relation_categories"])
+entropy_gain = max(after - before, 0.0)
+```
+
+也就是说，熵不是直接对 query 打分，而是衡量“把这个 chunk 加进 roots 后，relation category 分布是否变得更丰富”。
+
+### 6.5 第二阶段 relaxed pass
+
+如果第一阶段后 `len(selected) < top_k`，则进入第二阶段。
+
+`deferred` 的排序 key：
+
+```python
+(
+    doc_counts.get(full_doc_id, 0),
+    -entropy_gain,
+    current_max_overlap_to_selected,
+    -base_score,
+    -(len(graph_nodes) + len(graph_edges)),
+    chunk_id,
+)
+```
+
+即：
+
+1. 优先文档占用更少的候选
+2. 再优先 entropy gain 更高的候选
+3. 再优先与已选集合重叠更小的候选
+4. 再看 retrieval score
+5. 再看图覆盖量
+
+第二阶段仍然保留约束：
+
+- 禁止 `same_band`
+- 限制 `same_doc_count < relaxed_max_same_doc_roots`
+- 限制 `max_overlap <= relaxed_max_provenance_overlap`
+
+### 6.6 输出
+
+最后返回的 root chunk 条目中，会保留：
+
+- `novelty_gain`
+- `entropy_gain`
+- `max_selected_overlap`
+- `selection_score`
+
+这些字段会进入 retrieval JSON。
+
+## 7. section 题的 root 特化
+
+实现文件：[pipeline.py](/Users/Admin/projects/Association/associative_rag_project/pipeline.py)
+
+函数：
+
+- `_select_contract_root_chunks(...)`
+
+当 `query_contract != "section-grounded"` 时：
+
+- 直接调用 `select_diverse_root_chunks(...)`
+
+当 `query_contract == "section-grounded"` 时：
+
+1. 在前 `max(top_k * 4, 12)` 个候选上统计每个 `full_doc_id` 的累计 `score_norm`
+2. 选择得分最高的文档 `dominant_doc_id`
+3. 仅保留该文档内的候选
+4. 在这个子集上再次调用 `select_diverse_root_chunks(...)`
+
+这样 section 题的 roots 会从一开始就被压到单文档带内。
+
+## 8. root nodes / root edges 打分
+
+实现文件：[retrieval.py](/Users/Admin/projects/Association/associative_rag_project/retrieval.py)
+
+### 8.1 `score_root_nodes(...)`
+
+对每个 root node 计算：
+
+- `query_rel`
+- `support`
+- `chunk_alignment`
+
+其中：
+
+- `query_rel` 是 query 和 `node_id + entity_type + description` 的 lexical overlap
+- `support, chunk_alignment = support_score(node_to_chunks[node_id], root_chunk_score_lookup)`
+
+排序 key：
+
+```python
+(-support, -chunk_alignment, -query_rel, node_id)
+```
+
+### 8.2 `score_root_edges(...)`
+
+对每个 root edge 计算：
+
+- `query_rel`
+- `support`
+- `chunk_alignment`
+- `weight_term = log1p(weight) / 5`
+
+排序 key：
+
+```python
+(-support, -weight_term, -query_rel, edge_id)
+```
+
+它们的作用不是最终答案排序，而是为 association 提供 seed nodes / edges。
+
+## 9. association 总体结构
+
+实现文件：[association.py](/Users/Admin/projects/Association/associative_rag_project/association.py)
+
+主函数：
+
+- `expand_associative_graph(...)`
+
+association 每一轮都执行两段：
+
+1. `bridge_association(...)`
+2. `coverage_association(...)`
+
+而两段内部又同时使用 graph-side 和 chunk-side 信号，因此形成 2x2 结构：
+
+- graph-bridge
+- chunk-bridge
+- graph-coverage
+- chunk-coverage
+
+## 10. association 中的 contract-aware 过滤
+
+### 10.1 `_candidate_contract_features(...)`
+
+任何 path / chunk / edge / node 候选都会先计算：
+
+- `source_docs`
+- `root_docs`
+- `root_alignment`
+- `query_overlap`
+- `same_root_doc`
+- `section_consistent`
+
+定义如下：
+
+`source_docs`
+
+- 候选来源 chunks 的 `full_doc_id` 集合
+
+`root_docs`
+
+- roots 对应 chunks 的 `full_doc_id` 集合
+
+`root_alignment`
+
+- `support_score(source_chunk_ids, root_chunk_score_lookup)` 的第二个输出
+
+`query_overlap`
+
+- query 与候选 preview text 的 lexical overlap
+
+`same_root_doc`
+
+- `source_docs` 与 `root_docs` 是否有交集
+
+`section_consistent`
+
+- 只有在 `section-grounded` 时有效
+- 检查 `source_docs ⊆ root_docs`
+
+### 10.2 允许条件
+
+不同 contract 的 allow 规则不同：
+
+`section-grounded`
+
+```python
+allowed = bool(section_consistent)
+```
+
+`mechanism-grounded`
+
+```python
+allowed = same_root_doc or root_alignment >= 0.08 or query_overlap >= 0.035
+```
+
+`comparison-grounded`
+
+```python
+allowed = same_root_doc or root_alignment >= 0.05 or query_overlap >= 0.025
+```
+
+`theme-grounded`
+
+```python
+allowed = same_root_doc or root_alignment >= 0.03 or query_overlap >= 0.02
+```
+
+只有 `allowed == True` 的候选会进入排序。
+
+### 10.3 `_contract_sort_key(...)`
+
+contract-aware 排序并不替代 primary rank，而是把 contract 信号和 primary rank 组合。
+
+`section-grounded`
+
+```python
+(
+    -section_consistent,
+    -same_root_doc,
+    -root_alignment,
+    -query_overlap,
+    *primary_fields
+)
+```
+
+`mechanism-grounded`
+
+```python
+(
+    *primary_fields,
+    -query_overlap,
+    -same_root_doc,
+    -root_alignment
+)
+```
+
+`comparison-grounded`
+
+```python
+(
+    *primary_fields,
+    -same_root_doc,
+    -query_overlap,
+    -root_alignment
+)
+```
+
+`theme-grounded`
+
+```python
+(
+    *primary_fields,
+    -query_overlap,
+    -same_root_doc,
+    -root_alignment
+)
+```
+
+## 11. graph-bridge association
+
+函数：
+
+- `_graph_bridge_association(...)`
+
+### 11.1 当前连通分量
+
+先用 `build_root_components(current_nodes, current_edges)` 构造当前子图的连通分量：
+
+- `components`
+- `node_to_component`
+
+### 11.2 seed nodes
+
+seed 来自：
+
+1. `top_nodes` 中的 node ids
+2. `top_edges` 中两端的 node ids
+
+合并去重后得到 `seed_nodes`
+
+### 11.3 候选路径构造
+
+对每个 `source_id in seed_nodes`：
+
+1. 调用 `nx.single_source_shortest_path(graph, source_id, cutoff=max_hop)`
+2. 遍历所有 `target_id in current_nodes`
+3. 只保留跨 component 的路径
+4. 去掉长度 <= 1 的路径
+5. 用正向/逆向较小的 tuple 做 canonical path 去重
+6. 如果该路径上的 edge 全都已经在 `current_edges` 中，则跳过
+
+### 11.4 路径特征
+
+每条 path 计算：
+
+- `path_chunks`
+- `bridge_gain`
+- `new_source_count`
+- `path_length`
+- contract features
+
+其中：
+
+`bridge_gain`
+
+- `_path_bridge_signature(path, node_to_component)`
+- 本质上只看 path 首尾是否来自不同 component
+
+`new_source_count`
+
+- `len(path_chunks - covered_chunks)`，再经 `_bounded_gain(...)` 截断
+
+### 11.5 排序
+
+primary rank 为：
+
+```python
+(-bridge_gain, -new_source_count, path_length, path)
+```
+
+然后通过 `_contract_sort_key(...)` 注入 contract 优先级。
+
+### 11.6 输出
+
+输出：
+
+- `selected_paths`
+- `selected_path_nodes`
+- `selected_path_edges`
+
+## 12. chunk-bridge association
+
+函数：
+
+- `_chunk_bridge_association(...)`
+
+### 12.1 候选 chunk 集合
+
+1. 先取当前覆盖 chunks：
+
+```python
+covered_chunks = _covered_chunk_ids(current_nodes, current_edges, ...)
+```
+
+2. 再扩一层 local band：
+
+```python
+covered_band = _expand_chunk_band(covered_chunks, chunk_neighbors)
+```
+
+3. 再把 `covered_band` 的邻居并进来
+
+4. 最后去掉已经覆盖的 chunks
+
+### 12.2 每个 chunk 的特征
+
+对每个候选 chunk：
+
+- `chunk_nodes`
+- `chunk_edges`
+- `new_nodes`
+- `new_edges`
+- `component_ids`
+- `bridge_gain`
+- `frontier_touch`
+- `new_source_count`
+- `root_overlap`
+- `root_band_alignment`
+- contract features
+
+其中：
+
+`bridge_gain`
+
+- 如果 chunk 同时碰到两个及以上当前 component，则取 1，否则 0
+
+`frontier_touch`
+
+- `_chunk_bridge_touch(...)`
+- 由三部分相加：
+  - 与当前 nodes 的交
+  - 与当前 edges 的交
+  - 与 `covered_band` 的 chunk 邻接触碰数
+
+`root_band_alignment`
+
+- 取 `_expand_chunk_band({chunk_id})` 内各 chunk 在 `root_chunk_score_lookup` 中的最大值
+
+### 12.3 排序
+
+primary rank：
+
+```python
+(
+    -bridge_gain,
+    -frontier_touch,
+    -new_source_count,
+    -(new_node_count + new_edge_count),
+    -root_overlap,
+    -root_band_alignment,
+    chunk_id
+)
+```
+
+再通过 `_contract_sort_key(...)` 注入 contract 优先级。
+
+## 13. coverage association
+
+函数：
+
+- `coverage_association(...)`
+
+它同时处理 edge candidates、node candidates，以及 chunk-side coverage。
+
+### 13.1 当前状态量
+
+先构造：
+
+- `current_categories = build_current_relation_categories(current_edges, graph)`
+- `covered_chunks`
+- `covered_chunk_band`
+- `root_chunk_id_set`
+
+### 13.2 candidate edges
+
+来源有两类：
+
+1. 所有 `current_nodes` 的图邻边
+2. `covered_chunk_band` 中 chunk 所覆盖但尚未进入 `current_edges` 的 edges
+
+对于每条 candidate edge，计算：
+
+- `source_chunks`
+- `local_source_chunks`
+- `expanded_band`
+- `new_source_count`
+- `category`
+- `new_relation`
+- `chunk_alignment`
+- `root_overlap`
+- `coverage_gain`
+- contract features
+
+其中：
+
+```python
+coverage_gain = new_source_count if new_source_count > 0 else new_relation
+```
+
+也就是说：
+
+- 如果能带来新 source band，优先使用这个增益
+- 否则退回到“是否引入新 relation type”
+
+candidate edge 只有满足以下条件才保留：
+
+1. contract allow
+2. `coverage_gain >= semantic_edge_min_score`
+3. `coverage_gain > 0`
+
+排序 primary key：
+
+```python
+(-coverage_gain, -new_relation, -root_overlap, -chunk_alignment, edge)
+```
+
+### 13.3 candidate nodes
+
+来源有两类：
+
+1. `current_nodes` 的图邻接点
+2. `covered_chunk_band` 中 chunk 覆盖但尚未进入 `current_nodes` 的点
+
+对于每个 candidate node，计算：
+
+- `source_chunks`
+- `local_source_chunks`
+- `expanded_band`
+- `new_source_count`
+- `relation_categories`
+- `bridge_strength`
+- `new_relation_count`
+- `chunk_alignment`
+- `root_overlap`
+- `coverage_gain`
+- contract features
+
+其中：
+
+`bridge_strength`
+
+- 该 node 有多少邻居已经在 `current_nodes` 或 `expanded_nodes` 中
+
+`coverage_gain`
+
+```python
+coverage_gain = new_source_count if new_source_count > 0 else new_relation_count
+```
+
+candidate node 保留条件：
+
+1. contract allow
+2. `coverage_gain >= semantic_node_min_score`
+3. 或者 `coverage_gain <= 0` 但 `bridge_strength > 0`
+
+排序 primary key：
+
+```python
+(-coverage_gain, -bridge_strength, -root_overlap, -chunk_alignment, node_id)
+```
+
+### 13.4 chunk-side coverage
+
+`coverage_association(...)` 最后还会调用：
+
+- `_chunk_coverage_association(...)`
+
+它的候选来自 `covered_chunk_band` 的邻居 chunks。
+
+对每个 chunk 计算：
+
+- `new_node_count`
+- `new_edge_count`
+- `new_relation_count`
+- `new_source_count`
+- `root_overlap`
+- `root_band_alignment`
+- contract features
+
+排序 primary key：
+
+```python
+(
+    -(new_node_count + new_edge_count),
+    -new_relation_count,
+    -new_source_count,
+    -root_overlap,
+    -root_band_alignment,
+    chunk_id
+)
+```
+
+### 13.5 输出
+
+`coverage_association(...)` 返回：
+
+- `selected_edges`
+- `selected_nodes`
+- `selected_chunks`
+- `final_nodes`
+- `final_edges`
+
+其中 `final_nodes/final_edges` 是把当前子图与本轮新增内容合并后的结果。
+
+## 14. 多轮 expansion
+
+函数：
+
+- `expand_associative_graph(...)`
+
+循环逻辑：
+
+1. 对当前 `current_nodes/current_edges` 重新执行 `score_root_nodes/edges`
+2. 调用 `bridge_association(...)`
+3. 把 structural 结果并入当前子图
+4. 调用 `coverage_association(...)`
+5. 用 semantic 输出覆盖 `current_nodes/current_edges`
+6. 记录本轮 round summary
+7. 如果本轮 structural 和 semantic 都没有新增内容，则提前结束
+
+最终输出：
+
+- `final_nodes`
+- `final_edges`
+- `all_structural_nodes`
+- `all_structural_edges`
+- `all_semantic_nodes`
+- `all_semantic_edges`
+- `rounds`
+- `last_structural_output`
+
+`last_structural_output` 后面会被 organization 用来切 bridge regions。
+
+## 15. 从 final graph 划分 evidence regions
+
+实现文件：[organization.py](/Users/Admin/projects/Association/associative_rag_project/organization.py)
+
+总入口：
+
+- `collect_overlapping_regions(...)`
+
+它会生成三类 region：
+
+- root regions
+- bridge regions
+- theme regions
+
+### 15.1 `_chunk_local_index(...)`
+
+先把 final subgraph 投影回 chunk：
+
+- `chunk_to_final_nodes`
+- `chunk_to_final_edges`
+
+### 15.2 `_root_chunk_band(...)`
+
+对所有 roots 扩一层 chunk 邻接：
+
+```python
+root_chunk_band = roots ∪ neighbors(roots)
+```
+
+这个 band 后面用于判断 region 是否仍与 roots 保持局部连接。
+
+### 15.3 `_make_region(...)`
+
+这是所有 region 的统一构造器。
+
+输入：
 
 - `region_kind`
 - `root_chunk_ids`
-- `anchor_chunk_ids`
-- `supporting_chunk_ids`
 - `node_ids`
 - `edge_ids`
-- `relation_themes`
-- `focus_entities`
-- `doc_ids`
-- `growth_traces`
+- `root_chunk_band`
 
-这些 region 之后会被进一步合并和筛选为最终 facet groups。
+内部步骤：
 
-## 10. 当前 facet 选择逻辑：coverage-first
+1. 调用 `_supporting_chunks_for_region(node_ids, edge_ids, ...)`
+   从 nodes / edges 反推 supporting chunks
+2. 调用 `_rank_chunks(...)`
+   先按是否 root，再按 query overlap 排 chunk
+3. 取前 5 个作为 `anchor_chunk_ids`
+4. 用 `_relation_themes(...)` 汇总 relation themes
+5. 用 `_focus_entities(...)` 选 query 最相关的实体
+6. 用 `_evidence_descriptor_text(...)` 构建 `descriptor_text`
+7. 计算 `root_connected`
 
-这部分是当前系统相较早期版本变化最大的地方之一。
+`root_connected` 的定义：
 
-[organization.py](/Users/Admin/projects/Association/associative_rag_project/organization.py) 中的 `_select_groups(...)` 不再只是“按分数排序然后去重”，而是 coverage-first greedy selection。
+```python
+bool(
+    anchor_chunk_ids 与 root_chunk_ids 有交
+    or supporting_chunk_ids 与 root_chunk_band 有交
+)
+```
 
-### 10.1 当前选择原则
+### 15.4 root regions
 
-系统先看一个候选 group 能否补到新的 coverage 维度，再决定是否优先保留。当前覆盖键会根据 contract 使用不同组合，但常见维度包括：
+函数：
 
-- `facet_label`
-- `relation theme`
+- `_collect_root_regions(...)`
+
+对每个 root chunk：
+
+1. 从 `chunk_to_final_nodes/chunk_to_final_edges` 找到 seed nodes / edges
+2. 找这些 seed 覆盖到的 supporting chunks
+3. 按 query overlap 对 supporting chunks 排序
+4. 取前 4 个 supporting chunks，把它们的 final nodes / edges 再并进局部集合
+5. 额外补上“节点都已在局部集合中的 final edges”
+6. 交给 `_make_region(...)`
+
+所以 root region 不是单 chunk，而是“以 root chunk 为中心扩一圈局部证据”。
+
+### 15.5 bridge regions
+
+函数：
+
+- `_collect_bridge_regions(...)`
+
+bridge region 有两种来源。
+
+第一种：graph bridge path
+
+1. 读取 `last_structural_output["selected_paths"]`
+2. 每条 path 先把路径上的 nodes / edges 放进局部集合
+3. 再取 path 覆盖到的 chunks，按 query overlap 排序
+4. 取前 3 个 chunks，把它们覆盖到的 nodes / edges 并入
+5. 再补齐局部闭包内的 final edges
+6. 交给 `_make_region(...)`
+
+第二种：chunk-side bridge
+
+1. 读取 `last_structural_output["selected_chunks"]`
+2. 用 chunk 自带的 `node_ids/edge_ids` 作为局部集合
+3. 交给 `_make_region(...)`
+
+两种 bridge region 最后都要求：
+
+- `region is not None`
+- `region.root_connected == True`
+
+### 15.6 theme regions
+
+函数：
+
+- `_collect_theme_regions(...)`
+
+步骤：
+
+1. 遍历全部 `final_edges`
+2. 按 `normalize_relation_category(...)` 分组
+3. 排序 key：
+
+```python
+(-lexical_overlap_score(query, theme), -len(edges), theme)
+```
+
+4. 只取前 `max_themes=5`
+5. 对每个 theme：
+   - 先把 theme 对应的 edges 和两端 nodes 放进局部集合
+   - 反推 supporting chunks
+   - 要求 supporting chunks 与 `root_chunk_band` 有交
+   - 对 supporting chunks 排序，取前 4 个，再把这些 chunk 覆盖到的 final nodes / edges 并入
+   - 交给 `_make_region(...)`
+
+theme region 的作用是把 final graph 中最强的 relation themes 单独抽出来。
+
+## 16. 从 regions 组装 facet groups
+
+统一 group 构造函数：
+
+- `_build_group(...)`
+
+它会把一组 regions 合并成一个 facet group。
+
+### 16.1 `_build_group(...)` 的聚合逻辑
+
+给定一组 regions：
+
+1. 合并所有 `root_chunk_ids`
+2. 合并 `node_ids`
+3. 合并 `edge_ids`
+4. 合并 `supporting_chunk_ids`
+5. 统计 `region_kinds`
+6. 统计 `relation_themes`
+7. 统计 `focus_entities`
+8. 合并 `doc_ids`
+9. 合并 `growth_traces`
+10. 对聚合后的 `anchor_chunk_ids` 再用 `_rank_chunks(...)` 排一次
+
+然后构造：
+
+- `group_score = lexical_overlap_score(query, descriptor_text)`
+- `query_rel`
+- `anchor_support`
+- `root_anchor_count`
+- `group_summary`
+
+### 16.2 机制题 group
+
+函数：
+
+- `_build_mechanism_groups(...)`
+
+逻辑：
+
+1. 建 `root_by_chunk`，把 root regions 按 root chunk 反查
+2. 遍历每个 bridge region
+3. 把该 bridge region 相关的 root regions 合并进来
+4. 再尝试把与它共享 roots 或 supporting chunks 的 theme regions 合并进来
+5. 标签优先取 bridge region 的 primary theme，若有次主题则写成 `primary -> secondary`
+6. 如果没有 bridge candidates，则退化为用 root/theme regions 按 primary theme 分组
+7. 最后过滤掉：
+   - 不含 bridge kind
+   - 且 `edge_count < 3`
+   的 groups
+
+### 16.3 对比题 group
+
+函数：
+
+- `_build_comparison_groups(...)`
+
+逻辑：
+
+1. 每个 root region 先单独形成一组
+2. 如果 bridge region 覆盖两个及以上 roots，再额外形成一个 `contrast around ...` 组
+
+### 16.4 主题题 group
+
+函数：
+
+- `_build_theme_groups(...)`
+
+逻辑：
+
+1. 遍历 root/theme/bridge regions
+2. 过滤：
+   - bridge region 要求 `query_rel >= 0.12`
+   - root/theme region 要求 `query_rel >= 0.05`
+3. 分组键：
+
+```python
+(_primary_theme(region), root_key)
+```
+
+其中 `root_key` 优先取第一个 `root_chunk_id`，没有时退化到第一个 `doc_id`
+
+### 16.5 section 题 group
+
+函数：
+
+- `_build_section_groups(...)`
+
+逻辑：
+
+1. 对每个 root region，取前 3 个 anchor chunks 作为 seed
+2. 对每个 seed 在同文档内扩 `radius=2` 的 chunk band
+3. 把这个 band 覆盖到的 final nodes / edges 收集起来
+4. 再构成一个 `section` region
+5. label 形如：
+
+```python
+section band {doc_suffix}:{start_order}-{end_order}
+```
+
+## 17. group 选择算法
+
+函数：
+
+- `_select_groups(groups, limit, distinct_key_fn, coverage_key_fn=None)`
+
+这是当前 organization 中最重要的选择器。
+
+### 17.1 group 排序基线
+
+所有 groups 先按 `_group_rank_key(...)` 排序：
+
+```python
+(
+    -root_anchor_count,
+    -query_rel,
+    -len(region_kinds),
+    -anchor_support,
+    -node_count,
+    facet_label
+)
+```
+
+### 17.2 greedy coverage-first
+
+第一阶段是 coverage-first greedy：
+
+1. 维护：
+   - `selected`
+   - `used`
+   - `covered`
+2. 每轮扫描所有未选 group
+3. 计算该 group 带来的新增 coverage：
+
+```python
+gain = len(set(coverage_key_fn(group)) - covered)
+```
+
+4. 只考虑 `gain > 0` 的候选
+5. 选择：
+   - `gain` 最大
+   - 若相同，则 `_group_rank_key` 更优
+
+6. 选中后更新：
+   - `selected`
+   - `used`
+   - `covered`
+
+### 17.3 fallback 填充
+
+如果 greedy 后还没满：
+
+1. 再按排好序的 groups 顺序扫描
+2. 过滤：
+   - 已经选中
+   - `distinct_key_fn(group)` 已在 `used`
+   - `anchor_chunk_ids` 与已选 group 完全相同
+
+3. 通过的直接补入
+
+### 17.4 不同 contract 的 coverage 键
+
+不同 `_build_*_groups(...)` 给 `_select_groups(...)` 传入不同的 `coverage_key_fn`。
+
+常见 coverage 键包括：
+
+- `label`
+- `theme`
 - `doc`
 - `root`
-- `region kind`
+- `kinds`
+- `band`
 
-### 10.2 这一步的效果
+因此 `_select_groups(...)` 是一个统一 greedy 框架，而“覆盖什么”由不同 contract 的调用方决定。
 
-这会让最终 facet groups 更偏向：
+## 18. context 组装
 
-- 先保不同方面
-- 再保高分重复支线
+实现文件：[context.py](/Users/Admin/projects/Association/associative_rag_project/context.py)
 
-而不是：
+### 18.1 supporting chunk 排序
 
-- 被一条很强但很窄的 dense support chain 占满
+`rank_supporting_chunks(...)`：
 
-### 10.3 这一步不做什么
+1. 被 final nodes 覆盖到的 chunk 加分
+2. 被 final edges 覆盖到的 chunk 加分
+3. root chunks 再加 1
 
-当前 coverage-first 仍然不是强模板系统。它不会：
+最后按分数降序得到全局 chunk 排名。
 
-- 强制每个 facet 都变成一个段落
-- 强制每一类维度都必须出现
-- 在证据不足时硬凑 coverage
+### 18.2 source chunk 选择
 
-它只是把 facet selection 的优先级从“先看 rank”改成了“先看能否补新 coverage”。
+`choose_diverse_source_chunks(...)` 分三轮：
 
-## 11. Prompt Context 构造
+第一轮：
 
-相关逻辑在 [context.py](/Users/Admin/projects/Association/associative_rag_project/context.py)。
+- 每个 facet group 尝试贡献 1 个 chunk
 
-这一层的作用是把 facet groups 和 source chunks 变成最终 LLM 能读的 evidence package。
+第二轮：
 
-### 11.1 source chunk 排名
+- 每个 facet group 再尝试贡献 1 个 chunk
 
-`rank_supporting_chunks(...)` 会根据 final graph 对 chunk 做支持度排序：
+第三轮：
 
-- 被更多 final nodes 覆盖的 chunk 分数更高
-- 被更多 final edges 覆盖的 chunk 分数更高
-- root chunks 只获得轻量加分，不再拥有巨大常数 boost
+- 按全局 `ranked_chunk_ids` 补齐
 
-这意味着 grounding 不再主要靠“root 永远压倒一切”，而更多依赖 facet 内部的 anchor selection。
+每次加入 chunk 前都会经过 `try_add(...)`，检查：
 
-### 11.2 当前 source packaging 策略
+- 是否已选
+- 是否超过 `max_source_chunks`
+- 是否违反 `_violates_local_band_cap(...)`
+- 是否超过 `max_source_word_budget`
 
-`choose_diverse_source_chunks(...)` 现在采用三段式：
+### 18.3 最终 prompt_context
 
-1. 每个 facet 先争取 1 个 chunk
-2. 每个 facet 再争取第 2 个 chunk
-3. 最后才按全局 rank 补剩余预算
+`build_prompt_context(...)` 输出一个固定模板字符串，包含：
 
-同时还有限制：
+- Root Chunks
+- Focused Entities
+- Focused Relations
+- Facet Groups
+- Coverage Checklist
+- Facet Group Dossiers
+- Sources
 
-- 同一文档相邻 local band 不能无限重复入选
-- `_violates_local_band_cap(...)` 会限制相近 chunk 的局部堆叠
+同时返回：
 
-### 11.3 Coverage Checklist
+```python
+{
+    "context": str,
+    "selected_source_word_count": int,
+    "selected_source_chunk_count": int,
+}
+```
 
-当前 evidence package 中还会加入一个轻量的 `Coverage Checklist`，来自 `_coverage_checklist_lines(...)`。
+## 19. 最终 retrieval record
 
-其作用不是强制答案逐项 checklist 化，而是提醒生成模型：
+`run_query(...)` 返回一条记录，核心字段：
 
-- 这些 facet labels 是当前已拿到的 major supported aspects
-- 如果 query 属于 broad theme 类型，不要过早把它们压缩掉
+- `candidate_root_chunks`
+- `root_chunks`
+- `query_contract`
+- `stats`
+- `top_root_nodes`
+- `top_root_edges`
+- `rounds`
+- `structural_association`
+- `semantic_association`
+- `facet_groups`
+- `knowledge_groups`
+- `prompt_context`
 
-## 12. 生成阶段：当前真正决定“写法”的一层
+其中：
 
-相关逻辑在 [llm_client.py](/Users/Admin/projects/Association/associative_rag_project/llm_client.py)。
+- `structural_association = expansion["last_structural_output"]`
+- `semantic_association` 只保留被选中的 semantic edges/nodes 预览
 
-### 12.1 system prompt
+## 20. 生成层
 
-当前 `GENERATION_SYSTEM_PROMPT` 的核心约束是：
+实现文件：[llm_client.py](/Users/Admin/projects/Association/associative_rag_project/llm_client.py)
 
-- 做 query-focused summarization
-- 优先 multi-source aggregation
-- 优先 theme organization
-- 证据薄弱时显式承认不确定性
-- 不要把回答写成“这是图检索系统给我的结果”
-- 优先 breadth，而不是把一个窄线程过度展开
+### 20.1 prompt 构造
 
-### 12.2 contract hints
+`build_generation_prompt(query, prompt_context, query_contract)`：
 
-`_contract_template_hints(...)` 会根据 `query_contract` 给出软提示：
+1. 先写固定 answer requirements
+2. 插入 contract-specific hints
+3. 如果 `_is_broad_theme_query(...)` 为真，再增加 broad theme 覆盖提示
+4. 把 `query` 和 `prompt_context` 拼进去
 
-- section-grounded
-- mechanism-grounded
-- comparison-grounded
-- theme-grounded
+### 20.2 LLM 调用
 
-这些只是 optional organization templates，不是硬模板。
-
-### 12.3 `query_style` 在生成阶段的作用
-
-`build_generation_prompt(...)` 还会接收一个 `query_style` 参数。当前它支持三种风格：
-
-- `synthesis`
-- `concrete`
-- `balanced`
-
-对应影响如下：
-
-`synthesis`
-
-- 额外提示模型强调 cross-source patterns、contrasts 和 thematic structure。
-- 更适合 overview / pattern / broad-theme 类问题。
-
-`concrete`
-
-- 额外提示模型优先给出直接、实用、局部、明确支持的点。
-- 尽量避免不必要的泛化扩展。
-
-`balanced`
-
-- 不额外向两端偏置，保持默认的 query-focused summary 风格。
-
-### 12.4 broad theme query 检测
-
-`_is_broad_theme_query(...)` 会对 broad `theme-grounded` query 给额外提示。
-
-这一步使用的是通用 query-shape cues，例如：
-
-- `what are the primary reasons`
-- `what strategies`
-- `which external resources`
-- `in what ways`
-- `what role`
-
-### 12.5 当前 broad-theme 生成策略
-
-这是当前版本最重要的生成改动之一。
-
-对 broad theme query，prompt 会明确要求：
-
-- 先覆盖 major supported aspects，再展开局部
-- 若证据支持多个并列方面，优先覆盖约 `4-7` 个 aspect
-- 使用 `Coverage Checklist` 作为提醒，但不能硬塞 unsupported items
-
-同时，prompt 明确取消了早期那种过强的压缩倾向。当前会要求模型：
-
-- 先识别“主要支持的 aspects”
-- 不要只抓最强的 `1-2` 个 facet
-- 也不要机械地把每个 facet 原样照抄出来
-
-换句话说，当前生成层追求的是：
-
-- 保持 grounded
-- 但不要过早把多 facet coverage 压成 2 到 3 个大点
-
-## 12A. `query_style` 是如何判出来的
-
-这部分逻辑在 [adaptive_control.py](/Users/Admin/projects/Association/associative_rag_project/adaptive_control.py)。
-
-### 12A.1 判定方式
-
-`compute_query_intent_profile(query)` 会根据通用 discourse cues 做一个很轻量的 intent 估计。
-
-它维护两组 cue：
-
-- `OVERVIEW_CUES`
-- `FOCUSED_CUES`
-
-例如：
-
-- overview cues 更偏 `overall / patterns / themes / across / various / role / influence`
-- focused cues 更偏 `which / where / specific / section / steps / signs / costs / examples`
-
-然后计算：
-
-- `overview_hits`
-- `focused_hits`
-
-规则非常简单：
-
-- 如果 `focused_hits >= overview_hits + 1`，判为 `concrete`
-- 如果 `overview_hits >= focused_hits + 1`，判为 `synthesis`
-- 否则判为 `balanced`
-
-### 12A.2 它和 adaptive control 的关系
-
-当前代码里，`query_style` 是 adaptive controller 输出的一部分，但它和 budget 调节并不是同一件事。
-
-更准确地说：
-
-- adaptive controller 会同时产出
-  - `query_style`
-  - `association_strength`
-  - graph / retrieval / candidate features
-  - adapted budgets
-- 当 `adaptive_control = False` 时
-  - 预算不会按这些特征动态调整
-  - pipeline 会把最终 `query_style` 记为 `disabled`
-  - 但底层 intent/profile 仍然会被计算并保存在 `adaptive_profile` 里，供日志和分析使用
-
-### 12A.3 为什么会这样设计
-
-当前实现故意把 adaptive control 设计得很轻：
-
-- 默认系统行为应当是非自适应、可复现、易解释
-- style 判定和各种先验特征先保留下来做分析
-- 等这些先验被证明稳定有效后，再把它们逐步转成正式控制信号
-
-因此，看到输出里是：
-
-- `"query_style": "disabled"`
-
-并不表示系统完全没有 query-style 概念，而是表示：
-
-- 当前这次运行没有让 query-style 作为正式在线控制量生效
-- 只是保留了这套判定机制和相关诊断信息
-
-## 13. Judge 维度
-
-相关逻辑在 [judge.py](/Users/Admin/projects/Association/associative_rag_project/judge.py)。
-
-当前 judge 不是只给一个 overall winner，而是显式拆成以下维度：
-
-- `Comprehensiveness`
-- `Diversity`
-- `Empowerment`
-- `Focus Match`
-- `Evidence Anchoring`
-- `Overall Winner`
-
-同时，judge 还会额外输出：
-
-- `Query Organization Need`
-- `Answer 1 Organization`
-- `Answer 2 Organization`
-
-### 13.1 这些维度的实际作用
-
-`Comprehensiveness`
-
-- 看答案覆盖面是否足够全。
-
-`Diversity`
-
-- 看答案是否提供了多个角度、多个方面，而不是重复一个主线。
-
-`Empowerment`
-
-- 看答案是否让读者更容易做出判断、理解结构和因果。
-
-`Focus Match`
-
-- 看答案的组织方式是否匹配 query 真正需要的组织方式。
-- 这更像是“有没有答对题、答在点上”。
-
-`Evidence Anchoring`
-
-- 看答案是否稳定站在 corpus-specific evidence 上。
-- 这更像是“是不是 grounded，而不是只听起来合理”。
-
-### 13.2 双向评测
-
-`judge_pair(...)` 会：
-
-1. candidate vs baseline
-2. baseline vs candidate
-
-双向各判一次，再把票数映射回 candidate / baseline，以降低位置偏差。
-
-## 14. 当前系统为什么会有 tree3 这类提升
-
-从当前代码和最近实验现象看，系统提升的来源可以分成三层：
-
-### 14.1 tree1：组织层开始显式保 coverage
-
-通过 coverage-first facet selection 和 per-facet source packaging，系统不再只是保最强 support chain，而是更倾向于保不同方面。
-
-### 14.2 tree2：root 选择更分散
-
-通过更严格的 same-doc / same-band / provenance-overlap 限制，roots 起点更宽，部分 broad theme query 能拿到更分散的原始证据。
-
-### 14.3 tree3：生成层不再过早压缩 facet
-
-这是当前代码最关键的一步。
-
-在 retrieval 统计基本不变的情况下，tree3 的明显提升说明：
-
-- 证据包本身没有大幅变化
-- 变化主要来自最终 prompt
-
-也就是：
-
-- 同一包 evidence，在旧 prompt 下容易被压成过窄答案
-- 在当前 prompt 下，模型更愿意先覆盖 major aspects，再展开细节
-
-因此当前代码版的一个核心结论是：
-
-> 系统主瓶颈已经不只是“检到什么”，而是“同一包证据如何被组织和写出来”。
-
-## 15. 是否存在针对 agriculture / art 的专门优化
-
-在当前代码中，我额外检查了是否存在针对 `agriculture` 或 `art` 数据集的专门优化，包括：
-
-- 按 corpus 名分支
-- 特定数据集关键词触发特殊逻辑
-- 针对农业或艺术题材的专门 prompt
-- 针对具体 benchmark 题目的硬编码回答指导
-
-结论是：
-
-### 15.1 没有发现数据集名级别的专门优化
-
-当前代码中没有发现如下模式：
-
-- `if corpus_name == "agriculture": ...`
-- `if corpus_name == "art": ...`
-- 针对 `agriculture` 或 `art` 单独换 prompt
-- 针对这两个数据集单独换检索、组织、打包、生成逻辑
-
-### 15.2 但存在通用的 query-shape 词法启发式
-
-系统中确实存在一些词法 cue，例如：
-
-- `what are the primary reasons`
-- `which external resources`
-- `what strategies`
-- `in what ways`
-- `compare`
-- `what sections`
-
-这些 cue 出现在：
-
-- [organization.py](/Users/Admin/projects/Association/associative_rag_project/organization.py) 的 contract 检测
-- [llm_client.py](/Users/Admin/projects/Association/associative_rag_project/llm_client.py) 的 broad-theme 检测
-
-它们的作用是识别 query 的组织需求，而不是识别数据集主题。
-
-因此更准确的表述应当是：
-
-- 当前系统没有针对 `agriculture` 或 `art` 的 corpus-specific tuning
-- 但有针对 query form 的通用启发式
-- 如果某个 benchmark 的题面经常使用这些表述，那么它会自然更容易触发对应的组织策略
-
-这属于 query-shape adaptation，不属于 dataset-specific hardcoding。
-
-## 16. 当前版本的优点与边界
-
-### 16.1 当前优点
-
-- root 选择更分散，起点不容易被单文档占满
-- association 同时利用 graph 路径和 chunk 邻域
-- organization 不再只是去重，而是显式保 coverage
-- source packaging 不再只按全局 rank，而是先保每个 facet 的发声权
-- broad theme query 的生成 prompt 更重视覆盖多个 supported aspects
-- judge 维度更细，能定位是 focus 问题、grounding 问题还是 coverage 问题
-
-### 16.2 当前边界
-
-- contract 检测仍是词法启发式，不是学习式分类器
-- broad-theme 检测同样是启发式
-- adaptive control 已经接入，但默认关闭
-- source budget 仍然比较紧，宽 query 上仍可能出现 coverage 不足
-- 对某些需要更窄、更局部、更强 anchored 的 query，coverage-first 策略未必总是占优
-
-## 17. 当前默认结论
-
-如果只用一句话概括当前代码版系统：
-
-> 这是一个以“多起点 root + 多轮图联想 + contract-aware 组织 + coverage-first 打包 + broad-theme 生成约束”为核心的 Associative RAG QFS 系统。
-
-再更具体一点：
-
-- 检索层负责把证据找出来。
-- 联想层负责把证据带展开。
-- 组织层负责把证据整理成 query-facing facets。
-- 生成层负责避免把 facet 过早压缩成过窄答案。
-
-而从当前代码和最近实验一起看，系统最重要的经验是：
-
-> 对 broad thematic queries，真正的性能拐点往往不是再多检一点，而是不要把已经拿到的 supported facets 提前写没了。
+`generate_answers(...)` 会对每条 retrieval record：
+
+1. 构造 prompt
+2. 调 `llm_client.generate(...)`
+3. 收集：
+   - `group_id`
+   - `query`
+   - `query_contract`
+   - `model_answer`
+   - `stats`
+
+## 21. 总结
+
+当前系统可以被精确描述为：
+
+1. 用 lexical / dense retrieval 找候选 chunks
+2. 用多样性、局部 band 约束和 relation entropy 选 roots
+3. 用 query contract 决定联想扩展的 allow rule 和 sort key
+4. 用 2x2 association 结构扩展 final graph
+5. 从 final graph 中切出 root / bridge / theme evidence regions
+6. 再把 regions 合并成 facet groups，并用 greedy coverage-first 选最终 groups
+7. 把 groups 和 source chunks 打包成 evidence package 交给 LLM
+
+如果要读代码实现细节，推荐顺序：
+
+1. [pipeline.py](/Users/Admin/projects/Association/associative_rag_project/pipeline.py)
+2. [retrieval.py](/Users/Admin/projects/Association/associative_rag_project/retrieval.py)
+3. [association.py](/Users/Admin/projects/Association/associative_rag_project/association.py)
+4. [organization.py](/Users/Admin/projects/Association/associative_rag_project/organization.py)
+5. [context.py](/Users/Admin/projects/Association/associative_rag_project/context.py)
+6. [llm_client.py](/Users/Admin/projects/Association/associative_rag_project/llm_client.py)

@@ -4,17 +4,16 @@ import json
 from collections import defaultdict
 from pathlib import Path
 
-from .adaptive_control import build_adaptive_controller
 from .association import (
     build_edge_role_sets,
     build_node_role_sets,
     expand_associative_graph,
 )
 from .context import build_prompt_context
-from .data import build_chunk_mappings, build_chunk_neighborhoods, load_graph_corpus, load_query_rows
+from .data import build_chunk_mappings, build_chunk_neighborhoods, infer_corpus_name, load_graph_corpus, load_query_rows
 from .embedding_client import OpenAICompatibleEmbeddingClient
 from .logging_utils import log, shorten
-from .organization import build_answer_facet_groups
+from .organization import build_answer_facet_groups, detect_query_contract
 from .retrieval import BM25Index, DenseChunkIndex, HybridChunkRetriever, score_root_edges, score_root_nodes, select_diverse_root_chunks
 
 
@@ -85,28 +84,54 @@ def _format_round_preview(round_info):
     return lines
 
 
-def _format_adaptive_preview(adaptive_profile):
-    intent = adaptive_profile["intent"]
-    graph = adaptive_profile["graph_features"]
-    candidate = adaptive_profile["candidate_features"]
-    retrieval = adaptive_profile["retrieval_features"]
-    components = adaptive_profile.get("alpha_components", {})
-    budgets = adaptive_profile["adapted_budgets"]
-    return (
-        f"adaptive style={adaptive_profile['query_style']} alpha={adaptive_profile['association_strength']:.3f} "
-        f"overview_hits={intent['overview_hits']} focused_hits={intent['focused_hits']} "
-        f"density={graph['root_density']:.3f} fragmentation={graph['fragmentation']:.3f} "
-        f"density_signal={components.get('density_signal', 0.0):.3f} "
-        f"frag_signal={components.get('fragmentation_signal', 0.0):.3f} "
-        f"style_prior={components.get('style_prior', 0.0):.3f} "
-        f"candidate_dispersion={candidate['candidate_chunk_dispersion']:.3f} "
-        f"effective_candidates={candidate['effective_candidate_chunk_count']:.2f} "
-        f"retrieval_cliff@{retrieval['retrieval_cliff_topn']}={retrieval['retrieval_cliff']:.3f} "
-        f"cliff_brake={components.get('cliff_brake', 0.0):.3f} "
-        f"budgets(rounds={budgets['association_rounds']}, path={budgets['path_budget']}, "
-        f"sem_edges={budgets['semantic_edge_budget']}, sem_nodes={budgets['semantic_node_budget']}, "
-        f"group_limit={budgets['group_limit']}, sources={budgets['max_source_chunks']}, "
-        f"words={budgets['max_source_word_budget']})"
+def _select_contract_root_chunks(query_contract, candidate_chunk_hits, chunk_store, chunk_to_nodes, chunk_to_edges, graph, top_k):
+    if query_contract != "section-grounded":
+        return select_diverse_root_chunks(
+            candidate_hits=candidate_chunk_hits,
+            chunk_store=chunk_store,
+            chunk_to_nodes=chunk_to_nodes,
+            chunk_to_edges=chunk_to_edges,
+            graph=graph,
+            top_k=top_k,
+        )
+
+    doc_scores = defaultdict(float)
+    for item in candidate_chunk_hits[: max(top_k * 4, 12)]:
+        doc_id = chunk_store.get(item["chunk_id"], {}).get("full_doc_id")
+        if doc_id:
+            doc_scores[doc_id] += item.get("score_norm", 0.0)
+    if not doc_scores:
+        return select_diverse_root_chunks(
+            candidate_hits=candidate_chunk_hits,
+            chunk_store=chunk_store,
+            chunk_to_nodes=chunk_to_nodes,
+            chunk_to_edges=chunk_to_edges,
+            graph=graph,
+            top_k=top_k,
+        )
+
+    dominant_doc_id = max(doc_scores.items(), key=lambda item: (item[1], item[0]))[0]
+    doc_candidates = [
+        item for item in candidate_chunk_hits if chunk_store.get(item["chunk_id"], {}).get("full_doc_id") == dominant_doc_id
+    ]
+    if len(doc_candidates) >= max(2, min(top_k, 3)):
+        return select_diverse_root_chunks(
+            candidate_hits=doc_candidates,
+            chunk_store=chunk_store,
+            chunk_to_nodes=chunk_to_nodes,
+            chunk_to_edges=chunk_to_edges,
+            graph=graph,
+            top_k=top_k,
+            max_same_doc_roots=top_k,
+            relaxed_max_same_doc_roots=top_k,
+        )
+    return select_diverse_root_chunks(
+        candidate_hits=candidate_chunk_hits,
+        chunk_store=chunk_store,
+        chunk_to_nodes=chunk_to_nodes,
+        chunk_to_edges=chunk_to_edges,
+        graph=graph,
+        top_k=top_k,
     )
 
 
@@ -136,15 +161,18 @@ def run_query(
     candidate_top_k = max(
         cfg["top_chunks"],
         cfg["top_chunks"] * max(cfg["chunk_candidate_multiplier"], 1),
-        cfg.get("adaptive_candidate_pool_size", 30),
+        cfg.get("candidate_pool_size", 30),
     )
     candidate_chunk_hits = chunk_retriever.search(query_row["query"], top_k=candidate_top_k)
+    query_contract = detect_query_contract(query_row["query"])
     log(f"{prefix}retrieval candidates={len(candidate_chunk_hits)} mode={cfg['retrieval_mode']}")
-    root_chunk_hits = select_diverse_root_chunks(
-        candidate_hits=candidate_chunk_hits,
+    root_chunk_hits = _select_contract_root_chunks(
+        query_contract=query_contract,
+        candidate_chunk_hits=candidate_chunk_hits,
         chunk_store=chunk_store,
         chunk_to_nodes=chunk_to_nodes,
         chunk_to_edges=chunk_to_edges,
+        graph=graph,
         top_k=cfg["top_chunks"],
     )
     for line in _format_root_chunk_preview(root_chunk_hits, chunk_store):
@@ -158,38 +186,6 @@ def run_query(
     for chunk_id in root_chunk_ids:
         root_nodes.update(chunk_to_nodes.get(chunk_id, set()))
         root_edges.update(chunk_to_edges.get(chunk_id, set()))
-    # Always compute adaptive signals so later analysis can compare priors
-    # against outcomes, even when the actual budgets are fixed.
-    adaptive_profile = build_adaptive_controller(
-        query=query_row["query"],
-        root_nodes=root_nodes,
-        root_edges=root_edges,
-        root_chunk_hits=root_chunk_hits,
-        candidate_chunk_hits=candidate_chunk_hits,
-        node_to_chunks=node_to_chunks,
-        edge_to_chunks=edge_to_chunks,
-        base_cfg=cfg,
-    )
-    if not cfg.get("adaptive_control", False):
-        adaptive_profile = {
-            **adaptive_profile,
-            "adapted_budgets": {
-                "association_rounds": cfg["association_rounds"],
-                "path_budget": cfg["path_budget"],
-                "semantic_edge_budget": cfg["semantic_edge_budget"],
-                "semantic_node_budget": cfg["semantic_node_budget"],
-                "semantic_edge_min_score": cfg["semantic_edge_min_score"],
-                "semantic_node_min_score": cfg["semantic_node_min_score"],
-                "group_limit": cfg["group_limit"],
-                "max_source_chunks": cfg["max_source_chunks"],
-                "max_source_word_budget": cfg["max_source_word_budget"],
-            },
-            "query_style": "disabled",
-        }
-    adapted = adaptive_profile["adapted_budgets"]
-    if cfg.get("adaptive_control", False):
-        log(f"{prefix}{_format_adaptive_preview(adaptive_profile)}")
-
     top_root_nodes = score_root_nodes(
         query=query_row["query"],
         root_nodes=root_nodes,
@@ -207,6 +203,7 @@ def run_query(
 
     expansion = expand_associative_graph(
         query=query_row["query"],
+        query_contract=query_contract,
         graph=graph,
         root_nodes=root_nodes,
         root_edges=root_edges,
@@ -217,15 +214,16 @@ def run_query(
         node_to_chunks=node_to_chunks,
         edge_to_chunks=edge_to_chunks,
         chunk_neighbors=cfg["chunk_neighbors"],
+        chunk_store=chunk_store,
         top_root_nodes=cfg["top_root_nodes"],
         top_root_edges=cfg["top_root_edges"],
         max_hop=cfg["max_hop"],
-        path_budget=adapted["path_budget"],
-        semantic_edge_budget=adapted["semantic_edge_budget"],
-        semantic_node_budget=adapted["semantic_node_budget"],
-        association_rounds=adapted["association_rounds"],
-        semantic_edge_min_score=adapted["semantic_edge_min_score"],
-        semantic_node_min_score=adapted["semantic_node_min_score"],
+        path_budget=cfg["path_budget"],
+        semantic_edge_budget=cfg["semantic_edge_budget"],
+        semantic_node_budget=cfg["semantic_node_budget"],
+        association_rounds=cfg["association_rounds"],
+        semantic_edge_min_score=cfg["semantic_edge_min_score"],
+        semantic_node_min_score=cfg["semantic_node_min_score"],
     )
     for round_info in expansion["rounds"]:
         for line in _format_round_preview(round_info):
@@ -243,6 +241,7 @@ def run_query(
     )
     facet_groups, query_contract = build_answer_facet_groups(
         query=query_row["query"],
+        query_contract=query_contract,
         graph=graph,
         final_nodes=expansion["final_nodes"],
         final_edges=expansion["final_edges"],
@@ -254,7 +253,7 @@ def run_query(
         node_to_chunks=node_to_chunks,
         edge_to_chunks=edge_to_chunks,
         chunk_store=chunk_store,
-        group_limit=adapted["group_limit"],
+        group_limit=cfg["group_limit"],
     )
     prompt_payload = build_prompt_context(
         query_row=query_row,
@@ -272,8 +271,8 @@ def run_query(
         chunk_store=chunk_store,
         node_to_chunks=node_to_chunks,
         edge_to_chunks=edge_to_chunks,
-        max_source_chunks=adapted["max_source_chunks"],
-        max_source_word_budget=adapted["max_source_word_budget"],
+        max_source_chunks=cfg["max_source_chunks"],
+        max_source_word_budget=cfg["max_source_word_budget"],
     )
     log(
         f"{prefix}done roots=({len(root_nodes)}n/{len(root_edges)}e) "
@@ -285,9 +284,7 @@ def run_query(
         **query_row,
         "candidate_root_chunks": candidate_chunk_hits,
         "root_chunks": root_chunk_hits,
-        "query_style": adaptive_profile["query_style"],
         "query_contract": query_contract,
-        "adaptive_profile": adaptive_profile,
         "stats": {
             "root_chunk_count": len(root_chunk_hits),
             "root_node_count": len(root_nodes),
@@ -312,14 +309,6 @@ def run_query(
             "knowledge_group_count": len(facet_groups),
             "selected_source_chunk_count": prompt_payload["selected_source_chunk_count"],
             "selected_source_word_count": prompt_payload["selected_source_word_count"],
-            "association_strength": adaptive_profile.get("association_strength", 0.0),
-            "root_density": adaptive_profile["graph_features"]["root_density"],
-            "root_fragmentation": adaptive_profile["graph_features"]["fragmentation"],
-            "candidate_chunk_dispersion": adaptive_profile["candidate_features"]["candidate_chunk_dispersion"],
-            "candidate_chunk_concentration": adaptive_profile["candidate_features"]["candidate_chunk_concentration"],
-            "effective_candidate_chunk_count": adaptive_profile["candidate_features"]["effective_candidate_chunk_count"],
-            "retrieval_cliff": adaptive_profile["retrieval_features"]["retrieval_cliff"],
-            "retrieval_cliff_topn": adaptive_profile["retrieval_features"]["retrieval_cliff_topn"],
         },
         "top_root_nodes": top_root_nodes,
         "top_root_edges": top_root_edges,
@@ -370,7 +359,7 @@ def retrieve_corpus_queries(
         questions_file=Path(questions_file) if questions_file else None,
         limit_groups=limit_groups,
     )
-    log(f"[retrieve] queries={len(query_rows)} retrieval_mode={cfg['retrieval_mode']} adaptive={cfg.get('adaptive_control', True)}")
+    log(f"[retrieve] queries={len(query_rows)} retrieval_mode={cfg['retrieval_mode']}")
     results = [
         run_query(
             query_row=row,
@@ -395,7 +384,10 @@ def retrieve_corpus_queries(
     }
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    stem = f"{corpus_dir.name}_top{cfg['top_chunks']}_hop{cfg['max_hop']}_assoc_project"
+    corpus_name = infer_corpus_name(corpus_dir)
+    stem = f"{corpus_name}_top{cfg['top_chunks']}_hop{cfg['max_hop']}_assoc_project"
+    if limit_groups is not None:
+        stem = f"{stem}_limit{limit_groups}"
     output_path = output_dir / f"{stem}_retrieval.json"
     output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     if results:

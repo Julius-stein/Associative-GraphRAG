@@ -244,12 +244,21 @@ def _provenance_overlap(nodes_a, edges_a, nodes_b, edges_b):
     return len(left & right) / max(len(left | right), 1)
 
 
+def _chunk_relation_categories(chunk_id, chunk_to_edges, graph):
+    categories = []
+    for edge_id in chunk_to_edges.get(chunk_id, set()):
+        edge_data = graph.get_edge_data(edge_id[0], edge_id[1]) or {}
+        categories.append(normalize_relation_category(edge_data))
+    return categories
+
+
 def select_diverse_root_chunks(
     candidate_hits,
     chunk_store,
     chunk_to_nodes,
     chunk_to_edges,
     top_k,
+    graph=None,
     same_doc_window=1,
     max_same_doc_roots=1,
     relaxed_max_same_doc_roots=2,
@@ -283,6 +292,7 @@ def select_diverse_root_chunks(
                 "chunk_order_index": chunk.get("chunk_order_index", -1),
                 "graph_nodes": nodes,
                 "graph_edges": edges,
+                "relation_categories": _chunk_relation_categories(chunk_id, chunk_to_edges, graph) if graph is not None else [],
             }
         )
     candidates.sort(key=lambda item: (-item["base_score"], -len(item["graph_nodes"]), item["chunk_id"]))
@@ -290,6 +300,7 @@ def select_diverse_root_chunks(
     selected = []
     deferred = []
     doc_counts = Counter()
+    selected_relation_categories = []
 
     for candidate in candidates:
         if len(selected) >= top_k:
@@ -299,9 +310,11 @@ def select_diverse_root_chunks(
                 {
                     **candidate,
                     "novelty_gain": len(candidate["graph_nodes"]) + len(candidate["graph_edges"]),
+                    "entropy_gain": 0.0,
                     "max_selected_overlap": 0.0,
                 }
             )
+            selected_relation_categories.extend(candidate["relation_categories"])
             if candidate.get("full_doc_id"):
                 doc_counts[candidate["full_doc_id"]] += 1
             continue
@@ -326,16 +339,29 @@ def select_diverse_root_chunks(
         ]
         max_overlap = max(overlaps) if overlaps else 0.0
         if same_doc_count >= max_same_doc_roots or same_band or max_overlap > max_provenance_overlap:
-            deferred.append(candidate)
+            entropy_gain = 0.0
+            if candidate["relation_categories"]:
+                before = relation_entropy(selected_relation_categories)
+                after = relation_entropy(selected_relation_categories + candidate["relation_categories"])
+                entropy_gain = round(max(after - before, 0.0), 6)
+            deferred.append({**candidate, "entropy_gain": entropy_gain})
             continue
+
+        entropy_gain = 0.0
+        if candidate["relation_categories"]:
+            before = relation_entropy(selected_relation_categories)
+            after = relation_entropy(selected_relation_categories + candidate["relation_categories"])
+            entropy_gain = round(max(after - before, 0.0), 6)
 
         selected.append(
             {
                 **candidate,
                 "novelty_gain": len(candidate["graph_nodes"]) + len(candidate["graph_edges"]),
+                "entropy_gain": entropy_gain,
                 "max_selected_overlap": round(max_overlap, 6),
             }
         )
+        selected_relation_categories.extend(candidate["relation_categories"])
         if candidate.get("full_doc_id"):
             doc_counts[candidate["full_doc_id"]] += 1
 
@@ -343,6 +369,7 @@ def select_diverse_root_chunks(
         deferred.sort(
             key=lambda item: (
                 doc_counts.get(item.get("full_doc_id"), 0),
+                -item.get("entropy_gain", 0.0),
                 max(
                     [
                         _provenance_overlap(
@@ -387,13 +414,20 @@ def select_diverse_root_chunks(
             max_overlap = max(overlaps) if overlaps else 0.0
             if max_overlap > relaxed_max_provenance_overlap:
                 continue
+            entropy_gain = 0.0
+            if candidate["relation_categories"]:
+                before = relation_entropy(selected_relation_categories)
+                after = relation_entropy(selected_relation_categories + candidate["relation_categories"])
+                entropy_gain = round(max(after - before, 0.0), 6)
             selected.append(
                 {
                     **candidate,
                     "novelty_gain": len(candidate["graph_nodes"]) + len(candidate["graph_edges"]),
+                    "entropy_gain": entropy_gain,
                     "max_selected_overlap": round(max_overlap, 6),
                 }
             )
+            selected_relation_categories.extend(candidate["relation_categories"])
             if candidate.get("full_doc_id"):
                 doc_counts[candidate["full_doc_id"]] += 1
 

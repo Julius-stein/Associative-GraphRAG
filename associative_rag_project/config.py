@@ -12,7 +12,7 @@ from pathlib import Path
 
 def _load_scheme4_config():
     """Load the shared OpenAI-compatible config from the original repo."""
-    module_path = Path(__file__).resolve().parents[1] / "lightrag" / "llm_config.py"
+    module_path = Path(__file__).resolve().parents[1] / "llm_config.py"
     spec = spec_from_file_location("assoc_llm_config", module_path)
     module = module_from_spec(spec)
     assert spec is not None and spec.loader is not None

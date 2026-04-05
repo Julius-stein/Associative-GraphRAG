@@ -1,7 +1,9 @@
 """Chunk retrieval and root-scoring utilities.
 
-This module first retrieves a small pool of root chunks, then reranks chunk-,
-node-, and edge-level candidates with cheap query-aware signals.
+Current refactor direction:
+- keep chunk retrieval simple and grounded
+- select diverse root chunks instead of linearly reranking them by many factors
+- keep root node/edge scoring lightweight so later stages remain interpretable
 """
 
 import base64
@@ -14,15 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .common import (
-    GRAPH_FIELD_SEP,
-    lexical_overlap_score,
-    normalize_text,
-    query_prefers_technical_content,
-    safe_mean,
-    technical_density,
-    tokenize,
-)
+from .common import GRAPH_FIELD_SEP, lexical_overlap_score, normalize_text, safe_mean, tokenize
 
 
 @dataclass
@@ -221,58 +215,205 @@ def relation_entropy(categories):
     return entropy
 
 
-def rerank_root_chunks(query, candidate_hits, chunk_store, chunk_to_nodes, chunk_to_edges, top_k):
-    """Rerank retrieved chunks before they become graph roots.
+def _root_base_score(item):
+    """Prefer dense grounding when available; fall back to retrieval score."""
+    if item.get("dense_score_norm", 0.0) > 0:
+        return float(item["dense_score_norm"])
+    return float(item.get("score_norm", item.get("retrieval_score", 0.0)))
 
-    Dense/bm25 retrieval gets us in the right neighborhood. This second stage
-    rewards chunks that are both textually relevant and graph-rich enough to
-    seed useful association later.
+
+def _chunk_graph_signature(chunk_id, chunk_to_nodes, chunk_to_edges):
+    nodes = set(chunk_to_nodes.get(chunk_id, set()))
+    edges = set(chunk_to_edges.get(chunk_id, set()))
+    return nodes, edges
+
+
+def _same_doc_band(chunk_a, chunk_b, window):
+    if chunk_a.get("full_doc_id") != chunk_b.get("full_doc_id"):
+        return False
+    order_a = chunk_a.get("chunk_order_index", -10**9)
+    order_b = chunk_b.get("chunk_order_index", 10**9)
+    return abs(order_a - order_b) <= window
+
+
+def _provenance_overlap(nodes_a, edges_a, nodes_b, edges_b):
+    left = set(nodes_a) | set(edges_a)
+    right = set(nodes_b) | set(edges_b)
+    if not left or not right:
+        return 0.0
+    return len(left & right) / max(len(left | right), 1)
+
+
+def select_diverse_root_chunks(
+    candidate_hits,
+    chunk_store,
+    chunk_to_nodes,
+    chunk_to_edges,
+    top_k,
+    same_doc_window=1,
+    max_same_doc_roots=1,
+    relaxed_max_same_doc_roots=2,
+    max_provenance_overlap=0.55,
+    relaxed_max_provenance_overlap=0.85,
+):
+    """Select root chunks as diverse grounded starting points.
+
+    The rule is intentionally simple:
+    - keep the strongest dense/root retrieval anchor
+    - prefer one root per document in the first pass
+    - never select adjacent chunks from the same document band
+    - defer graph-near-duplicate roots until the relaxed pass
+
+    This gives us a small set of multi-start roots without reintroducing a
+    large weighted rerank score.
     """
     if not candidate_hits:
         return []
-    query_is_technical = query_prefers_technical_content(query)
-    graph_sizes = []
-    for item in candidate_hits:
-        chunk_id = item["chunk_id"]
-        graph_sizes.append(len(chunk_to_nodes.get(chunk_id, set())) + 2 * len(chunk_to_edges.get(chunk_id, set())))
-    max_graph_size = max(graph_sizes) if graph_sizes else 1
-    scored = []
+
+    candidates = []
     for item in candidate_hits:
         chunk_id = item["chunk_id"]
         chunk = chunk_store.get(chunk_id, {})
-        query_rel = lexical_overlap_score(query, chunk.get("content", ""))
-        graph_size = len(chunk_to_nodes.get(chunk_id, set())) + 2 * len(chunk_to_edges.get(chunk_id, set()))
-        graph_yield = graph_size / max(max_graph_size, 1)
-        dense_term = item.get("dense_score_norm", 0.0)
-        bm25_term = item.get("bm25_score_norm", 0.0)
-        technical_penalty = 0.0 if query_is_technical else technical_density(chunk.get("content", "")) * 0.20
-        rerank_score = (
-            0.35 * item["score_norm"]
-            + 0.25 * query_rel
-            + 0.15 * graph_yield
-            + 0.15 * dense_term
-            + 0.10 * bm25_term
-            - technical_penalty
-        )
-        scored.append(
+        nodes, edges = _chunk_graph_signature(chunk_id, chunk_to_nodes, chunk_to_edges)
+        candidates.append(
             {
                 **item,
-                "query_rel": round(query_rel, 6),
-                "graph_yield": round(graph_yield, 6),
-                "technical_penalty": round(technical_penalty, 6),
-                "rerank_score": round(rerank_score, 6),
+                "base_score": round(_root_base_score(item), 6),
+                "full_doc_id": chunk.get("full_doc_id"),
+                "chunk_order_index": chunk.get("chunk_order_index", -1),
+                "graph_nodes": nodes,
+                "graph_edges": edges,
             }
         )
-    scored.sort(key=lambda item: (-item["rerank_score"], -item["score_norm"], item["chunk_id"]))
-    top_score = scored[0]["rerank_score"] if scored else 1.0
-    reranked = []
-    for item in scored[:top_k]:
-        reranked.append({**item, "score_norm": item["rerank_score"] / max(top_score, 1e-9)})
-    return reranked
+    candidates.sort(key=lambda item: (-item["base_score"], -len(item["graph_nodes"]), item["chunk_id"]))
+
+    selected = []
+    deferred = []
+    doc_counts = Counter()
+
+    for candidate in candidates:
+        if len(selected) >= top_k:
+            break
+        if not selected:
+            selected.append(
+                {
+                    **candidate,
+                    "novelty_gain": len(candidate["graph_nodes"]) + len(candidate["graph_edges"]),
+                    "max_selected_overlap": 0.0,
+                }
+            )
+            if candidate.get("full_doc_id"):
+                doc_counts[candidate["full_doc_id"]] += 1
+            continue
+
+        same_doc_count = doc_counts.get(candidate.get("full_doc_id"), 0)
+        same_band = any(
+            _same_doc_band(
+                chunk_store.get(existing["chunk_id"], {}),
+                chunk_store.get(candidate["chunk_id"], {}),
+                same_doc_window,
+            )
+            for existing in selected
+        )
+        overlaps = [
+            _provenance_overlap(
+                candidate["graph_nodes"],
+                candidate["graph_edges"],
+                existing["graph_nodes"],
+                existing["graph_edges"],
+            )
+            for existing in selected
+        ]
+        max_overlap = max(overlaps) if overlaps else 0.0
+        if same_doc_count >= max_same_doc_roots or same_band or max_overlap > max_provenance_overlap:
+            deferred.append(candidate)
+            continue
+
+        selected.append(
+            {
+                **candidate,
+                "novelty_gain": len(candidate["graph_nodes"]) + len(candidate["graph_edges"]),
+                "max_selected_overlap": round(max_overlap, 6),
+            }
+        )
+        if candidate.get("full_doc_id"):
+            doc_counts[candidate["full_doc_id"]] += 1
+
+    if len(selected) < top_k:
+        deferred.sort(
+            key=lambda item: (
+                doc_counts.get(item.get("full_doc_id"), 0),
+                max(
+                    [
+                        _provenance_overlap(
+                            item["graph_nodes"],
+                            item["graph_edges"],
+                            existing["graph_nodes"],
+                            existing["graph_edges"],
+                        )
+                        for existing in selected
+                    ]
+                    or [0.0]
+                ),
+                -item["base_score"],
+                -(len(item["graph_nodes"]) + len(item["graph_edges"])),
+                item["chunk_id"],
+            )
+        )
+        for candidate in deferred:
+            if len(selected) >= top_k:
+                break
+            same_doc_count = doc_counts.get(candidate.get("full_doc_id"), 0)
+            same_band = any(
+                _same_doc_band(
+                    chunk_store.get(existing["chunk_id"], {}),
+                    chunk_store.get(candidate["chunk_id"], {}),
+                    same_doc_window,
+                )
+                for existing in selected
+            )
+            # Even in the relaxed pass, do not allow adjacent chunk roots.
+            if same_band or same_doc_count >= relaxed_max_same_doc_roots:
+                continue
+            overlaps = [
+                _provenance_overlap(
+                    candidate["graph_nodes"],
+                    candidate["graph_edges"],
+                    existing["graph_nodes"],
+                    existing["graph_edges"],
+                )
+                for existing in selected
+            ]
+            max_overlap = max(overlaps) if overlaps else 0.0
+            if max_overlap > relaxed_max_provenance_overlap:
+                continue
+            selected.append(
+                {
+                    **candidate,
+                    "novelty_gain": len(candidate["graph_nodes"]) + len(candidate["graph_edges"]),
+                    "max_selected_overlap": round(max_overlap, 6),
+                }
+            )
+            if candidate.get("full_doc_id"):
+                doc_counts[candidate["full_doc_id"]] += 1
+
+    top_score = max((item["base_score"] for item in selected), default=1.0)
+    return [
+        {
+            key: value
+            for key, value in {
+                **item,
+                "score_norm": item["base_score"] / max(top_score, 1e-9),
+                "selection_score": item["base_score"],
+            }.items()
+            if key not in {"graph_nodes", "graph_edges"}
+        }
+        for item in selected
+    ]
 
 
 def score_root_nodes(query, root_nodes, graph, node_to_chunks, root_chunk_score_lookup):
-    """Rank root nodes so structural association starts from strong anchors."""
+    """Rank root nodes by support first, using query relevance only as tie-break."""
     scored = []
     for node_id in root_nodes:
         node_data = graph.nodes[node_id]
@@ -287,11 +428,10 @@ def score_root_nodes(query, root_nodes, graph, node_to_chunks, root_chunk_score_
             ),
         )
         support, chunk_alignment = support_score(node_to_chunks.get(node_id, set()), root_chunk_score_lookup)
-        score = 0.55 * query_rel + 0.25 * support + 0.20 * chunk_alignment
         scored.append(
             {
                 "id": node_id,
-                "score": round(score, 6),
+                "score": round(support, 6),
                 "query_rel": round(query_rel, 6),
                 "support": round(support, 6),
                 "chunk_alignment": round(chunk_alignment, 6),
@@ -300,12 +440,12 @@ def score_root_nodes(query, root_nodes, graph, node_to_chunks, root_chunk_score_
                 "source_chunk_ids": sorted(node_to_chunks.get(node_id, set())),
             }
         )
-    scored.sort(key=lambda item: (-item["score"], item["id"]))
+    scored.sort(key=lambda item: (-item["support"], -item["chunk_alignment"], -item["query_rel"], item["id"]))
     return scored
 
 
 def score_root_edges(query, root_edges, graph, edge_to_chunks, root_chunk_score_lookup):
-    """Rank root edges as relation-first anchors for later expansion."""
+    """Rank root edges by support first, with edge weight as secondary signal."""
     scored = []
     for edge_id in root_edges:
         edge_data = graph.get_edge_data(edge_id[0], edge_id[1]) or {}
@@ -320,11 +460,10 @@ def score_root_edges(query, root_edges, graph, edge_to_chunks, root_chunk_score_
         query_rel = lexical_overlap_score(query, edge_text)
         support, chunk_alignment = support_score(edge_to_chunks.get(edge_id, set()), root_chunk_score_lookup)
         weight_term = math.log1p(float(edge_data.get("weight", 0.0) or 0.0)) / 5.0
-        score = 0.50 * query_rel + 0.20 * support + 0.15 * chunk_alignment + 0.15 * weight_term
         scored.append(
             {
                 "edge": edge_id,
-                "score": round(score, 6),
+                "score": round(support, 6),
                 "query_rel": round(query_rel, 6),
                 "support": round(support, 6),
                 "chunk_alignment": round(chunk_alignment, 6),
@@ -335,5 +474,5 @@ def score_root_edges(query, root_edges, graph, edge_to_chunks, root_chunk_score_
                 "source_chunk_ids": sorted(edge_to_chunks.get(edge_id, set())),
             }
         )
-    scored.sort(key=lambda item: (-item["score"], item["edge"]))
+    scored.sort(key=lambda item: (-item["support"], -item["weight_term"], -item["query_rel"], item["edge"]))
     return scored

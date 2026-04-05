@@ -10,11 +10,12 @@ from .association import (
     build_node_role_sets,
     expand_associative_graph,
 )
-from .context import build_knowledge_groups, build_prompt_context
-from .data import build_chunk_mappings, load_graph_corpus, load_query_rows
+from .context import build_prompt_context
+from .data import build_chunk_mappings, build_chunk_neighborhoods, load_graph_corpus, load_query_rows
 from .embedding_client import OpenAICompatibleEmbeddingClient
 from .logging_utils import log, shorten
-from .retrieval import BM25Index, DenseChunkIndex, HybridChunkRetriever, rerank_root_chunks, score_root_edges, score_root_nodes
+from .organization import build_answer_facet_groups
+from .retrieval import BM25Index, DenseChunkIndex, HybridChunkRetriever, score_root_edges, score_root_nodes, select_diverse_root_chunks
 
 
 def summarize_results(results):
@@ -42,7 +43,8 @@ def _format_root_chunk_preview(root_chunk_hits, chunk_store, limit=3):
         chunk = chunk_store.get(item["chunk_id"], {})
         preview = shorten(chunk.get("content", ""), 90)
         previews.append(
-            f"{item['chunk_id']} score={item['score_norm']:.3f} qrel={item.get('query_rel', 0.0):.3f} :: {preview}"
+            f"{item['chunk_id']} score={item['score_norm']:.3f} novelty={item.get('novelty_gain', 0)} "
+            f"overlap={item.get('max_selected_overlap', 0.0):.3f} :: {preview}"
         )
     return previews
 
@@ -50,23 +52,35 @@ def _format_root_chunk_preview(root_chunk_hits, chunk_store, limit=3):
 def _format_round_preview(round_info):
     lines = [
         f"round={round_info['round']} structural_paths={round_info['structural_path_count']} "
+        f"structural_chunks={round_info.get('structural_chunk_bridge_count', 0)} "
         f"+nodes={round_info['structural_added_node_count']} +edges={round_info['structural_added_edge_count']} "
+        f"semantic_chunks={round_info.get('semantic_chunk_coverage_count', 0)} "
         f"semantic +nodes={round_info['semantic_added_node_count']} +edges={round_info['semantic_added_edge_count']} "
         f"current=({round_info['current_node_count']}n/{round_info['current_edge_count']}e)"
     ]
     for path_item in round_info.get("structural_path_preview", []):
         lines.append(
-            f"  structural: score={path_item['score']:.3f} span={path_item['support_span']:.2f} "
+            f"  structural: bridge={path_item['score']:.3f} new_sources={path_item['new_source_count']} "
             f"path={' -> '.join(path_item['path'])}"
+        )
+    for chunk_item in round_info.get("structural_chunk_preview", []):
+        lines.append(
+            f"  structural-chunk: bridge={chunk_item['bridge_gain']:.3f} touch={chunk_item['frontier_touch']} "
+            f"new_sources={chunk_item['new_source_count']} {chunk_item['chunk_id']}"
         )
     for edge_item in round_info.get("semantic_edge_preview", []):
         lines.append(
-            f"  semantic-edge: score={edge_item['score']:.3f} rel={edge_item['query_rel']:.3f} "
+            f"  coverage-edge: gain={edge_item['score']:.3f} new_sources={edge_item['new_source_count']} "
             f"{edge_item['edge'][0]} -> {edge_item['edge'][1]} [{edge_item['category']}]"
         )
     for node_item in round_info.get("semantic_node_preview", []):
         lines.append(
-            f"  semantic-node: score={node_item['score']:.3f} bridge={node_item['bridge_strength']:.2f} {node_item['id']}"
+            f"  coverage-node: gain={node_item['score']:.3f} bridge={node_item['bridge_strength']:.2f} {node_item['id']}"
+        )
+    for chunk_item in round_info.get("semantic_chunk_preview", []):
+        lines.append(
+            f"  coverage-chunk: nodes={chunk_item['new_node_count']} edges={chunk_item['new_edge_count']} "
+            f"new_sources={chunk_item['new_source_count']} {chunk_item['chunk_id']}"
         )
     return lines
 
@@ -112,9 +126,8 @@ def run_query(
     """Run the full retrieval pipeline for a single query.
 
     Flow:
-    dense/bm25 retrieval -> root rerank -> adaptive budget selection ->
-    alternating graph association -> knowledge group construction ->
-    final prompt context assembly
+    chunk retrieval -> diverse root selection -> grounded graph association ->
+    query-aware organization -> final prompt context assembly
     """
     prefix = f"[query {query_index}/{total_queries}] " if query_index is not None and total_queries is not None else ""
     log(f"{prefix}start {query_row['group_id']} :: {query_row['query']}")
@@ -127,8 +140,7 @@ def run_query(
     )
     candidate_chunk_hits = chunk_retriever.search(query_row["query"], top_k=candidate_top_k)
     log(f"{prefix}retrieval candidates={len(candidate_chunk_hits)} mode={cfg['retrieval_mode']}")
-    root_chunk_hits = rerank_root_chunks(
-        query=query_row["query"],
+    root_chunk_hits = select_diverse_root_chunks(
         candidate_hits=candidate_chunk_hits,
         chunk_store=chunk_store,
         chunk_to_nodes=chunk_to_nodes,
@@ -158,8 +170,7 @@ def run_query(
         edge_to_chunks=edge_to_chunks,
         base_cfg=cfg,
     )
-    # Keep the adaptive controller optional so fixed-budget ablations remain easy.
-    if not cfg.get("adaptive_control", True):
+    if not cfg.get("adaptive_control", False):
         adaptive_profile = {
             **adaptive_profile,
             "adapted_budgets": {
@@ -173,9 +184,11 @@ def run_query(
                 "max_source_chunks": cfg["max_source_chunks"],
                 "max_source_word_budget": cfg["max_source_word_budget"],
             },
+            "query_style": "disabled",
         }
     adapted = adaptive_profile["adapted_budgets"]
-    log(f"{prefix}{_format_adaptive_preview(adaptive_profile)}")
+    if cfg.get("adaptive_control", False):
+        log(f"{prefix}{_format_adaptive_preview(adaptive_profile)}")
 
     top_root_nodes = score_root_nodes(
         query=query_row["query"],
@@ -203,6 +216,7 @@ def run_query(
         chunk_to_edges=chunk_to_edges,
         node_to_chunks=node_to_chunks,
         edge_to_chunks=edge_to_chunks,
+        chunk_neighbors=cfg["chunk_neighbors"],
         top_root_nodes=cfg["top_root_nodes"],
         top_root_edges=cfg["top_root_edges"],
         max_hop=cfg["max_hop"],
@@ -227,13 +241,16 @@ def run_query(
         structural_edges=set(expansion["all_structural_edges"]),
         semantic_edges=expansion["all_semantic_edges"],
     )
-    knowledge_groups = build_knowledge_groups(
+    facet_groups, query_contract = build_answer_facet_groups(
         query=query_row["query"],
         graph=graph,
         final_nodes=expansion["final_nodes"],
         final_edges=expansion["final_edges"],
-        node_roles=node_roles,
-        edge_roles=edge_roles,
+        root_chunk_ids=root_chunk_ids,
+        last_structural_output=expansion["last_structural_output"],
+        chunk_neighbors=cfg["chunk_neighbors"],
+        chunk_to_nodes=chunk_to_nodes,
+        chunk_to_edges=chunk_to_edges,
         node_to_chunks=node_to_chunks,
         edge_to_chunks=edge_to_chunks,
         chunk_store=chunk_store,
@@ -241,6 +258,7 @@ def run_query(
     )
     prompt_payload = build_prompt_context(
         query_row=query_row,
+        query_contract=query_contract,
         root_chunk_hits=root_chunk_hits,
         top_root_nodes=top_root_nodes,
         top_root_edges=top_root_edges,
@@ -250,7 +268,7 @@ def run_query(
         semantic_edges=expansion["all_semantic_edges"],
         final_nodes=expansion["final_nodes"],
         final_edges=expansion["final_edges"],
-        knowledge_groups=knowledge_groups,
+        facet_groups=facet_groups,
         chunk_store=chunk_store,
         node_to_chunks=node_to_chunks,
         edge_to_chunks=edge_to_chunks,
@@ -260,7 +278,7 @@ def run_query(
     log(
         f"{prefix}done roots=({len(root_nodes)}n/{len(root_edges)}e) "
         f"final=({len(expansion['final_nodes'])}n/{len(expansion['final_edges'])}e) "
-        f"groups={len(knowledge_groups)} sources={prompt_payload['selected_source_chunk_count']} "
+        f"groups={len(facet_groups)} sources={prompt_payload['selected_source_chunk_count']} "
         f"words={prompt_payload['selected_source_word_count']}"
     )
     return {
@@ -268,6 +286,7 @@ def run_query(
         "candidate_root_chunks": candidate_chunk_hits,
         "root_chunks": root_chunk_hits,
         "query_style": adaptive_profile["query_style"],
+        "query_contract": query_contract,
         "adaptive_profile": adaptive_profile,
         "stats": {
             "root_chunk_count": len(root_chunk_hits),
@@ -277,16 +296,23 @@ def run_query(
             "top_root_edge_count": len(top_root_edges),
             "association_round_count": len(expansion["rounds"]),
             "structural_path_count": sum(item["structural_path_count"] for item in expansion["rounds"]),
+            "structural_chunk_bridge_count": sum(
+                item.get("structural_chunk_bridge_count", 0) for item in expansion["rounds"]
+            ),
             "structural_added_node_count": len(expansion["all_structural_nodes"]),
             "structural_added_edge_count": len(expansion["all_structural_edges"]),
             "semantic_added_node_count": len(expansion["all_semantic_nodes"]),
             "semantic_added_edge_count": len({item["edge"] for item in expansion["all_semantic_edges"]}),
+            "semantic_chunk_coverage_count": sum(
+                item.get("semantic_chunk_coverage_count", 0) for item in expansion["rounds"]
+            ),
             "final_node_count": len(expansion["final_nodes"]),
             "final_edge_count": len(expansion["final_edges"]),
-            "knowledge_group_count": len(knowledge_groups),
+            "facet_group_count": len(facet_groups),
+            "knowledge_group_count": len(facet_groups),
             "selected_source_chunk_count": prompt_payload["selected_source_chunk_count"],
             "selected_source_word_count": prompt_payload["selected_source_word_count"],
-            "association_strength": adaptive_profile["association_strength"],
+            "association_strength": adaptive_profile.get("association_strength", 0.0),
             "root_density": adaptive_profile["graph_features"]["root_density"],
             "root_fragmentation": adaptive_profile["graph_features"]["fragmentation"],
             "candidate_chunk_dispersion": adaptive_profile["candidate_features"]["candidate_chunk_dispersion"],
@@ -303,7 +329,8 @@ def run_query(
             "selected_edges": expansion["all_semantic_edges"],
             "selected_nodes": [{"id": node_id} for node_id in expansion["all_semantic_nodes"]],
         },
-        "knowledge_groups": knowledge_groups,
+        "facet_groups": facet_groups,
+        "knowledge_groups": facet_groups,
         "prompt_context": prompt_payload["context"],
     }
 
@@ -337,6 +364,7 @@ def retrieve_corpus_queries(
     )
     chunk_ids = list(chunk_store.keys())
     chunk_to_nodes, chunk_to_edges, node_to_chunks, edge_to_chunks = build_chunk_mappings(graph, chunk_ids)
+    chunk_neighbors = build_chunk_neighborhoods(chunk_store, radius=1)
     query_rows = load_query_rows(
         rewrites_file=Path(rewrites_file) if rewrites_file else None,
         questions_file=Path(questions_file) if questions_file else None,
@@ -353,7 +381,7 @@ def retrieve_corpus_queries(
             chunk_to_edges=chunk_to_edges,
             node_to_chunks=node_to_chunks,
             edge_to_chunks=edge_to_chunks,
-            cfg=cfg,
+            cfg={**cfg, "chunk_neighbors": chunk_neighbors},
             query_index=index,
             total_queries=len(query_rows),
         )

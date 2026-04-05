@@ -8,13 +8,28 @@ from .logging_utils import log
 
 
 JUDGE_SYSTEM_PROMPT = """---Role---
-You are an expert tasked with evaluating two answers to the same question based on three criteria: **Comprehensiveness**, **Diversity**, and **Empowerment**.
+You are an expert tasked with evaluating two answers to the same question.
+You must also identify what kind of organization the query requires and what kind of organization each answer actually uses.
 """
 
 
 FG_RAG_EVALUATE_PROMPT = """---Goal---
 
-You will evaluate two answers to the same question based on three criteria: **Comprehensiveness**, **Diversity**, and **Empowerment**.
+You will evaluate two answers to the same question based on:
+
+- **Comprehensiveness**
+- **Diversity**
+- **Empowerment**
+- **Focus Match**
+- **Evidence Anchoring**
+
+First classify the query's required organization contract as exactly one of:
+- `section-grounded`
+- `mechanism-grounded`
+- `comparison-grounded`
+- `theme-grounded`
+
+Then classify each answer's dominant organization type using the same four labels.
 
 - **Comprehensiveness**: How much detail does the answer provide to cover all aspects and details of the question?
 
@@ -22,7 +37,15 @@ You will evaluate two answers to the same question based on three criteria: **Co
 
 - **Empowerment**: How well does the answer help the reader understand and make informed judgments about the topic?
 
-For each criterion, choose the better answer (ether Answer 1 or Answer 2) and explain why. Then, select an overal winner based on these three categories.
+- **Focus Match**: How well does the answer's organization match what the query actually requires?
+  Examples:
+  - if the query needs section-grounded organization, a thematic overview is a mismatch
+  - if the query needs mechanism-grounded organization, generic advice is a mismatch
+  - if the query needs comparison-grounded organization, a broad summary without clear contrasts is a mismatch
+
+- **Evidence Anchoring**: How well is the answer's chosen organization stably anchored in corpus-specific evidence rather than only sounding plausible?
+
+For each criterion, choose the better answer (ether Answer 1 or Answer 2) and explain why. Then, select an overal winner based on these criteria as a whole.
 
 Here is the question:
 {input_query}
@@ -35,14 +58,19 @@ Here are the two answers:
 **Answer 2:**
 {second_answer}
 
-Evaluate both answers using the three criteria listed above and provide detailed explanations for each criterion.
+Evaluate both answers using the criteria listed above and provide detailed explanations for each criterion.
 
 Output your evaluation in the following JSON format:
 
 {{
+    "Query Organization Need": {{ "Label": "[section-grounded | mechanism-grounded | comparison-grounded | theme-grounded]", "Explanation": "[Why this query needs that organization]" }},
+    "Answer 1 Organization": {{ "Label": "[section-grounded | mechanism-grounded | comparison-grounded | theme-grounded]", "Explanation": "[What organization Answer 1 actually uses]" }},
+    "Answer 2 Organization": {{ "Label": "[section-grounded | mechanism-grounded | comparison-grounded | theme-grounded]", "Explanation": "[What organization Answer 2 actually uses]" }},
     "Comprehensiveness": {{ "Winner": "[Answer 1 or Answer 2]", "Explanation": "[Provide explanation here]" }} ,
     "Diversity": {{ "Winner": "[Answer 1 or Answer 2]", "Explanation": "[Provide explanation here]" }} ,
     "Empowerment": {{ "Winner": "[Answer 1 or Answer 2]", "Explanation": "[Provide explanation here]" }} ,
+    "Focus Match": {{ "Winner": "[Answer 1 or Answer 2]", "Explanation": "[Which answer better matches the query's required organization and why]" }} ,
+    "Evidence Anchoring": {{ "Winner": "[Answer 1 or Answer 2]", "Explanation": "[Which answer is better anchored in evidence for its chosen organization and why]" }} ,
     "Overall Winner": {{ "Winner": "[Answer 1 or Answer 2]", "Explanation": "[Summarize why ths answer is the overall winner based on the three criteria]" }}
 }}
 """
@@ -97,8 +125,17 @@ CRITERIA_KEYS = [
     "Comprehensiveness",
     "Diversity",
     "Empowerment",
+    "Focus Match",
+    "Evidence Anchoring",
     "Overall Winner",
 ]
+
+ORGANIZATION_LABELS = {
+    "section-grounded",
+    "mechanism-grounded",
+    "comparison-grounded",
+    "theme-grounded",
+}
 
 
 def _map_letter_winner(winner):
@@ -132,6 +169,42 @@ def _fallback_verdict():
             "Explanation": "Evaluator output could not be parsed reliably; treated as a tie for robustness.",
         }
         for key in CRITERIA_KEYS
+    }
+
+
+def _normalize_contract_label(raw_value):
+    value = (raw_value or "").strip().lower()
+    if value in ORGANIZATION_LABELS:
+        return value
+    if "section" in value:
+        return "section-grounded"
+    if "mechan" in value or "cause" in value or "process" in value:
+        return "mechanism-grounded"
+    if "compar" in value or "contrast" in value:
+        return "comparison-grounded"
+    return "theme-grounded"
+
+
+def _extract_organization_analysis(verdict_ab, verdict_ba_raw):
+    query_contract_ab = _normalize_contract_label(verdict_ab.get("Query Organization Need", {}).get("Label", ""))
+    query_contract_ba = _normalize_contract_label(verdict_ba_raw.get("Query Organization Need", {}).get("Label", ""))
+    query_contract = query_contract_ab if query_contract_ab == query_contract_ba else query_contract_ab
+    candidate_labels = [
+        _normalize_contract_label(verdict_ab.get("Answer 1 Organization", {}).get("Label", "")),
+        _normalize_contract_label(verdict_ba_raw.get("Answer 2 Organization", {}).get("Label", "")),
+    ]
+    baseline_labels = [
+        _normalize_contract_label(verdict_ab.get("Answer 2 Organization", {}).get("Label", "")),
+        _normalize_contract_label(verdict_ba_raw.get("Answer 1 Organization", {}).get("Label", "")),
+    ]
+    candidate_contract = Counter(candidate_labels).most_common(1)[0][0]
+    baseline_contract = Counter(baseline_labels).most_common(1)[0][0]
+    return {
+        "query_contract": query_contract,
+        "candidate_answer_contract": candidate_contract,
+        "baseline_answer_contract": baseline_contract,
+        "candidate_matches_query_contract": candidate_contract == query_contract,
+        "baseline_matches_query_contract": baseline_contract == query_contract,
     }
 
 
@@ -171,6 +244,7 @@ def judge_pair(query, candidate_answer, baseline_answer, llm_client):
     return {
         "order_ab": verdict_ab,
         "order_ba": verdict_ba_raw,
+        "organization_analysis": _extract_organization_analysis(verdict_ab, verdict_ba_raw),
         "mapped_overall_votes": {
             "candidate": votes["a"],
             "baseline": votes["b"],
@@ -234,6 +308,20 @@ def run_winrate_judgement(questions, candidate_answers, baseline_answers, llm_cl
             "tie_probability": round(counter["tie"] / max(total_votes, 1), 4),
             "total_votes": total_votes,
         }
+    organization_summary = {
+        "query_contracts": Counter(),
+        "candidate_answer_contracts": Counter(),
+        "baseline_answer_contracts": Counter(),
+        "candidate_contract_matches": 0,
+        "baseline_contract_matches": 0,
+    }
+    for verdict in verdicts:
+        analysis = verdict["organization_analysis"]
+        organization_summary["query_contracts"][analysis["query_contract"]] += 1
+        organization_summary["candidate_answer_contracts"][analysis["candidate_answer_contract"]] += 1
+        organization_summary["baseline_answer_contracts"][analysis["baseline_answer_contract"]] += 1
+        organization_summary["candidate_contract_matches"] += int(analysis["candidate_matches_query_contract"])
+        organization_summary["baseline_contract_matches"] += int(analysis["baseline_matches_query_contract"])
     payload = {
         "summary": {
             "total": total,
@@ -244,6 +332,13 @@ def run_winrate_judgement(questions, candidate_answers, baseline_answers, llm_cl
             "baseline_win_rate": round(summary_counter["baseline"] / max(total, 1), 4),
         },
         "criteria_summary": dimension_summary,
+        "organization_summary": {
+            "query_contracts": dict(organization_summary["query_contracts"]),
+            "candidate_answer_contracts": dict(organization_summary["candidate_answer_contracts"]),
+            "baseline_answer_contracts": dict(organization_summary["baseline_answer_contracts"]),
+            "candidate_contract_match_rate": round(organization_summary["candidate_contract_matches"] / max(total, 1), 4),
+            "baseline_contract_match_rate": round(organization_summary["baseline_contract_matches"] / max(total, 1), 4),
+        },
         "verdicts": verdicts,
     }
     if output_path is not None:

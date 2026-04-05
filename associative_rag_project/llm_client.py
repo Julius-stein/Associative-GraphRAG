@@ -8,14 +8,53 @@ from .config import load_llm_config
 from .logging_utils import log
 
 
-GENERATION_SYSTEM_PROMPT = """You are an expert at query-focused summarization.
-Use the provided evidence package to synthesize a coherent answer to the query.
-Prioritize multi-source aggregation, theme organization, and explicit uncertainty when evidence is thin.
-Do not mention that the input came from a graph or a retrieval system unless the user asks.
-Prefer breadth across well-supported themes over over-explaining one narrow thread."""
+GENERATION_SYSTEM_PROMPT = """You are an expert at evidence-grounded question answering.
+Answer the user's query directly using the provided evidence package.
+Match the shape of the answer to the query: explain mechanisms when asked how, compare when asked to compare, and name concrete examples when the query points to people, periods, sections, or items.
+Synthesize across sources when it helps, but do not inflate the answer into a broad thematic essay unless the query truly calls for that.
+State uncertainty briefly when evidence is thin or mixed.
+Do not mention that the input came from a graph or a retrieval system unless the user asks."""
 
 
-def build_generation_prompt(query, prompt_context, query_style="balanced"):
+def _contract_template_hints(query_contract: str) -> str:
+    if query_contract == "section-grounded":
+        return """Default answer shape for this query:
+- Prefer following the relevant sections, periods, parts, or local evidence bands.
+- Keep the answer anchored to those units instead of drifting into a free-form overview."""
+    if query_contract == "mechanism-grounded":
+        return """Default answer shape for this query:
+- Prefer explaining what drove the change, how it operated, and what it affected.
+- Keep causal links explicit instead of replacing them with broad topical coverage."""
+    if query_contract == "comparison-grounded":
+        return """Default answer shape for this query:
+- Prefer an explicit side-by-side comparison or clear comparison dimensions.
+- Surface both commonalities and differences when the evidence supports them."""
+    return """Default answer shape for this query:
+- Group the answer by the strongest recurring themes only when that actually matches the question.
+- Use representative examples to keep each theme concrete and query-focused."""
+
+
+def _is_broad_theme_query(query: str, query_contract: str) -> bool:
+    if query_contract != "theme-grounded":
+        return False
+    query_lower = " ".join(query.lower().split())
+    broad_cues = (
+        "what are the primary reasons",
+        "what are the reasons",
+        "what are the benefits",
+        "what are the potential benefits",
+        "what strategies",
+        "what essential aspects",
+        "what aspects",
+        "what factors",
+        "what themes",
+        "what examples",
+        "which external resources",
+    )
+    return any(cue in query_lower for cue in broad_cues)
+
+
+def build_generation_prompt(query, prompt_context, query_style="balanced", query_contract="theme-grounded"):
     """Build a QFS-oriented prompt from the evidence package and query style."""
     query_lower = query.lower()
     extra_constraints = []
@@ -24,30 +63,40 @@ def build_generation_prompt(query, prompt_context, query_style="balanced"):
     if any(term in query_lower for term in ["historical", "history", "socio-political", "conflict", "conflicts"]):
         extra_constraints.append("- Emphasize comparative historical interpretation, not metadata about how the evidence was collected or modeled.")
     if query_style == "synthesis":
-        extra_constraints.append("- Emphasize cross-source patterns, contrasts, and thematic structure.")
+        extra_constraints.append("- Emphasize cross-source patterns and contrasts, but keep the answer shaped by the query rather than by a generic overview template.")
     elif query_style == "concrete":
         extra_constraints.append("- Prioritize concrete, practical, and directly supported points. Avoid broad contextual expansion unless it clearly helps answer the question.")
+    if _is_broad_theme_query(query, query_contract):
+        extra_constraints.extend(
+            [
+                "- This query supports broader coverage, but only include aspects that are clearly relevant to the wording of the question.",
+                "- Cover the main supported aspects before adding secondary ones, and stop once the query is answered.",
+                "- Use the coverage checklist as a reminder, not as an obligation to expand the answer.",
+            ]
+        )
     extra_block = "\n".join(extra_constraints)
+    contract_hint_block = _contract_template_hints(query_contract)
     return f"""Answer the query using the evidence package below.
 
 Requirements:
 - Write a concise but substantive query-focused summary.
-- Organize the answer around major themes or aspects of the query.
-- Synthesize across sources instead of listing isolated facts.
-- Prefer themes supported by multiple groups, relations, or source chunks.
+- Answer the question in the form it asks for; do not default to a broad thematic survey.
+- Start from the most direct answer, then add supporting synthesis only where it helps.
+- Synthesize across sources instead of listing isolated facts, but keep concrete examples and named items when they are central to the query.
 - Ignore isolated low-support peripheral items unless they clearly strengthen the answer.
 - Focus on the substantive content of passages, characters, events, and themes.
 - Unless the query explicitly asks about datasets, models, benchmarks, or methods, do not center the answer on metadata, annotation schemes, or NLP systems.
 - If the evidence is partial or mixed, say so briefly.
 - Do not fabricate details outside the evidence.
-- Read the evidence package group-first rather than table-first.
-- Treat each knowledge group dossier as one thematic slice of evidence.
-- First identify the 2-4 knowledge groups that best match the query's main aspects.
-- For each chosen group, read its summary and linked-source previews before consulting the full Sources table.
-- Use the Sources table through linked source ids from the chosen groups, rather than summarizing the Root Chunks table by itself.
-- Use Focused Entities and Focused Relations as optional indexes to clarify a group's content, not as a requirement to mention every listed item.
-- You do not need to use every knowledge group. Prefer the best-supported groups and ignore peripheral groups that do not improve the answer.
-- When multiple groups support the same theme, merge them into one synthesized point instead of repeating them separately.
+- Use the facet groups and linked sources as evidence aids, not as a script for the final prose.
+- Let strong anchor evidence determine the main points; do not let a broad facet summary dominate if its support is weak for this query.
+- You do not need to use every facet group. Select the evidence that best answers the question.
+- Merge overlapping evidence when it supports the same point, but do not merge away distinctions the query cares about.
+- Read the facet summaries, linked-source previews, and sources together; avoid summarizing the Root Chunks table by itself.
+- Use Focused Entities and Focused Relations only when they help clarify the answer.
+
+Contract-Specific Hints:
+{contract_hint_block}
 {extra_block}
 
 Query:
@@ -92,12 +141,18 @@ def generate_answers(records, output_path, llm_client, max_workers=None):
     log(f"[answer] start total={len(records)} workers={max_workers} model={llm_client.model}")
 
     def _one(record):
-        prompt = build_generation_prompt(record["query"], record["prompt_context"], query_style=record.get("query_style", "balanced"))
+        prompt = build_generation_prompt(
+            record["query"],
+            record["prompt_context"],
+            query_style=record.get("query_style", "balanced"),
+            query_contract=record.get("query_contract", "theme-grounded"),
+        )
         answer = llm_client.generate(prompt)
         return {
             "group_id": record["group_id"],
             "query": record["query"],
             "query_style": record.get("query_style", "balanced"),
+            "query_contract": record.get("query_contract", "theme-grounded"),
             "model_answer": answer,
             "stats": record["stats"],
         }

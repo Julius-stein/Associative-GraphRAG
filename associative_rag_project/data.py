@@ -9,8 +9,50 @@ import networkx as nx
 from .common import edge_key, parse_source_ids
 
 
+def infer_corpus_name(corpus_path: str | Path) -> str:
+    """Infer a dataset name from either a corpus name or a dataset path.
+
+    Supported examples:
+    - `agriculture` -> `agriculture`
+    - `Datasets/agriculture` -> `agriculture`
+    - `Datasets/agriculture/corpus` -> `agriculture`
+    - `Datasets/agriculture/corpus/agriculture_unique_contexts.json` -> `agriculture`
+    """
+    path = Path(corpus_path)
+    parts = [part for part in path.parts if part not in {".", ""}]
+    if not parts:
+        return str(corpus_path)
+
+    leaf = parts[-1]
+    if leaf in {"corpus", "query", "output", "index"} and len(parts) >= 2:
+        return parts[-2]
+
+    if leaf.endswith(".json") and len(parts) >= 3 and parts[-2] == "corpus":
+        return parts[-3]
+
+    if len(parts) >= 2 and parts[-2] in {"corpus", "query", "output", "index"}:
+        return parts[-1]
+
+    return path.stem if path.suffix else leaf
+
+
 def extract_questions(file_path: Path) -> list[str]:
-    """Read the benchmark question file format used in this repo."""
+    """Read benchmark questions from either text or JSON files."""
+    if file_path.suffix.lower() == ".json":
+        payload = json.loads(file_path.read_text(encoding="utf-8"))
+        if isinstance(payload, list):
+            questions = []
+            for item in payload:
+                if isinstance(item, str):
+                    questions.append(item.strip())
+                elif isinstance(item, dict):
+                    query = item.get("query")
+                    if query:
+                        questions.append(str(query).strip())
+            if questions:
+                return questions
+        raise ValueError(f"Unsupported JSON question format: {file_path}")
+
     data = file_path.read_text(encoding="utf-8").replace("**", "")
     matches = re.findall(r"- Question \d+: (.+)", data)
     if matches:
@@ -62,9 +104,36 @@ def resolve_questions_file(corpus_name: str, explicit_path: str | None):
     """Find the default question file for a corpus unless the user overrides it."""
     if explicit_path:
         return Path(explicit_path)
-    candidate = Path("datasets/questions") / f"{corpus_name}_questions.txt"
-    if candidate.exists():
-        return candidate
+
+    query_dir = Path("Datasets") / corpus_name / "query"
+    if not query_dir.exists():
+        return None
+
+    preferred_candidates = [
+        query_dir / f"{corpus_name}.json",
+        query_dir / f"{corpus_name}.txt",
+        query_dir / f"{corpus_name}_questions.json",
+        query_dir / f"{corpus_name}_questions.txt",
+        query_dir / "questions.json",
+        query_dir / "questions.txt",
+        query_dir / "query.json",
+        query_dir / "query.txt",
+    ]
+    for candidate in preferred_candidates:
+        if candidate.exists():
+            return candidate
+
+    fallback_files = sorted(
+        [
+            path
+            for path in query_dir.iterdir()
+            if path.is_file() and path.suffix.lower() in {".json", ".txt"}
+        ]
+    )
+    if len(fallback_files) == 1:
+        return fallback_files[0]
+    if fallback_files:
+        return fallback_files[0]
     return None
 
 
@@ -73,6 +142,7 @@ def resolve_baseline_file(corpus_name: str, explicit_path: str | None):
     if explicit_path:
         return Path(explicit_path)
     candidates = [
+        Path("Datasets") / f"{corpus_name}" / "output" / f"FG-RAG-4o-mini.json",
         Path("FG-RAG") / f"{corpus_name}" / "output" / f"FG-RAG-4o-mini.json",
     ]
     for candidate in candidates:
@@ -111,6 +181,31 @@ def build_chunk_mappings(graph, chunk_ids):
             if chunk_id in chunk_id_set:
                 chunk_to_edges[chunk_id].add(ek)
     return chunk_to_nodes, chunk_to_edges, node_to_chunks, edge_to_chunks
+
+
+def build_chunk_neighborhoods(chunk_store, radius=1):
+    """Build local same-document chunk neighborhoods.
+
+    This gives the pipeline a lightweight section-like continuity signal without
+    changing the original chunking scheme.
+    """
+    by_doc = {}
+    for chunk_id, chunk in chunk_store.items():
+        full_doc_id = chunk.get("full_doc_id")
+        if not full_doc_id:
+            continue
+        by_doc.setdefault(full_doc_id, []).append((chunk.get("chunk_order_index", -1), chunk_id))
+
+    neighborhoods = {chunk_id: set() for chunk_id in chunk_store}
+    for _, items in by_doc.items():
+        items.sort()
+        ordered_ids = [chunk_id for _, chunk_id in items]
+        for index, chunk_id in enumerate(ordered_ids):
+            left = max(0, index - radius)
+            right = min(len(ordered_ids), index + radius + 1)
+            neighborhoods[chunk_id].update(ordered_ids[left:right])
+            neighborhoods[chunk_id].discard(chunk_id)
+    return neighborhoods
 
 
 def load_baseline_answers(result_path: Path):

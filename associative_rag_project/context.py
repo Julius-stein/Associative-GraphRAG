@@ -1,25 +1,18 @@
 """Turn the final graph into LLM-facing evidence groups and source bundles."""
 
-from collections import Counter
+from collections import Counter, defaultdict
 
 import networkx as nx
 
-from .common import (
-    approx_word_count,
-    build_csv,
-    lexical_overlap_score,
-    normalize_text,
-    query_prefers_technical_content,
-    technical_density,
-)
+from .common import approx_word_count, build_csv, lexical_overlap_score, normalize_text
 from .retrieval import normalize_relation_category
 
 
 def rank_supporting_chunks(final_nodes, final_edges, root_chunk_ids, node_to_chunks, edge_to_chunks):
-    """Rank chunks by how much final graph evidence they support.
+    """Rank chunks by direct support of the final graph.
 
-    Root chunks are strongly boosted so the answer always remains grounded in
-    the initial dense retrieval rather than drifting to graph-only evidence.
+    Root chunks are no longer forced to dominate via a huge constant boost.
+    Grounding is preserved later through anchor selection inside each group.
     """
     chunk_scores = Counter()
     for node_id in final_nodes:
@@ -27,9 +20,9 @@ def rank_supporting_chunks(final_nodes, final_edges, root_chunk_ids, node_to_chu
             chunk_scores[chunk_id] += 1
     for edge_id in final_edges:
         for chunk_id in edge_to_chunks.get(edge_id, set()):
-            chunk_scores[chunk_id] += 2
+            chunk_scores[chunk_id] += 1
     for chunk_id in root_chunk_ids:
-        chunk_scores[chunk_id] += 1000
+        chunk_scores[chunk_id] += 1
     return [chunk_id for chunk_id, _ in sorted(chunk_scores.items(), key=lambda item: (-item[1], item[0]))]
 
 
@@ -63,8 +56,21 @@ def _ranked_group_chunks(supporting_chunk_ids, rank_index, root_chunk_id_set):
     return roots, supports
 
 
+def _chunk_doc_and_order(chunk_store, chunk_id):
+    chunk = chunk_store.get(chunk_id, {})
+    return chunk.get("full_doc_id"), chunk.get("chunk_order_index")
+
+
+def _violates_local_band_cap(chunk_store, chunk_id, selected_orders_by_doc, band_radius=1, band_cap=2):
+    doc_id, order = _chunk_doc_and_order(chunk_store, chunk_id)
+    if doc_id is None or order is None:
+        return False
+    nearby = sum(1 for existing_order in selected_orders_by_doc.get(doc_id, []) if abs(existing_order - order) <= band_radius)
+    return nearby >= band_cap
+
+
 def choose_diverse_source_chunks(
-    knowledge_groups,
+    facet_groups,
     ranked_chunk_ids,
     chunk_store,
     root_chunk_ids,
@@ -73,40 +79,71 @@ def choose_diverse_source_chunks(
 ):
     """Pick source chunks with group diversity before falling back to global rank.
 
-    Each group first gets a chance to contribute one grounded root chunk and one
-    non-root support chunk. This keeps the final prompt centered on dense roots
-    while ensuring graph-expanded evidence survives into the final package.
+    Selection policy:
+    - each facet group gets a first chance to contribute one chunk
+    - then each facet can contribute one more chunk if budget remains
+    - finally global rank fills the rest
+
+    Adjacent chunks from the same document are capped so one dense support
+    chain cannot crowd out other useful facets.
     """
     selected_ids = []
     used_words = 0
     seen = set()
     root_chunk_id_set = set(root_chunk_ids)
     rank_index = {chunk_id: idx for idx, chunk_id in enumerate(ranked_chunk_ids)}
+    selected_orders_by_doc = defaultdict(list)
+    group_candidates = []
+
+    for group in facet_groups:
+        roots, supports = _ranked_group_chunks(group["supporting_chunk_ids"], rank_index, root_chunk_id_set)
+        ordered = []
+        for chunk_id in roots[:2] + supports[:6]:
+            if chunk_id not in ordered:
+                ordered.append(chunk_id)
+        group_candidates.append(ordered)
 
     def try_add(chunk_id):
         nonlocal used_words
         if chunk_id in seen or len(selected_ids) >= max_source_chunks:
-            return
+            return False
         chunk = chunk_store.get(chunk_id)
         if chunk is None:
-            return
+            return False
+        if _violates_local_band_cap(chunk_store, chunk_id, selected_orders_by_doc):
+            return False
         word_count = approx_word_count(chunk.get("content", ""))
         if selected_ids and used_words + word_count > max_source_word_budget:
-            return
+            return False
         selected_ids.append(chunk_id)
         seen.add(chunk_id)
         used_words += word_count
+        doc_id, order = _chunk_doc_and_order(chunk_store, chunk_id)
+        if doc_id is not None and order is not None:
+            selected_orders_by_doc[doc_id].append(order)
+        return True
 
-    for group in knowledge_groups:
-        roots, supports = _ranked_group_chunks(group["supporting_chunk_ids"], rank_index, root_chunk_id_set)
-        if roots:
-            try_add(roots[0])
-        elif supports:
-            try_add(supports[0])
-        if supports:
-            try_add(supports[0])
+    # Round 1: let each facet secure one chunk if possible.
+    for ordered_chunk_ids in group_candidates:
+        for chunk_id in ordered_chunk_ids:
+            if try_add(chunk_id):
+                break
         if len(selected_ids) >= max_source_chunks:
             break
+
+    # Round 2: allow each facet one more chunk before global fallback.
+    if len(selected_ids) < max_source_chunks:
+        for ordered_chunk_ids in group_candidates:
+            added = 0
+            for chunk_id in ordered_chunk_ids:
+                if chunk_id in seen:
+                    continue
+                if try_add(chunk_id):
+                    added += 1
+                if added >= 1:
+                    break
+            if len(selected_ids) >= max_source_chunks:
+                break
 
     for chunk_id in ranked_chunk_ids:
         try_add(chunk_id)
@@ -117,22 +154,94 @@ def choose_diverse_source_chunks(
     return selected, used_words
 
 
-def _build_group_summary(component_nodes, relation_categories, source_previews, chunk_count):
-    """Produce a short orienting summary for one knowledge group."""
+def _build_group_summary(component_nodes, relation_categories, source_previews, anchor_count):
+    """Produce a short orienting summary for one knowledge group.
+
+    The summary is intentionally anchor-based rather than component-based:
+    it should describe what the selected evidence anchors say, not summarize
+    every chunk connected to a large component.
+    """
     lead_entities = ", ".join(component_nodes[:3]) if component_nodes else "the retrieved evidence"
     themes = [theme for theme, _ in relation_categories.most_common(3) if theme]
     summary_parts = [f"This group centers on {lead_entities}."]
     if themes:
         summary_parts.append(f"It mainly connects evidence through {', '.join(themes)}.")
-    if chunk_count > 1:
-        summary_parts.append(f"It is supported by {chunk_count} chunks.")
+    if anchor_count > 1:
+        summary_parts.append(f"It is anchored by {anchor_count} evidence chunks.")
     if source_previews:
-        summary_parts.append(f"Representative evidence: {source_previews[0]['preview'][:180]}")
+        summary_parts.append(f"Representative anchor evidence: {source_previews[0]['preview'][:180]}")
     return " ".join(summary_parts)
 
 
-def build_knowledge_groups(
+def _group_overlap_ratio(left, right):
+    if not left or not right:
+        return 0.0
+    left = set(left)
+    right = set(right)
+    return len(left & right) / max(len(left | right), 1)
+
+
+def _build_anchor_previews(anchor_chunk_ids, chunk_store, limit=2):
+    previews = []
+    for chunk_id in anchor_chunk_ids[:limit]:
+        chunk = chunk_store.get(chunk_id, {})
+        previews.append(
+            {
+                "chunk_id": chunk_id,
+                "preview": " ".join(chunk.get("content", "").split())[:220],
+            }
+        )
+    return previews
+
+
+def _coverage_checklist_lines(facet_groups, limit=6):
+    lines = []
+    seen = set()
+    for group in facet_groups:
+        label = normalize_text(group.get("facet_label", ""))
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        themes = [normalize_text(theme) for theme in group.get("relation_themes", [])[:2] if normalize_text(theme)]
+        theme_suffix = f" [{', '.join(themes)}]" if themes else ""
+        lines.append(f"- {label}{theme_suffix}")
+        if len(lines) >= limit:
+            break
+    return lines
+
+
+def _build_chunk_local_index(final_nodes, final_edges, node_to_chunks, edge_to_chunks):
+    chunk_to_final_nodes = defaultdict(set)
+    chunk_to_final_edges = defaultdict(set)
+    for node_id in final_nodes:
+        for chunk_id in node_to_chunks.get(node_id, set()):
+            chunk_to_final_nodes[chunk_id].add(node_id)
+    for edge_id in final_edges:
+        for chunk_id in edge_to_chunks.get(edge_id, set()):
+            chunk_to_final_edges[chunk_id].add(edge_id)
+    return dict(chunk_to_final_nodes), dict(chunk_to_final_edges)
+
+
+def _rank_local_support_chunks(query, root_chunk_id, seed_nodes, seed_edges, node_to_chunks, edge_to_chunks, chunk_store):
+    support_chunk_ids = set()
+    for node_id in seed_nodes:
+        support_chunk_ids.update(node_to_chunks.get(node_id, set()))
+    for edge_id in seed_edges:
+        support_chunk_ids.update(edge_to_chunks.get(edge_id, set()))
+    support_chunk_ids.discard(root_chunk_id)
+    return sorted(
+        support_chunk_ids,
+        key=lambda chunk_id: (
+            -lexical_overlap_score(query, chunk_store.get(chunk_id, {}).get("content", "")),
+            -approx_word_count(chunk_store.get(chunk_id, {}).get("content", "")),
+            chunk_id,
+        ),
+    )
+
+
+def _build_anchor_local_group(
     query,
+    root_chunk_id,
     graph,
     final_nodes,
     final_edges,
@@ -141,98 +250,152 @@ def build_knowledge_groups(
     node_to_chunks,
     edge_to_chunks,
     chunk_store,
+    chunk_to_final_nodes,
+    chunk_to_final_edges,
+):
+    seed_nodes = set(chunk_to_final_nodes.get(root_chunk_id, set()))
+    seed_edges = set(chunk_to_final_edges.get(root_chunk_id, set()))
+    if not seed_nodes and not seed_edges:
+        return None
+
+    support_chunks = _rank_local_support_chunks(
+        query=query,
+        root_chunk_id=root_chunk_id,
+        seed_nodes=seed_nodes,
+        seed_edges=seed_edges,
+        node_to_chunks=node_to_chunks,
+        edge_to_chunks=edge_to_chunks,
+        chunk_store=chunk_store,
+    )
+    anchor_chunk_ids = [root_chunk_id] + support_chunks[:2]
+    local_nodes = set(seed_nodes)
+    local_edges = set(seed_edges)
+    for chunk_id in anchor_chunk_ids[1:]:
+        local_nodes.update(chunk_to_final_nodes.get(chunk_id, set()))
+        local_edges.update(chunk_to_final_edges.get(chunk_id, set()))
+    for edge_id in list(local_edges):
+        local_nodes.update(edge_id[:2])
+    local_edges.update(
+        edge_id for edge_id in final_edges if edge_id[0] in local_nodes and edge_id[1] in local_nodes
+    )
+    supporting_chunk_ids = set(anchor_chunk_ids)
+    relation_categories = Counter()
+    for node_id in local_nodes:
+        supporting_chunk_ids.update(node_to_chunks.get(node_id, set()))
+    for edge_id in local_edges:
+        supporting_chunk_ids.update(edge_to_chunks.get(edge_id, set()))
+        edge_data = graph.get_edge_data(edge_id[0], edge_id[1]) or {}
+        relation_categories[normalize_relation_category(edge_data)] += 1
+
+    component_nodes = sorted(local_nodes)
+    component_edges = sorted(local_edges)
+    sorted_chunk_ids = sorted(supporting_chunk_ids)
+    source_previews = _build_anchor_previews(anchor_chunk_ids, chunk_store, limit=3)
+    group_text = " ".join(
+        component_nodes[:12]
+        + [theme for theme, _ in relation_categories.most_common(5)]
+        + [item["preview"] for item in source_previews]
+    )
+    query_rel = lexical_overlap_score(query, group_text)
+    cohesion = len(component_edges) / max(len(component_nodes), 1)
+    return {
+        "node_count": len(component_nodes),
+        "edge_count": len(component_edges),
+        "group_score": round(query_rel, 6),
+        "query_rel": round(query_rel, 6),
+        "cohesion": round(cohesion, 6),
+        "anchor_support": len(anchor_chunk_ids),
+        "has_root_anchor": True,
+        "near_root": True,
+        "node_roles": dict(Counter(node_roles.get(node_id, "other") for node_id in component_nodes)),
+        "edge_roles": dict(Counter(edge_roles.get(edge_id, "other") for edge_id in component_edges)),
+        "relation_themes": [theme for theme, _ in relation_categories.most_common(5)],
+        "supporting_chunk_ids": sorted_chunk_ids,
+        "anchor_chunk_ids": anchor_chunk_ids,
+        "source_previews": source_previews,
+        "group_summary": _build_group_summary(component_nodes, relation_categories, source_previews, len(anchor_chunk_ids)),
+        "nodes": component_nodes,
+        "edges": component_edges,
+    }
+
+
+def build_knowledge_groups(
+    query,
+    graph,
+    final_nodes,
+    final_edges,
+    root_chunk_ids,
+    node_roles,
+    edge_roles,
+    node_to_chunks,
+    edge_to_chunks,
+    chunk_store,
     group_limit,
 ):
-    """Package connected subgraphs into query-facing knowledge groups."""
-    group_graph = nx.Graph()
-    group_graph.add_nodes_from(final_nodes)
-    group_graph.add_edges_from(final_edges)
+    """Package connected subgraphs into query-facing knowledge groups.
+
+    The organization stage is intentionally different from association:
+    - association expands by evidence gain
+    - organization builds anchor-local groups around grounded root chunks
+      and only then orders/deduplicates them
+    """
+    chunk_to_final_nodes, chunk_to_final_edges = _build_chunk_local_index(
+        final_nodes=final_nodes,
+        final_edges=final_edges,
+        node_to_chunks=node_to_chunks,
+        edge_to_chunks=edge_to_chunks,
+    )
+    candidate_groups = []
+    for root_chunk_id in root_chunk_ids:
+        group = _build_anchor_local_group(
+            query=query,
+            root_chunk_id=root_chunk_id,
+            graph=graph,
+            final_nodes=final_nodes,
+            final_edges=final_edges,
+            node_roles=node_roles,
+            edge_roles=edge_roles,
+            node_to_chunks=node_to_chunks,
+            edge_to_chunks=edge_to_chunks,
+            chunk_store=chunk_store,
+            chunk_to_final_nodes=chunk_to_final_nodes,
+            chunk_to_final_edges=chunk_to_final_edges,
+        )
+        if group is not None:
+            candidate_groups.append(group)
+
+    def _group_rank_key(item):
+        return (
+            -item["query_rel"],
+            -item["anchor_support"],
+            -item["node_count"],
+            item["nodes"][0] if item["nodes"] else "",
+        )
+
+    candidate_groups.sort(key=_group_rank_key)
+
     groups = []
-    query_is_technical = query_prefers_technical_content(query)
-    components = sorted(nx.connected_components(group_graph), key=lambda item: (-len(item), sorted(item)[0]))
-    for component in components:
-        component_nodes = sorted(component)
-        component_edges = sorted(edge_id for edge_id in final_edges if edge_id[0] in component and edge_id[1] in component)
-        if len(component_nodes) < 2 and len(component_edges) == 0:
+    for candidate in candidate_groups:
+        if len(groups) >= group_limit:
+            break
+        redundant = False
+        for chosen in groups:
+            chunk_overlap = _group_overlap_ratio(candidate["supporting_chunk_ids"], chosen["supporting_chunk_ids"])
+            if chunk_overlap >= 0.60:
+                redundant = True
+                break
+        if redundant:
             continue
-        chunk_ids = set()
-        relation_categories = Counter()
-        for node_id in component_nodes:
-            chunk_ids.update(node_to_chunks.get(node_id, set()))
-        for edge_id in component_edges:
-            chunk_ids.update(edge_to_chunks.get(edge_id, set()))
-            edge_data = graph.get_edge_data(edge_id[0], edge_id[1]) or {}
-            relation_categories[normalize_relation_category(edge_data)] += 1
-        sorted_chunk_ids = sorted(chunk_ids)
-        source_previews = []
-        for chunk_id in sorted_chunk_ids[:4]:
-            chunk = chunk_store.get(chunk_id, {})
-            source_previews.append(
-                {
-                    "chunk_id": chunk_id,
-                    "preview": " ".join(chunk.get("content", "").split())[:200],
-                }
-            )
-        root_role_count = sum(1 for node_id in component_nodes if node_roles.get(node_id) == "root") + sum(
-            1 for edge_id in component_edges if edge_roles.get(edge_id) == "root"
-        )
-        structural_role_count = sum(1 for node_id in component_nodes if node_roles.get(node_id) == "structural") + sum(
-            1 for edge_id in component_edges if edge_roles.get(edge_id) == "structural"
-        )
-        group_text = " ".join(
-            component_nodes[:12]
-            + [theme for theme, _ in relation_categories.most_common(5)]
-            + [item["preview"] for item in source_previews]
-        )
-        query_rel = lexical_overlap_score(query, group_text)
-        root_density = root_role_count / max(len(component_nodes) + len(component_edges), 1)
-        structure_density = structural_role_count / max(len(component_nodes) + len(component_edges), 1)
-        support_span = min(len(sorted_chunk_ids) / 8.0, 1.0)
-        size_term = min((len(component_nodes) + len(component_edges)) / 14.0, 1.0)
-        relation_term = min(len(relation_categories) / 4.0, 1.0)
-        technical_penalty = 0.0 if query_is_technical else 0.18 * technical_density(group_text)
-        # A group should be relevant, supported by multiple chunks, reasonably
-        # sized, and not dominated by technical metadata unless the query asks
-        # for technical content.
-        group_score = (
-            0.42 * query_rel
-            + 0.18 * support_span
-            + 0.12 * size_term
-            + 0.10 * relation_term
-            + 0.10 * root_density
-            + 0.08 * structure_density
-            - technical_penalty
-        )
-        if len(sorted_chunk_ids) < 2 and len(component_nodes) < 4:
-            group_score -= 0.06
-        if not relation_categories and query_rel < 0.05:
-            group_score -= 0.04
-        groups.append(
-            {
-                "node_count": len(component_nodes),
-                "edge_count": len(component_edges),
-                "group_score": round(group_score, 6),
-                "query_rel": round(query_rel, 6),
-                "technical_penalty": round(technical_penalty, 6),
-                "node_roles": dict(Counter(node_roles.get(node_id, "other") for node_id in component_nodes)),
-                "edge_roles": dict(Counter(edge_roles.get(edge_id, "other") for edge_id in component_edges)),
-                "relation_themes": [theme for theme, _ in relation_categories.most_common(5)],
-                "supporting_chunk_ids": sorted_chunk_ids,
-                "source_previews": source_previews,
-                "group_summary": _build_group_summary(component_nodes, relation_categories, source_previews, len(sorted_chunk_ids)),
-                "nodes": component_nodes,
-                "edges": component_edges,
-            }
-        )
-    groups.sort(key=lambda item: (-item["group_score"], -item["node_count"], item["nodes"][0] if item["nodes"] else ""))
-    for group_index, group in enumerate(groups[:group_limit], start=1):
+        groups.append(candidate)
+
+    for group_index, group in enumerate(groups, start=1):
         group["group_id"] = f"kg-{group_index:02d}"
-    groups = groups[:group_limit]
     return groups
 
 
 def build_prompt_context(
     query_row,
+    query_contract,
     root_chunk_hits,
     top_root_nodes,
     top_root_edges,
@@ -242,7 +405,7 @@ def build_prompt_context(
     semantic_edges,
     final_nodes,
     final_edges,
-    knowledge_groups,
+    facet_groups,
     chunk_store,
     node_to_chunks,
     edge_to_chunks,
@@ -253,7 +416,7 @@ def build_prompt_context(
     root_chunk_ids = [item["chunk_id"] for item in root_chunk_hits]
     chunk_rank = rank_supporting_chunks(final_nodes, final_edges, root_chunk_ids, node_to_chunks, edge_to_chunks)
     selected_source_chunks, used_words = choose_diverse_source_chunks(
-        knowledge_groups=knowledge_groups,
+        facet_groups=facet_groups,
         ranked_chunk_ids=chunk_rank,
         chunk_store=chunk_store,
         root_chunk_ids=root_chunk_ids,
@@ -262,7 +425,7 @@ def build_prompt_context(
     )
     root_chunk_id_set = set(root_chunk_ids)
     chunk_to_group_ids = {}
-    for group in knowledge_groups:
+    for group in facet_groups:
         for chunk_id in group["supporting_chunk_ids"]:
             chunk_to_group_ids.setdefault(chunk_id, []).append(group["group_id"])
     source_id_map = {chunk_id: f"src-{index:02d}" for index, (chunk_id, _, _) in enumerate(selected_source_chunks, start=1)}
@@ -338,11 +501,11 @@ def build_prompt_context(
             ]
         )
 
-    group_rows = [["id", "score", "node_count", "edge_count", "themes", "key_entities", "key_relations", "supporting_chunks"]]
+    group_rows = [["id", "score", "node_count", "edge_count", "facet", "key_entities", "key_relations", "supporting_chunks"]]
     group_sections = []
-    for group in knowledge_groups:
+    for group in facet_groups:
         key_entities = sorted(
-            group["nodes"],
+            group.get("focus_entities") or group["nodes"],
             key=lambda node_id: (
                 -lexical_overlap_score(query_row["query"], f"{node_id} {normalize_text(node_lookup.get(node_id, {}).get('description', ''))}"),
                 -role_priority.get(node_roles.get(node_id, "other"), 0),
@@ -374,7 +537,7 @@ def build_prompt_context(
                 f"{group['group_score']:.4f}",
                 group["node_count"],
                 group["edge_count"],
-                " | ".join(group["relation_themes"]),
+                f"{group.get('facet_label', group.get('primary_theme', 'facet'))} :: {' / '.join(group.get('region_kinds', []))}",
                 " | ".join(key_entities),
                 " | ".join(
                     f"{edge_id[0]} -> {edge_id[1]} ({normalize_text((semantic_edge_lookup.get(edge_id) or root_edge_lookup.get(edge_id) or {}).get('keywords',''))[:40]})"
@@ -400,11 +563,35 @@ def build_prompt_context(
             )
         group_section = [
             f"[{group['group_id']}] score={group['group_score']:.4f} nodes={group['node_count']} edges={group['edge_count']}",
+            f"Facet: {group.get('facet_label', group.get('primary_theme', 'facet'))}",
+            f"Facet Prompt: {group.get('facet_prompt', '')}",
             f"Summary: {group['group_summary']}",
             f"Themes: {' | '.join(group['relation_themes']) or 'n/a'}",
+            f"Evidence Roles: {' | '.join(group.get('region_kinds', [])) or 'n/a'}",
             f"Key Entities: {' | '.join(key_entities) or 'n/a'}",
-            "Key Relations:",
+            "Structural Growth Trace:",
         ]
+        if group.get("growth_traces"):
+            group_section.extend(f"- {trace}" for trace in group["growth_traces"][:4])
+        else:
+            group_section.append("- n/a")
+        group_section.extend(
+            [
+            "Anchor Evidence:",
+            ]
+        )
+        if group.get("anchor_chunk_ids"):
+            for chunk_id in group["anchor_chunk_ids"][:2]:
+                chunk_data = chunk_store.get(chunk_id, {})
+                role = "root" if chunk_id in root_chunk_id_set else "support"
+                group_section.append(f"- {role} {chunk_id}: {' '.join(chunk_data.get('content', '').split())[:220]}")
+        else:
+            group_section.append("- n/a")
+        group_section.extend(
+            [
+            "Key Relations:",
+            ]
+        )
         if key_relations:
             group_section.extend(
                 f"- {edge_id[0]} -> {edge_id[1]} ({normalize_text((semantic_edge_lookup.get(edge_id) or root_edge_lookup.get(edge_id) or {}).get('keywords',''))[:60]})"
@@ -430,6 +617,8 @@ def build_prompt_context(
             ]
         )
 
+    coverage_checklist = _coverage_checklist_lines(facet_groups)
+
     context = f"""
 -----Root Chunks-----
 ```csv
@@ -443,11 +632,13 @@ def build_prompt_context(
 ```csv
 {build_csv(relation_rows)}
 ```
------Knowledge Groups-----
+-----Facet Groups-----
 ```csv
 {build_csv(group_rows)}
 ```
------Knowledge Group Dossiers-----
+-----Coverage Checklist-----
+{chr(10).join(coverage_checklist) if coverage_checklist else '- n/a'}
+-----Facet Group Dossiers-----
 {chr(10).join(group_sections)}
 -----Sources-----
 ```csv

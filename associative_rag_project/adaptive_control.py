@@ -1,11 +1,9 @@
 """Adaptive controller for association strength.
 
-Current design principle:
-- start from the non-adaptive baseline as the default behavior
-- compute a linear alpha for analysis and light steering only
-- let adaptive control nudge graph expansion budgets around the baseline
-- do not let adaptive control fully take over rounds, group count, or source
-  budget, because those large global changes were too brittle in practice
+After the refactor, adaptive control is intentionally lightweight:
+- the default system behavior is non-adaptive
+- the controller mainly records interpretable priors
+- if enabled, it only nudges budgets using one dominant factor
 """
 
 import math
@@ -229,7 +227,7 @@ def build_adaptive_controller(
     edge_to_chunks,
     base_cfg,
 ):
-    """Convert query + root-graph signals into a per-query budget profile."""
+    """Convert simple priors into a light optional budget profile."""
     intent = compute_query_intent_profile(query)
     graph_features = compute_root_graph_features(
         root_nodes=root_nodes,
@@ -241,72 +239,23 @@ def build_adaptive_controller(
     candidate_features = compute_candidate_retrieval_dispersion(candidate_chunk_hits)
     retrieval_features = compute_retrieval_cliff(candidate_chunk_hits)
 
-    # Main axis: broad questions tend to produce sparser root graphs.
-    density_signal = _normalize_linear(
-        graph_features["root_density"],
-        low=0.30,
-        high=0.75,
-        inverse=True,
-    )
-    # Auxiliary correction: fragmented roots justify a bit more association.
-    fragmentation_signal = _normalize_linear(
-        graph_features["fragmentation"],
-        low=0.50,
-        high=0.95,
-        inverse=False,
-    )
-    # Query-form is only a weak prior now.
-    if intent["style"] == "synthesis":
-        style_prior = 0.08
-    elif intent["style"] == "concrete":
-        style_prior = -0.08
-    else:
-        style_prior = 0.0
-
-    # Retrieval cliff stays as a brake rather than a driver.
+    density_signal = _normalize_linear(graph_features["root_density"], low=0.30, high=0.75, inverse=True)
+    fragmentation_signal = _normalize_linear(graph_features["fragmentation"], low=0.50, high=0.95, inverse=False)
     retrieval_cliff = retrieval_features["retrieval_cliff"]
-    cliff_brake = 0.18 * retrieval_cliff
 
-    # Relative linear alpha around the non-adaptive midpoint 0.5.
-    # This keeps the feature semantics interpretable while preventing alpha
-    # from dominating the whole pipeline.
-    association_strength = (
-        0.50
-        + 0.26 * (density_signal - 0.50)
-        + 0.12 * (fragmentation_signal - 0.50)
-        + style_prior
-        - cliff_brake
-    )
-    association_strength = _clamp(association_strength, low=0.15, high=0.85)
-
-    # Bridge search can tolerate a bit more spread than semantic expansion,
-    # especially when the root graph is fragmented, but keep the adjustment
-    # close to the baseline.
-    bridge_strength = _clamp(
-        association_strength + 0.06 * (fragmentation_signal - 0.50),
-        low=0.15,
-        high=0.90,
-    )
-    semantic_strength = association_strength
-
-    # Convert alpha into residual budget changes around the no-adaptive base.
-    bridge_delta = bridge_strength - 0.50
-    semantic_delta = semantic_strength - 0.50
-    path_scale = 1.0 + 0.40 * bridge_delta
-    semantic_scale = 1.0 + 0.50 * semantic_delta
-    score_tightening = 1.0 - 0.45 * semantic_delta
+    # One dominant factor: fragmentation. Sparse, fragmented roots justify a
+    # slightly wider divergence horizon; steep retrieval cliffs push back.
+    association_strength = _clamp(fragmentation_signal - 0.20 * retrieval_cliff, low=0.0, high=1.0)
+    path_scale = 1.0 + 0.30 * (association_strength - 0.5)
+    semantic_scale = 1.0 + 0.30 * (association_strength - 0.5)
 
     adapted = {
-        # Keep global structure fixed. Adaptive control should not decide how
-        # many alternation rounds the whole pipeline gets.
         "association_rounds": base_cfg["association_rounds"],
         "path_budget": max(4, round(base_cfg["path_budget"] * path_scale)),
         "semantic_edge_budget": max(6, round(base_cfg["semantic_edge_budget"] * semantic_scale)),
         "semantic_node_budget": max(4, round(base_cfg["semantic_node_budget"] * semantic_scale)),
-        "semantic_edge_min_score": round(base_cfg["semantic_edge_min_score"] * score_tightening, 6),
-        "semantic_node_min_score": round(base_cfg["semantic_node_min_score"] * score_tightening, 6),
-        # Keep the final evidence-presentation shape stable for fairer
-        # comparisons; adaptive control only adjusts retrieval-time expansion.
+        "semantic_edge_min_score": base_cfg["semantic_edge_min_score"],
+        "semantic_node_min_score": base_cfg["semantic_node_min_score"],
         "group_limit": base_cfg["group_limit"],
         "max_source_chunks": base_cfg["max_source_chunks"],
         "max_source_word_budget": base_cfg["max_source_word_budget"],
@@ -318,9 +267,9 @@ def build_adaptive_controller(
         "alpha_components": {
             "density_signal": round(density_signal, 6),
             "fragmentation_signal": round(fragmentation_signal, 6),
-            "style_prior": round(style_prior, 6),
-            "cliff_brake": round(cliff_brake, 6),
-            "bridge_strength": round(bridge_strength, 6),
+            "style_prior": 0.0,
+            "cliff_brake": round(0.20 * retrieval_cliff, 6),
+            "bridge_strength": round(association_strength, 6),
         },
         "intent": intent,
         "graph_features": graph_features,

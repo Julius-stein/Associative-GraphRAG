@@ -6,7 +6,13 @@ from time import perf_counter
 from pathlib import Path
 
 from .config import load_judge_config, load_llm_config
-from .data import extract_questions, load_baseline_answers, resolve_baseline_file, resolve_questions_file
+from .data import (
+    extract_questions,
+    infer_corpus_name,
+    load_baseline_answers,
+    resolve_baseline_file,
+    resolve_questions_file,
+)
 from .judge import run_winrate_judgement
 from .llm_client import OpenAICompatibleClient, generate_answers
 from .logging_utils import log
@@ -27,7 +33,7 @@ def build_parser():
     common.add_argument("--top-chunks", type=int, default=5)
     common.add_argument("--chunk-candidate-multiplier", type=int, default=3)
     common.add_argument("--adaptive-candidate-pool-size", type=int, default=30)
-    common.add_argument("--retrieval-mode", choices=["bm25", "dense", "hybrid"], default="hybrid")
+    common.add_argument("--retrieval-mode", choices=["bm25", "dense", "hybrid"], default="dense")
     common.add_argument("--dense-weight", type=float, default=0.75)
     common.add_argument("--bm25-weight", type=float, default=0.25)
     common.add_argument("--top-root-nodes", type=int, default=12)
@@ -43,7 +49,9 @@ def build_parser():
     common.add_argument("--max-source-chunks", type=int, default=14)
     common.add_argument("--max-source-word-budget", type=int, default=4500)
     common.add_argument("--max-workers", type=int)
-    common.add_argument("--disable-adaptive-control", action="store_true")
+    common.add_argument("--enable-adaptive-control", dest="adaptive_control", action="store_true")
+    common.add_argument("--disable-adaptive-control", dest="adaptive_control", action="store_false")
+    common.set_defaults(adaptive_control=False)
 
     subparsers.add_parser("retrieve", parents=[common])
 
@@ -91,13 +99,14 @@ def retrieval_config_from_args(args):
         "group_limit": args.group_limit,
         "max_source_chunks": args.max_source_chunks,
         "max_source_word_budget": args.max_source_word_budget,
-        "adaptive_control": not args.disable_adaptive_control,
+        "adaptive_control": args.adaptive_control,
     }
 
 
 def command_retrieve(args):
     """Run retrieval only and save the evidence package."""
-    questions_file = resolve_questions_file(Path(args.corpus_dir).name, args.questions_file)
+    corpus_name = infer_corpus_name(args.corpus_dir)
+    questions_file = resolve_questions_file(corpus_name, args.questions_file)
     log(f"[main] retrieve corpus={args.corpus_dir} questions={questions_file}")
     payload, output_path = retrieve_corpus_queries(
         corpus_dir=args.corpus_dir,
@@ -130,10 +139,18 @@ def command_judge(args):
     candidate_answers = json.loads(Path(args.candidate_file).read_text(encoding="utf-8"))
     baseline_answers = load_baseline_answers(Path(args.baseline_file))
     questions = extract_questions(Path(args.questions_file))
+    aligned_total = min(len(questions), len(candidate_answers), len(baseline_answers))
+    if len({len(questions), len(candidate_answers), len(baseline_answers)}) != 1:
+        log(
+            "[main] judge length mismatch "
+            f"questions={len(questions)} candidate={len(candidate_answers)} baseline={len(baseline_answers)}; "
+            f"auto-aligning to first {aligned_total}"
+        )
     if args.limit is not None:
-        questions = questions[: args.limit]
-        candidate_answers = candidate_answers[: args.limit]
-        baseline_answers = baseline_answers[: args.limit]
+        aligned_total = min(aligned_total, args.limit)
+    questions = questions[:aligned_total]
+    candidate_answers = candidate_answers[:aligned_total]
+    baseline_answers = baseline_answers[:aligned_total]
     llm_client = OpenAICompatibleClient(load_judge_config())
     output_path = Path(args.output_file) if args.output_file else Path(args.candidate_file).with_name(Path(args.candidate_file).stem + "_vs_baseline_winrate.json")
     payload = run_winrate_judgement(
@@ -154,7 +171,7 @@ def command_run(args):
     This is mainly useful for fast iteration and for measuring how retrieval
     settings affect the overall system runtime before running full evaluation.
     """
-    corpus_name = Path(args.corpus_dir).name
+    corpus_name = infer_corpus_name(args.corpus_dir)
     log(f"[main] run corpus={corpus_name}")
     questions_file = resolve_questions_file(corpus_name, args.questions_file)
     if questions_file is None:
@@ -209,7 +226,7 @@ def command_run(args):
 
 def command_run_all(args):
     """Convenience wrapper for retrieve -> answer -> judge."""
-    corpus_name = Path(args.corpus_dir).name
+    corpus_name = infer_corpus_name(args.corpus_dir)
     log(f"[main] run-all corpus={corpus_name}")
     questions_file = resolve_questions_file(corpus_name, args.questions_file)
     if questions_file is None:

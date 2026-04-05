@@ -20,7 +20,8 @@ datasets/
 lightrag/llm_config.py
 .env
 .env.*
-
+old*
+result/   
 # Generated experiment outputs
 associative_rag_project/runs/
 associative_rag_project/runs_*/

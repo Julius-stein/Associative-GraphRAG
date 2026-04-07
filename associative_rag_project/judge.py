@@ -1,7 +1,7 @@
 """FG-RAG-compatible LLM-as-a-judge utilities."""
 
 import json
-from collections import Counter
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from .logging_utils import log
@@ -22,6 +22,8 @@ You will evaluate two answers to the same question based on:
 - **Empowerment**
 - **Focus Match**
 - **Evidence Anchoring**
+- **Scope Discipline**
+- **Scenario Fidelity**
 
 First classify the query's required organization contract as exactly one of:
 - `section-grounded`
@@ -45,7 +47,21 @@ Then classify each answer's dominant organization type using the same four label
 
 - **Evidence Anchoring**: How well is the answer's chosen organization stably anchored in corpus-specific evidence rather than only sounding plausible?
 
-For each criterion, choose the better answer (ether Answer 1 or Answer 2) and explain why. Then, select an overal winner based on these criteria as a whole.
+- **Scope Discipline**: Which answer better stays within the scope of the query itself?
+  Reward answers that stay within the asked entities, time range, section range, comparison axes, and task boundary.
+  Penalize answers that expand into clearly unasked territory just to sound broader.
+
+- **Scenario Fidelity**: Which answer better avoids inventing extra situations, motives, workflows, user settings, or narrative setups not required by the query?
+  Reward answers that stay at the level the query supports.
+  Penalize answers that "set the scene" or add specific contexts without clear need.
+
+For each criterion, choose the better answer (either Answer 1 or Answer 2) and explain why.
+Then select an Overall Winner using a contract-aware standard:
+
+- For `theme-grounded` queries, prioritize Comprehensiveness, Diversity, and Focus Match, but still penalize scope drift and invented scenarios.
+- For `mechanism-grounded` queries, prioritize Focus Match, Empowerment, Evidence Anchoring, Scope Discipline, and Scenario Fidelity.
+- For `section-grounded` queries, prioritize Focus Match, Evidence Anchoring, Scope Discipline, and Scenario Fidelity, while staying anchored to the relevant sections or local evidence bands.
+- For `comparison-grounded` queries, prioritize Focus Match, Comprehensiveness, Empowerment, and Scope Discipline, while keeping the comparison axes explicit and avoiding invented framing.
 
 Here is the question:
 {input_query}
@@ -71,7 +87,9 @@ Output your evaluation in the following JSON format:
     "Empowerment": {{ "Winner": "[Answer 1 or Answer 2]", "Explanation": "[Provide explanation here]" }} ,
     "Focus Match": {{ "Winner": "[Answer 1 or Answer 2]", "Explanation": "[Which answer better matches the query's required organization and why]" }} ,
     "Evidence Anchoring": {{ "Winner": "[Answer 1 or Answer 2]", "Explanation": "[Which answer is better anchored in evidence for its chosen organization and why]" }} ,
-    "Overall Winner": {{ "Winner": "[Answer 1 or Answer 2]", "Explanation": "[Summarize why ths answer is the overall winner based on the three criteria]" }}
+    "Scope Discipline": {{ "Winner": "[Answer 1 or Answer 2]", "Explanation": "[Which answer better stays within the query scope and avoids irrelevant expansion]" }} ,
+    "Scenario Fidelity": {{ "Winner": "[Answer 1 or Answer 2]", "Explanation": "[Which answer better avoids inventing extra situations or setups]" }} ,
+    "Overall Winner": {{ "Winner": "[Answer 1 or Answer 2]", "Explanation": "[Summarize why this answer is the overall winner under the contract-aware standard]" }}
 }}
 """
 
@@ -127,14 +145,48 @@ CRITERIA_KEYS = [
     "Empowerment",
     "Focus Match",
     "Evidence Anchoring",
+    "Scope Discipline",
+    "Scenario Fidelity",
     "Overall Winner",
 ]
+
+NON_OVERALL_CRITERIA_KEYS = [key for key in CRITERIA_KEYS if key != "Overall Winner"]
 
 ORGANIZATION_LABELS = {
     "section-grounded",
     "mechanism-grounded",
     "comparison-grounded",
     "theme-grounded",
+}
+
+CONTRACT_PRIMARY_METRICS = {
+    "theme-grounded": [
+        "Comprehensiveness",
+        "Diversity",
+        "Focus Match",
+        "Scope Discipline",
+        "Scenario Fidelity",
+    ],
+    "mechanism-grounded": [
+        "Focus Match",
+        "Empowerment",
+        "Evidence Anchoring",
+        "Scope Discipline",
+        "Scenario Fidelity",
+    ],
+    "section-grounded": [
+        "Focus Match",
+        "Evidence Anchoring",
+        "Scope Discipline",
+        "Scenario Fidelity",
+    ],
+    "comparison-grounded": [
+        "Focus Match",
+        "Comprehensiveness",
+        "Empowerment",
+        "Scope Discipline",
+        "Scenario Fidelity",
+    ],
 }
 
 
@@ -208,6 +260,67 @@ def _extract_organization_analysis(verdict_ab, verdict_ba_raw):
     }
 
 
+def _winner_from_counter(counter):
+    if counter["candidate"] > counter["baseline"] and counter["candidate"] > counter["tie"]:
+        return "candidate"
+    if counter["baseline"] > counter["candidate"] and counter["baseline"] > counter["tie"]:
+        return "baseline"
+    return "tie"
+
+
+def _aggregate_metric_votes(metric_names, dimension_votes):
+    counter = Counter({"candidate": 0, "baseline": 0, "tie": 0})
+    for metric_name in metric_names:
+        votes = dimension_votes.get(metric_name, {})
+        counter["candidate"] += votes.get("candidate", 0)
+        counter["baseline"] += votes.get("baseline", 0)
+        counter["tie"] += votes.get("tie", 0)
+    return counter
+
+
+def _contract_secondary_metrics(query_contract):
+    primary = set(CONTRACT_PRIMARY_METRICS.get(query_contract, CONTRACT_PRIMARY_METRICS["theme-grounded"]))
+    return [metric for metric in NON_OVERALL_CRITERIA_KEYS if metric not in primary]
+
+
+def _resolve_contract_conditioned_decision(query_contract, dimension_votes, llm_overall_votes):
+    primary_metrics = CONTRACT_PRIMARY_METRICS.get(query_contract, CONTRACT_PRIMARY_METRICS["theme-grounded"])
+    secondary_metrics = _contract_secondary_metrics(query_contract)
+    primary_counter = _aggregate_metric_votes(primary_metrics, dimension_votes)
+    primary_winner = _winner_from_counter(primary_counter)
+    if primary_winner != "tie":
+        return {
+            "winner": primary_winner,
+            "decided_by": "primary_metrics",
+            "primary_metrics": primary_metrics,
+            "secondary_metrics": secondary_metrics,
+            "primary_vote_totals": dict(primary_counter),
+            "secondary_vote_totals": dict(_aggregate_metric_votes(secondary_metrics, dimension_votes)),
+        }
+
+    secondary_counter = _aggregate_metric_votes(secondary_metrics, dimension_votes)
+    secondary_winner = _winner_from_counter(secondary_counter)
+    if secondary_winner != "tie":
+        return {
+            "winner": secondary_winner,
+            "decided_by": "secondary_metrics",
+            "primary_metrics": primary_metrics,
+            "secondary_metrics": secondary_metrics,
+            "primary_vote_totals": dict(primary_counter),
+            "secondary_vote_totals": dict(secondary_counter),
+        }
+
+    llm_winner = _winner_from_counter(Counter(llm_overall_votes))
+    return {
+        "winner": llm_winner,
+        "decided_by": "llm_overall_votes",
+        "primary_metrics": primary_metrics,
+        "secondary_metrics": secondary_metrics,
+        "primary_vote_totals": dict(primary_counter),
+        "secondary_vote_totals": dict(secondary_counter),
+    }
+
+
 def _generate_verdict(prompt, llm_client, max_attempts=3):
     """Retry parsing a judge response a few times before falling back to a tie."""
     last_error = None
@@ -233,25 +346,37 @@ def judge_pair(query, candidate_answer, baseline_answer, llm_client):
     overall_ba = _map_swapped_winner(_normalize_winner(verdict_ba_raw.get("Overall Winner", {}).get("Winner", "Tie")))
     votes = Counter([overall_ab, overall_ba])
     if votes["a"] > votes["b"] and votes["a"] > votes["tie"]:
-        final = "candidate"
+        llm_overall_winner = "candidate"
     elif votes["b"] > votes["a"] and votes["b"] > votes["tie"]:
-        final = "baseline"
+        llm_overall_winner = "baseline"
     else:
-        final = "tie"
+        llm_overall_winner = "tie"
 
     dimension_votes = _extract_dimension_votes(verdict_ab, verdict_ba_raw)
+    organization_analysis = _extract_organization_analysis(verdict_ab, verdict_ba_raw)
+    contract_conditioned = _resolve_contract_conditioned_decision(
+        organization_analysis["query_contract"],
+        dimension_votes,
+        {
+            "candidate": votes["a"],
+            "baseline": votes["b"],
+            "tie": votes["tie"],
+        },
+    )
 
     return {
         "order_ab": verdict_ab,
         "order_ba": verdict_ba_raw,
-        "organization_analysis": _extract_organization_analysis(verdict_ab, verdict_ba_raw),
+        "organization_analysis": organization_analysis,
         "mapped_overall_votes": {
             "candidate": votes["a"],
             "baseline": votes["b"],
             "tie": votes["tie"],
         },
+        "llm_overall_winner": llm_overall_winner,
         "dimension_votes": dimension_votes,
-        "final_winner": final,
+        "contract_conditioned_decision": contract_conditioned,
+        "final_winner": contract_conditioned["winner"],
     }
 
 
@@ -263,9 +388,12 @@ def run_winrate_judgement(questions, candidate_answers, baseline_answers, llm_cl
     log(f"[judge] start total={len(candidate_answers)} model={llm_client.model} workers={max_workers}")
     verdicts = [None] * len(candidate_answers)
     summary_counter = Counter()
+    llm_summary_counter = Counter()
     dimension_counter = {
         key: Counter({"candidate": 0, "baseline": 0, "tie": 0}) for key in CRITERIA_KEYS
     }
+    dimension_counter_by_contract = {}
+    contract_conditioned_counter_by_contract = defaultdict(Counter)
     pairs = list(zip(questions, candidate_answers, baseline_answers))
 
     def _one(item):
@@ -286,9 +414,19 @@ def run_winrate_judgement(questions, candidate_answers, baseline_answers, llm_cl
             idx, verdict_payload = future.result()
             verdicts[idx - 1] = verdict_payload
             summary_counter[verdict_payload["final_winner"]] += 1
+            llm_summary_counter[verdict_payload["llm_overall_winner"]] += 1
             for key, votes in verdict_payload["dimension_votes"].items():
                 for label, count in votes.items():
                     dimension_counter[key][label] += count
+            query_contract = verdict_payload["organization_analysis"]["query_contract"]
+            if query_contract not in dimension_counter_by_contract:
+                dimension_counter_by_contract[query_contract] = {
+                    key: Counter({"candidate": 0, "baseline": 0, "tie": 0}) for key in CRITERIA_KEYS
+                }
+            for key, votes in verdict_payload["dimension_votes"].items():
+                for label, count in votes.items():
+                    dimension_counter_by_contract[query_contract][key][label] += count
+            contract_conditioned_counter_by_contract[query_contract][verdict_payload["final_winner"]] += 1
             completed += 1
             log(
                 f"[judge {completed}/{len(candidate_answers)}] q{idx:03d} "
@@ -308,6 +446,20 @@ def run_winrate_judgement(questions, candidate_answers, baseline_answers, llm_cl
             "tie_probability": round(counter["tie"] / max(total_votes, 1), 4),
             "total_votes": total_votes,
         }
+    dimension_summary_by_contract = {}
+    for query_contract, counters in dimension_counter_by_contract.items():
+        dimension_summary_by_contract[query_contract] = {}
+        for key, counter in counters.items():
+            total_votes = counter["candidate"] + counter["baseline"] + counter["tie"]
+            dimension_summary_by_contract[query_contract][key] = {
+                "candidate": counter["candidate"],
+                "baseline": counter["baseline"],
+                "tie": counter["tie"],
+                "candidate_probability": round(counter["candidate"] / max(total_votes, 1), 4),
+                "baseline_probability": round(counter["baseline"] / max(total_votes, 1), 4),
+                "tie_probability": round(counter["tie"] / max(total_votes, 1), 4),
+                "total_votes": total_votes,
+            }
     organization_summary = {
         "query_contracts": Counter(),
         "candidate_answer_contracts": Counter(),
@@ -331,7 +483,32 @@ def run_winrate_judgement(questions, candidate_answers, baseline_answers, llm_cl
             "candidate_win_rate": round(summary_counter["candidate"] / max(total, 1), 4),
             "baseline_win_rate": round(summary_counter["baseline"] / max(total, 1), 4),
         },
+        "llm_overall_summary": {
+            "total": total,
+            "candidate_wins": llm_summary_counter["candidate"],
+            "baseline_wins": llm_summary_counter["baseline"],
+            "ties": llm_summary_counter["tie"],
+            "candidate_win_rate": round(llm_summary_counter["candidate"] / max(total, 1), 4),
+            "baseline_win_rate": round(llm_summary_counter["baseline"] / max(total, 1), 4),
+        },
         "criteria_summary": dimension_summary,
+        "criteria_summary_by_contract": dimension_summary_by_contract,
+        "contract_conditioned_summary_by_contract": {
+            query_contract: {
+                "total": counts["candidate"] + counts["baseline"] + counts["tie"],
+                "candidate_wins": counts["candidate"],
+                "baseline_wins": counts["baseline"],
+                "ties": counts["tie"],
+                "candidate_win_rate": round(
+                    counts["candidate"] / max(counts["candidate"] + counts["baseline"] + counts["tie"], 1), 4
+                ),
+                "baseline_win_rate": round(
+                    counts["baseline"] / max(counts["candidate"] + counts["baseline"] + counts["tie"], 1), 4
+                ),
+                "primary_metrics": CONTRACT_PRIMARY_METRICS.get(query_contract, CONTRACT_PRIMARY_METRICS["theme-grounded"]),
+            }
+            for query_contract, counts in contract_conditioned_counter_by_contract.items()
+        },
         "organization_summary": {
             "query_contracts": dict(organization_summary["query_contracts"]),
             "candidate_answer_contracts": dict(organization_summary["candidate_answer_contracts"]),

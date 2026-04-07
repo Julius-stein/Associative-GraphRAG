@@ -54,18 +54,14 @@ def _is_broad_theme_query(query: str, query_contract: str) -> bool:
     return any(cue in query_lower for cue in broad_cues)
 
 
-def build_generation_prompt(query, prompt_context, query_style="balanced", query_contract="theme-grounded"):
-    """Build a QFS-oriented prompt from the evidence package and query style."""
+def build_generation_prompt(query, prompt_context, query_contract="theme-grounded"):
+    """Build a QFS-oriented prompt from the evidence package."""
     query_lower = query.lower()
     extra_constraints = []
     if any(term in query_lower for term in ["character", "characters", "passage", "passages", "narrative", "narratives"]):
         extra_constraints.append("- This query is about passage content. Prioritize people, events, themes, and historical or social forces over dataset or method descriptions.")
     if any(term in query_lower for term in ["historical", "history", "socio-political", "conflict", "conflicts"]):
         extra_constraints.append("- Emphasize comparative historical interpretation, not metadata about how the evidence was collected or modeled.")
-    if query_style == "synthesis":
-        extra_constraints.append("- Emphasize cross-source patterns and contrasts, but keep the answer shaped by the query rather than by a generic overview template.")
-    elif query_style == "concrete":
-        extra_constraints.append("- Prioritize concrete, practical, and directly supported points. Avoid broad contextual expansion unless it clearly helps answer the question.")
     if _is_broad_theme_query(query, query_contract):
         extra_constraints.extend(
             [
@@ -144,14 +140,12 @@ def generate_answers(records, output_path, llm_client, max_workers=None):
         prompt = build_generation_prompt(
             record["query"],
             record["prompt_context"],
-            query_style=record.get("query_style", "balanced"),
             query_contract=record.get("query_contract", "theme-grounded"),
         )
         answer = llm_client.generate(prompt)
         return {
             "group_id": record["group_id"],
             "query": record["query"],
-            "query_style": record.get("query_style", "balanced"),
             "query_contract": record.get("query_contract", "theme-grounded"),
             "model_answer": answer,
             "stats": record["stats"],

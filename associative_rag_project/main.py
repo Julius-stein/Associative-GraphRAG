@@ -28,11 +28,11 @@ def build_parser():
     common.add_argument("--corpus-dir", required=True)
     common.add_argument("--questions-file")
     common.add_argument("--rewrites-file")
-    common.add_argument("--limit-groups", type=int)
+    common.add_argument("--limit-groups", "--limit", dest="limit_groups", type=int)
     common.add_argument("--output-dir", default="associative_rag_project/runs")
     common.add_argument("--top-chunks", type=int, default=5)
     common.add_argument("--chunk-candidate-multiplier", type=int, default=3)
-    common.add_argument("--adaptive-candidate-pool-size", type=int, default=30)
+    common.add_argument("--candidate-pool-size", type=int, default=30)
     common.add_argument("--retrieval-mode", choices=["bm25", "dense", "hybrid"], default="dense")
     common.add_argument("--dense-weight", type=float, default=0.75)
     common.add_argument("--bm25-weight", type=float, default=0.25)
@@ -49,9 +49,6 @@ def build_parser():
     common.add_argument("--max-source-chunks", type=int, default=14)
     common.add_argument("--max-source-word-budget", type=int, default=4500)
     common.add_argument("--max-workers", type=int)
-    common.add_argument("--enable-adaptive-control", dest="adaptive_control", action="store_true")
-    common.add_argument("--disable-adaptive-control", dest="adaptive_control", action="store_false")
-    common.set_defaults(adaptive_control=False)
 
     subparsers.add_parser("retrieve", parents=[common])
 
@@ -66,7 +63,7 @@ def build_parser():
     judge.add_argument("--baseline-file", required=True)
     judge.add_argument("--output-file")
     judge.add_argument("--limit", type=int)
-    judge.add_argument("--max-workers", type=int)
+    judge.add_argument("--max-workers", type=int, default=12)
 
     run = subparsers.add_parser("run", parents=[common])
     run.add_argument("--answer-output-file")
@@ -83,7 +80,7 @@ def retrieval_config_from_args(args):
     return {
         "top_chunks": args.top_chunks,
         "chunk_candidate_multiplier": args.chunk_candidate_multiplier,
-        "adaptive_candidate_pool_size": args.adaptive_candidate_pool_size,
+        "candidate_pool_size": args.candidate_pool_size,
         "retrieval_mode": args.retrieval_mode,
         "dense_weight": args.dense_weight,
         "bm25_weight": args.bm25_weight,
@@ -99,7 +96,6 @@ def retrieval_config_from_args(args):
         "group_limit": args.group_limit,
         "max_source_chunks": args.max_source_chunks,
         "max_source_word_budget": args.max_source_word_budget,
-        "adaptive_control": args.adaptive_control,
     }
 
 

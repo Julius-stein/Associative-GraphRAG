@@ -645,6 +645,7 @@ def _build_group(query, contract, group_id, label, regions, chunk_store):
     edge_ids = set()
     relation_counter = Counter()
     focus_counter = Counter()
+    region_kind_counter = Counter()
     region_kinds = []
     doc_ids = []
     growth_traces = []
@@ -654,6 +655,7 @@ def _build_group(query, contract, group_id, label, regions, chunk_store):
         edge_ids.update(region.edge_ids)
         supporting_chunk_ids.update(region.supporting_chunk_ids)
         region_kinds.append(region.region_kind)
+        region_kind_counter[region.region_kind] += 1
         relation_counter.update(region.relation_themes)
         focus_counter.update(region.focus_entities)
         for doc_id in region.doc_ids:
@@ -691,9 +693,17 @@ def _build_group(query, contract, group_id, label, regions, chunk_store):
         "root_anchor_count": len(set(anchor_chunk_ids) & root_chunk_ids),
         "node_count": len(node_ids),
         "edge_count": len(edge_ids),
+        "region_count": len(regions),
+        "unique_doc_count": len(doc_ids),
+        "unique_root_count": len(root_chunk_ids),
         "root_chunk_ids": sorted(root_chunk_ids),
         "doc_ids": doc_ids,
         "region_kinds": sorted(set(region_kinds)),
+        "region_kind_counts": dict(region_kind_counter),
+        "root_region_count": region_kind_counter.get("root", 0),
+        "bridge_region_count": region_kind_counter.get("bridge", 0),
+        "theme_region_count": region_kind_counter.get("theme", 0),
+        "section_region_count": region_kind_counter.get("section", 0),
         "relation_themes": relation_themes,
         "focus_entities": focus_entities,
         "supporting_chunk_ids": sorted(supporting_chunk_ids),
@@ -714,13 +724,86 @@ def _build_group(query, contract, group_id, label, regions, chunk_store):
 
 def _group_rank_key(group):
     return (
+        -group.get("selection_priority", 0),
         -group["root_anchor_count"],
         -group["query_rel"],
         -len(group["region_kinds"]),
+        -group.get("bridge_region_count", 0),
+        -group.get("theme_region_count", 0),
+        -group.get("unique_doc_count", 0),
         -group["anchor_support"],
         -group["node_count"],
         group["facet_label"],
     )
+
+
+def _theme_representative_regions(query, regions, max_roots=3, max_expansions=2):
+    root_like = [region for region in regions if region.region_kind in {"root", "theme"}]
+    expansion_like = [region for region in regions if region.region_kind == "bridge"]
+    root_like = sorted(
+        root_like,
+        key=lambda region: (
+            -lexical_overlap_score(query, region.descriptor_text),
+            -len(region.anchor_chunk_ids),
+            -len(region.supporting_chunk_ids),
+            region.region_id,
+        ),
+    )
+    expansion_like = sorted(
+        expansion_like,
+        key=lambda region: (
+            -lexical_overlap_score(query, region.descriptor_text),
+            -len(region.root_chunk_ids),
+            -len(region.supporting_chunk_ids),
+            region.region_id,
+        ),
+    )
+    selected = []
+    seen = set()
+    for region in root_like[:max_roots]:
+        if region.region_id not in seen:
+            selected.append(region)
+            seen.add(region.region_id)
+    for region in expansion_like[:max_expansions]:
+        if region.region_id not in seen:
+            selected.append(region)
+            seen.add(region.region_id)
+    if not selected:
+        selected = root_like[:max_roots] or expansion_like[:max_expansions] or regions[:1]
+    return selected
+
+
+def _retune_theme_group(group, query, representative_regions, chunk_store):
+    root_chunk_id_set = set(group.get("root_chunk_ids", []))
+    representative_anchor_chunks = []
+    for region in representative_regions:
+        for chunk_id in region.anchor_chunk_ids:
+            if chunk_id not in representative_anchor_chunks:
+                representative_anchor_chunks.append(chunk_id)
+    stable_anchor_candidates = [
+        chunk_id
+        for chunk_id in representative_anchor_chunks
+        if chunk_id in root_chunk_id_set
+    ] or representative_anchor_chunks
+    stable_anchor_candidates = _rank_chunks(query, stable_anchor_candidates, chunk_store, root_chunk_id_set)[:5]
+    if stable_anchor_candidates:
+        group["anchor_chunk_ids"] = stable_anchor_candidates
+        group["anchor_support"] = len(stable_anchor_candidates)
+        group["root_anchor_count"] = len(set(stable_anchor_candidates) & root_chunk_id_set)
+        group["source_previews"] = [
+            {
+                "chunk_id": chunk_id,
+                "preview": normalize_text(chunk_store.get(chunk_id, {}).get("content", ""))[:220],
+            }
+            for chunk_id in stable_anchor_candidates[:3]
+        ]
+    representative_kinds = sorted({region.region_kind for region in representative_regions})
+    group["group_summary"] = (
+        f"This theme-grounded facet centers on {group['facet_label']}. "
+        f"It uses representative root-connected evidence from {len(group.get('doc_ids', []))} documents "
+        f"and synthesizes {', '.join(representative_kinds)} support."
+    )
+    return group
 
 
 def _group_coverage_keys(group):
@@ -1013,15 +1096,53 @@ def _build_theme_groups(query, root_regions, bridge_regions, theme_regions, chun
         if not region.root_connected:
             continue
         region_rel = lexical_overlap_score(query, region.descriptor_text)
-        if region.region_kind == "bridge" and region_rel < 0.12:
+        if region.region_kind == "bridge" and region_rel < 0.06:
             continue
-        if region.region_kind in {"root", "theme"} and region_rel < 0.05:
+        if region.region_kind in {"root", "theme"} and region_rel < 0.04:
             continue
-        root_key = tuple(region.root_chunk_ids[:1]) if region.root_chunk_ids else tuple(region.doc_ids[:1])
-        grouped[(_primary_theme(region), root_key)].append(region)
+        grouped[_primary_theme(region)].append(region)
+
     groups = []
-    for index, ((label, _root_key), regions) in enumerate(grouped.items(), start=1):
-        groups.append(_build_group(query, "theme-grounded", f"facet-{index:02d}", label, regions, chunk_store))
+    for index, (label, regions) in enumerate(grouped.items(), start=1):
+        representative_regions = _theme_representative_regions(query, regions)
+        group = _build_group(query, "theme-grounded", f"facet-{index:02d}", label, representative_regions, chunk_store)
+        group["supporting_chunk_ids"] = sorted(
+            {
+                chunk_id
+                for region in regions
+                for chunk_id in region.supporting_chunk_ids
+            }
+        )
+        group["root_chunk_ids"] = sorted(
+            {
+                chunk_id
+                for region in regions
+                for chunk_id in region.root_chunk_ids
+            }
+        )
+        group["doc_ids"] = list(
+            dict.fromkeys(
+                doc_id
+                for region in regions
+                for doc_id in region.doc_ids
+            )
+        )
+        group["region_kinds"] = sorted({region.region_kind for region in regions})
+        group["region_count"] = len(regions)
+        group["bridge_region_count"] = sum(1 for region in regions if region.region_kind == "bridge")
+        group["theme_region_count"] = sum(1 for region in regions if region.region_kind == "theme")
+        group["root_region_count"] = sum(1 for region in regions if region.region_kind == "root")
+        group["unique_doc_count"] = len(group["doc_ids"])
+        group["unique_root_count"] = len(group["root_chunk_ids"])
+        group = _retune_theme_group(group, query, representative_regions, chunk_store)
+        group["selection_priority"] = (
+            group["bridge_region_count"] * 2
+            + group["theme_region_count"] * 2
+            + min(group["unique_doc_count"], 3)
+            + min(group["unique_root_count"], 3)
+            + min(group["region_count"], 4)
+        )
+        groups.append(group)
     return _select_groups(
         groups,
         group_limit,
@@ -1032,7 +1153,8 @@ def _build_theme_groups(query, root_regions, bridge_regions, theme_regions, chun
         coverage_key_fn=lambda group: (
             ("label", group["facet_label"]),
             ("root", tuple(group["root_chunk_ids"][:1])),
-            ("doc", tuple(group["doc_ids"][:1])),
+            ("doc", tuple(group["doc_ids"][:2])),
+            ("theme", tuple(group["relation_themes"][:2])),
             ("kinds", tuple(group["region_kinds"])),
         ),
     )

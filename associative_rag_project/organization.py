@@ -15,6 +15,7 @@ Supported contracts:
 
 from __future__ import annotations
 
+import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 
@@ -28,6 +29,13 @@ QUERY_CONTRACTS = [
     "comparison-grounded",
     "theme-grounded",
 ]
+
+
+ASPECT_GROUPING_SYSTEM_PROMPT = """You plan query-facing evidence groups.
+You must only use the provided evidence units and the provided focus items.
+Do not invent new facts, examples, entities, or scenarios.
+Choose focus items first, then group units around those focus items.
+Return valid JSON only."""
 
 
 SECTION_EXPLICIT_PHRASES = (
@@ -181,8 +189,60 @@ BROAD_SCOPE_MARKERS = (
     "regions",
     "periods",
     "social issues",
+    "social change",
+    "social commentary",
+    "public opinion",
+    "societal values",
+    "societal disparities",
+    "international stage",
+    "international relations",
+    "global economic",
+    "consumerism",
+    "art market",
+    "market landscape",
+    "identity",
+    "collective identity",
+    "regional art",
+    "geopolitical",
     "historical and political impact",
     "according to the dataset",
+)
+
+THEME_ROLE_SCOPE_MARKERS = (
+    "social",
+    "societal",
+    "public",
+    "regional",
+    "international",
+    "global",
+    "cultural",
+    "historical",
+    "political",
+    "economic",
+    "identity",
+    "market",
+    "institution",
+    "values",
+    "landscape",
+    "development",
+)
+
+MECHANISM_HARD_CUES = (
+    "mechanism",
+    "mechanisms",
+    "process",
+    "processes",
+    "procedure",
+    "procedures",
+    "workflow",
+    "workflows",
+    "pathway",
+    "pathways",
+    "step by step",
+    "how to",
+    "method",
+    "methods",
+    "implementation",
 )
 
 
@@ -234,6 +294,19 @@ def detect_query_contract(query: str) -> str:
         return "section-grounded"
     if query_lower.startswith(("what seasonal", "what initial", "which seasonal", "which initial")):
         return "section-grounded"
+    # Broad "how did ... influence ..." summaries (often theme-QFS) are easily
+    # over-classified as mechanism. Give them a theme override unless hard
+    # mechanism cues are explicitly present.
+    if (starts_how or starts_in_what_ways) and any(marker in query_lower for marker in BROAD_SCOPE_MARKERS) and any(
+        verb in query_lower for verb in MECHANISM_LINK_VERBS
+    ) and not any(cue in query_lower for cue in MECHANISM_HARD_CUES):
+        return "theme-grounded"
+    if query_lower.startswith(("what role did", "what role does", "what role do")) and not any(
+        cue in query_lower for cue in MECHANISM_HARD_CUES
+    ):
+        broad_role_hits = sum(1 for marker in THEME_ROLE_SCOPE_MARKERS if marker in query_lower)
+        if broad_role_hits >= 2 or any(marker in query_lower for marker in BROAD_SCOPE_MARKERS):
+            return "theme-grounded"
     if query_lower.startswith("what role did") and any(
         token in query_lower for token in ("play in", "shape", "influence", "affect", "evolution")
     ):
@@ -326,6 +399,16 @@ def _doc_ids(chunk_ids, chunk_store):
     return values
 
 
+def _filter_chunk_ids_by_doc(chunk_ids, chunk_store, allowed_doc_ids):
+    if not allowed_doc_ids:
+        return list(chunk_ids)
+    return [
+        chunk_id
+        for chunk_id in chunk_ids
+        if chunk_store.get(chunk_id, {}).get("full_doc_id") in allowed_doc_ids
+    ]
+
+
 def _make_region(
     *,
     region_id,
@@ -340,12 +423,19 @@ def _make_region(
     chunk_store,
     root_chunk_band,
     growth_traces=None,
+    allowed_doc_ids=None,
 ):
     node_ids = sorted(set(node_ids))
     edge_ids = sorted(set(edge_ids))
     if not node_ids and not edge_ids:
         return None
-    supporting_chunk_ids = sorted(_supporting_chunks_for_region(node_ids, edge_ids, node_to_chunks, edge_to_chunks))
+    supporting_chunk_ids = sorted(
+        _filter_chunk_ids_by_doc(
+            _supporting_chunks_for_region(node_ids, edge_ids, node_to_chunks, edge_to_chunks),
+            chunk_store,
+            allowed_doc_ids,
+        )
+    )
     if not supporting_chunk_ids:
         return None
     root_chunk_id_set = set(root_chunk_ids)
@@ -383,6 +473,7 @@ def _collect_root_regions(
     edge_to_chunks,
     chunk_store,
     root_chunk_band,
+    allowed_doc_ids=None,
 ):
     regions = []
     final_edge_set = set(final_edges)
@@ -417,6 +508,7 @@ def _collect_root_regions(
             chunk_store=chunk_store,
             root_chunk_band=root_chunk_band,
             growth_traces=[f"Root-anchored around {root_chunk_id}"],
+            allowed_doc_ids=allowed_doc_ids,
         )
         if region is not None:
             regions.append(region)
@@ -443,6 +535,7 @@ def _collect_bridge_regions(
     edge_to_chunks,
     chunk_store,
     root_chunk_band,
+    allowed_doc_ids=None,
 ):
     final_edge_set = set(final_edges)
     regions = []
@@ -474,6 +567,7 @@ def _collect_bridge_regions(
                 f"Graph bridge path: {' -> '.join(path)}",
                 f"Bridge introduced {item.get('new_source_count', 0)} new source chunks",
             ],
+            allowed_doc_ids=allowed_doc_ids,
         )
         if region is not None and region.root_connected:
             regions.append(region)
@@ -498,6 +592,7 @@ def _collect_bridge_regions(
                 f"Chunk-side bridge via {item.get('chunk_id')}",
                 f"Frontier touch={item.get('frontier_touch', 0)}, new sources={item.get('new_source_count', 0)}",
             ],
+            allowed_doc_ids=allowed_doc_ids,
         )
         if region is not None and region.root_connected:
             regions.append(region)
@@ -516,6 +611,7 @@ def _collect_theme_regions(
     chunk_store,
     root_chunk_band,
     max_themes=5,
+    allowed_doc_ids=None,
 ):
     theme_to_edges = defaultdict(list)
     final_edge_set = set(final_edges)
@@ -555,6 +651,7 @@ def _collect_theme_regions(
             chunk_store=chunk_store,
             root_chunk_band=root_chunk_band,
             growth_traces=[f"Theme expansion around relation theme '{theme}'"],
+            allowed_doc_ids=allowed_doc_ids,
         )
         if region is not None and region.root_connected:
             regions.append(region)
@@ -573,6 +670,7 @@ def collect_overlapping_regions(
     node_to_chunks,
     edge_to_chunks,
     chunk_store,
+    allowed_doc_ids=None,
 ):
     chunk_to_final_nodes, chunk_to_final_edges = _chunk_local_index(
         final_nodes=final_nodes,
@@ -592,6 +690,7 @@ def collect_overlapping_regions(
         edge_to_chunks=edge_to_chunks,
         chunk_store=chunk_store,
         root_chunk_band=root_chunk_band,
+        allowed_doc_ids=allowed_doc_ids,
     )
     bridge_regions = _collect_bridge_regions(
         query=query,
@@ -603,6 +702,7 @@ def collect_overlapping_regions(
         edge_to_chunks=edge_to_chunks,
         chunk_store=chunk_store,
         root_chunk_band=root_chunk_band,
+        allowed_doc_ids=allowed_doc_ids,
     )
     theme_regions = _collect_theme_regions(
         query=query,
@@ -614,6 +714,7 @@ def collect_overlapping_regions(
         edge_to_chunks=edge_to_chunks,
         chunk_store=chunk_store,
         root_chunk_band=root_chunk_band,
+        allowed_doc_ids=allowed_doc_ids,
     )
     return root_regions, bridge_regions, theme_regions
 
@@ -1090,7 +1191,7 @@ def _build_comparison_groups(query, root_regions, bridge_regions, chunk_store, g
     )
 
 
-def _build_theme_groups(query, root_regions, bridge_regions, theme_regions, chunk_store, group_limit):
+def _build_theme_groups_legacy(query, root_regions, bridge_regions, theme_regions, chunk_store, group_limit):
     grouped = defaultdict(list)
     for region in root_regions + theme_regions + bridge_regions:
         if not region.root_connected:
@@ -1160,6 +1261,593 @@ def _build_theme_groups(query, root_regions, bridge_regions, theme_regions, chun
     )
 
 
+def _contains_any(text, items):
+    return any(item in text for item in items)
+
+
+def _theme_slot_specs(query):
+    query_lower = " ".join(query.lower().split())
+    slots = []
+    seen = set()
+
+    def add_slot(key, label, cues):
+        if key in seen:
+            return
+        seen.add(key)
+        slots.append(
+            {
+                "key": key,
+                "label": label,
+                "cues": tuple(cues),
+                "signature": " ".join([query_lower, label.lower(), *cues]),
+            }
+        )
+
+    if _contains_any(query_lower, ("examples", "example", "types of", "styles", "themes", "movements", "artworks", "artifacts", "models")):
+        add_slot(
+            "examples",
+            "Examples and representative cases",
+            ("examples", "cases", "styles", "themes", "movements", "artworks", "resources", "models"),
+        )
+    if _contains_any(query_lower, ("resources", "support", "support networks", "associations", "organizations", "universities", "agencies", "partnerships")):
+        add_slot(
+            "support",
+            "Support networks and institutions",
+            ("support", "resources", "organizations", "associations", "institutions", "agencies", "universities", "partnerships"),
+        )
+    if _contains_any(query_lower, ("strategies", "tools", "manage", "management", "practices", "recommendations", "how can", "how should", "what role")):
+        add_slot(
+            "actions",
+            "Strategies, practices, and practical tools",
+            ("strategies", "tools", "management", "practices", "recommendations", "methods", "actions"),
+        )
+    if _contains_any(query_lower, ("why", "reasons", "reason", "fail", "failure", "challenges", "risks", "barriers", "importance")):
+        add_slot(
+            "drivers",
+            "Causes, constraints, and driving pressures",
+            ("reasons", "causes", "pressures", "constraints", "challenges", "risks", "failures", "barriers"),
+        )
+    if _contains_any(query_lower, ("benefits", "advantages", "impacts", "influence", "alter", "effects", "outcomes", "value", "importance")):
+        add_slot(
+            "outcomes",
+            "Effects, outcomes, and benefits",
+            ("effects", "outcomes", "benefits", "advantages", "value", "impact", "influence"),
+        )
+    if _contains_any(query_lower, ("policy", "policies", "government", "regulation", "regulatory", "market", "education", "community", "social", "historical", "political", "environmental", "local", "global")):
+        add_slot(
+            "contexts",
+            "Contexts, institutions, and operating conditions",
+            ("context", "institutions", "policy", "market", "community", "historical", "political", "environmental"),
+        )
+
+    if not slots:
+        add_slot(
+            "examples",
+            "Representative examples and cases",
+            ("examples", "cases", "instances", "themes"),
+        )
+        add_slot(
+            "drivers",
+            "Causes and driving pressures",
+            ("drivers", "causes", "pressures", "forces"),
+        )
+        add_slot(
+            "outcomes",
+            "Effects and outcomes",
+            ("effects", "outcomes", "results", "benefits"),
+        )
+        add_slot(
+            "contexts",
+            "Contexts and conditions",
+            ("contexts", "conditions", "settings", "institutions"),
+        )
+
+    if len(slots) < 3:
+        add_slot(
+            "contexts",
+            "Contexts and conditions",
+            ("contexts", "conditions", "settings", "institutions"),
+        )
+        add_slot(
+            "outcomes",
+            "Effects and outcomes",
+            ("effects", "outcomes", "results", "benefits"),
+        )
+        add_slot(
+            "examples",
+            "Representative examples and cases",
+            ("examples", "cases", "instances", "themes"),
+        )
+    return slots[:5]
+
+
+def _region_slot_affinity(query, slot, region):
+    descriptor = normalize_text(region.descriptor_text)
+    primary = normalize_text(_primary_theme(region))
+    support_text = " ".join(
+        [primary]
+        + [normalize_text(theme) for theme in region.relation_themes[:4]]
+        + [normalize_text(entity) for entity in region.focus_entities[:6]]
+    )
+    slot_signature = slot["signature"]
+    cue_hits = sum(1 for cue in slot["cues"] if cue in descriptor or cue in support_text)
+    score = 0.0
+    score += lexical_overlap_score(slot_signature, descriptor) * 1.4
+    score += lexical_overlap_score(slot_signature, support_text) * 1.0
+    score += lexical_overlap_score(query, descriptor) * 0.4
+    score += cue_hits * 0.03
+    if slot["key"] in {"drivers", "outcomes"} and region.region_kind == "bridge":
+        score += 0.05
+    if slot["key"] in {"examples", "support", "contexts"} and region.region_kind in {"root", "theme"}:
+        score += 0.04
+    if slot["key"] == "actions" and region.region_kind in {"root", "bridge"}:
+        score += 0.04
+    return round(score, 6)
+
+
+def _slot_group_label(query, slot, regions):
+    primary_counter = Counter(normalize_text(_primary_theme(region)) for region in regions if normalize_text(_primary_theme(region)))
+    dominant = primary_counter.most_common(1)[0][0] if primary_counter else ""
+    if dominant and lexical_overlap_score(query, dominant) >= 0.03:
+        return f"{slot['label']}: {dominant}"
+    return slot["label"]
+
+
+def _select_regions_for_slot(query, slot, regions, used_region_ids, max_regions=3):
+    ranked = sorted(
+        regions,
+        key=lambda region: (
+            -_region_slot_affinity(query, slot, region),
+            -lexical_overlap_score(query, region.descriptor_text),
+            -len(region.supporting_chunk_ids),
+            region.region_id,
+        ),
+    )
+    selected = []
+    seen_roots = set()
+    seen_docs = set()
+    seen_themes = set()
+    for region in ranked:
+        if region.region_id in used_region_ids:
+            continue
+        affinity = _region_slot_affinity(query, slot, region)
+        if affinity < 0.045:
+            continue
+        primary = normalize_text(_primary_theme(region))
+        if selected and primary in seen_themes and set(region.root_chunk_ids) & seen_roots and set(region.doc_ids) & seen_docs:
+            continue
+        selected.append(region)
+        seen_roots.update(region.root_chunk_ids)
+        seen_docs.update(region.doc_ids)
+        if primary:
+            seen_themes.add(primary)
+        if len(selected) >= max_regions:
+            break
+    return selected
+
+
+def _build_theme_groups(query, root_regions, bridge_regions, theme_regions, chunk_store, group_limit):
+    candidate_regions = []
+    for region in root_regions + theme_regions + bridge_regions:
+        if not region.root_connected:
+            continue
+        region_rel = lexical_overlap_score(query, region.descriptor_text)
+        if region.region_kind == "bridge" and region_rel < 0.05:
+            continue
+        if region.region_kind in {"root", "theme"} and region_rel < 0.035:
+            continue
+        candidate_regions.append(region)
+
+    if not candidate_regions:
+        return _build_theme_groups_legacy(query, root_regions, bridge_regions, theme_regions, chunk_store, group_limit)
+
+    slots = _theme_slot_specs(query)
+    used_region_ids = set()
+    candidates = []
+    for index, slot in enumerate(slots, start=1):
+        max_regions = 4 if slot["key"] in {"contexts", "outcomes", "examples"} else 3
+        selected_regions = _select_regions_for_slot(
+            query,
+            slot,
+            candidate_regions,
+            used_region_ids,
+            max_regions=max_regions,
+        )
+        if not selected_regions:
+            continue
+        label = _slot_group_label(query, slot, selected_regions)
+        group = _build_group(
+            query,
+            "theme-grounded",
+            f"facet-{index:02d}",
+            label,
+            selected_regions,
+            chunk_store,
+        )
+        representative_regions = _theme_representative_regions(query, selected_regions, max_roots=3, max_expansions=2)
+        group = _retune_theme_group(group, query, representative_regions, chunk_store)
+        group["focus_items"] = _priority_sort_texts(
+            [label] + group.get("relation_themes", []) + group.get("focus_entities", []),
+            [slot["label"]] + list(slot["cues"]),
+            limit=6,
+        )
+        group["slot_key"] = slot["key"]
+        group["selection_priority"] = (
+            min(group.get("unique_doc_count", 0), 4)
+            + min(group.get("unique_root_count", 0), 4)
+            + min(group.get("region_count", 0), 4)
+            + min(group.get("theme_region_count", 0), 3)
+            + min(group.get("bridge_region_count", 0), 2)
+            + min(group.get("root_region_count", 0), 2)
+        )
+        candidates.append(group)
+        used_region_ids.update(region.region_id for region in selected_regions)
+        if len(candidates) >= group_limit:
+            break
+
+    if len(candidates) < min(3, group_limit):
+        legacy_groups = _build_theme_groups_legacy(
+            query,
+            root_regions,
+            bridge_regions,
+            theme_regions,
+            chunk_store,
+            group_limit,
+        )
+        existing_labels = {normalize_text(group["facet_label"]) for group in candidates}
+        for group in legacy_groups:
+            if len(candidates) >= group_limit:
+                break
+            label = normalize_text(group.get("facet_label", ""))
+            if label in existing_labels:
+                continue
+            candidates.append(group)
+            if label:
+                existing_labels.add(label)
+
+    return _select_groups(
+        candidates,
+        group_limit,
+        lambda group: (group.get("slot_key", "legacy"), normalize_text(group.get("facet_label", ""))),
+        coverage_key_fn=lambda group: (
+            ("slot", group.get("slot_key", "legacy")),
+            ("label", normalize_text(group.get("facet_label", ""))),
+            ("doc", tuple(group.get("doc_ids", [])[:2])),
+            ("root", tuple(group.get("root_chunk_ids", [])[:2])),
+            ("theme", tuple(group.get("relation_themes", [])[:2])),
+        ),
+    )
+
+
+def build_candidate_points_from_groups(facet_groups, top_k=8):
+    """Project grouped evidence into LLM-facing aspect points.
+
+    This keeps aspect construction tied to region/group composition instead of
+    re-deriving labels from raw chunk text or isolated entities.
+    """
+    candidate_points = []
+    for group in facet_groups[:top_k]:
+        support_labels = []
+        for label in group.get("focus_items", [])[:4]:
+            text = normalize_text(label)
+            if text and text not in support_labels:
+                support_labels.append(text)
+        for label in group.get("relation_themes", [])[:3]:
+            text = normalize_text(label)
+            if text and text not in support_labels:
+                support_labels.append(text)
+        for label in group.get("focus_entities", [])[:4]:
+            text = normalize_text(label)
+            if text and text not in support_labels:
+                support_labels.append(text)
+        candidate_points.append(
+            {
+                "point_type": "aspect",
+                "aspect_contract": group.get("organization_contract"),
+                "label": normalize_text(group.get("facet_label", "")),
+                "query_alignment": round(float(group.get("query_rel", group.get("group_score", 0.0))), 6),
+                "chunk_alignment": round(
+                    min(
+                        1.0,
+                        max(
+                            float(group.get("root_anchor_count", 0)),
+                            float(group.get("anchor_support", 0)),
+                        )
+                        / 3.0,
+                    ),
+                    6,
+                ),
+                "supporting_chunk_ids": list(group.get("supporting_chunk_ids", [])),
+                "node_ids": list(group.get("nodes", [])),
+                "edge_ids": list(group.get("edges", [])),
+                "doc_ids": list(group.get("doc_ids", [])),
+                "support_labels": support_labels[:6],
+                "support_count": max(
+                    int(group.get("region_count", 0)),
+                    int(group.get("anchor_support", 0)),
+                    len(support_labels),
+                ),
+                "group_id": group.get("group_id"),
+                "focus_items": list(group.get("focus_items", []))[:6],
+            }
+        )
+    return candidate_points
+
+
+def _extract_json(text):
+    text = (text or "").strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(text[start : end + 1])
+        raise
+
+
+def _group_focus_pool(group, limit=8):
+    items = []
+    for label in group.get("relation_themes", [])[:4]:
+        text = normalize_text(label)
+        if text and text not in items:
+            items.append(text)
+    for label in group.get("focus_entities", [])[:5]:
+        text = normalize_text(label)
+        if text and text not in items:
+            items.append(text)
+    facet_label = normalize_text(group.get("facet_label", ""))
+    if facet_label and facet_label not in items:
+        items.append(facet_label)
+    return items[:limit]
+
+
+def _aspect_grouping_prompt(query, query_contract, facet_groups, group_limit):
+    contract_hint = (
+        "Build broad theme aspects that cover distinct major sides of the query."
+        if query_contract == "theme-grounded"
+        else "Build comparison aspects that act like comparison axes and keep both sides explicit."
+    )
+    unit_blocks = []
+    for group in facet_groups:
+        focus_pool = _group_focus_pool(group)
+        unit_blocks.append(
+            "\n".join(
+                [
+                    f"id: {group['group_id']}",
+                    f"label: {group.get('facet_label', '')}",
+                    f"summary: {group.get('group_summary', '')}",
+                    f"themes: {', '.join(group.get('relation_themes', [])[:4])}",
+                    f"entities: {', '.join(group.get('focus_entities', [])[:5])}",
+                    f"focus_pool: {', '.join(focus_pool)}",
+                    f"docs: {', '.join(group.get('doc_ids', [])[:3])}",
+                    f"region_kinds: {', '.join(group.get('region_kinds', []))}",
+                ]
+            )
+        )
+    max_groups = min(group_limit, max(2, min(6, len(facet_groups))))
+    return f"""Plan query-facing evidence groups from the evidence units below.
+
+Requirements:
+- {contract_hint}
+- Use only the given unit ids.
+- Use only focus items copied exactly from the provided focus_pool lines.
+- Select focus items first, then assign unit ids to each group.
+- Merge units when they support the same query-facing aspect.
+- Omit clearly irrelevant or noisy units instead of forcing them into a group.
+- Prefer specific, query-facing aspects over generic broad abstractions.
+- Prefer aspect labels that could serve as answer subsection headings and that stay close to the chosen focus items.
+- Cover distinct aspects rather than repeating the same one with different wording.
+- Return at most {max_groups} aspects.
+
+Query:
+{query}
+
+Evidence Units:
+
+{chr(10).join(unit_blocks)}
+
+Return JSON:
+{{
+  "groups": [
+    {{
+      "aspect_label": "...",
+      "focus_items": ["...", "..."],
+      "reason": "...",
+      "unit_ids": ["facet-01", "facet-03"]
+    }}
+  ]
+}}
+"""
+
+
+def _priority_sort_texts(values, focus_items, limit):
+    focus_text = " ".join(normalize_text(item) for item in focus_items if normalize_text(item))
+    return [
+        text
+        for text, _ in sorted(
+            Counter(normalize_text(value) for value in values if normalize_text(value)).items(),
+            key=lambda item: (
+                -(
+                    1.0
+                    if item[0] in {normalize_text(focus) for focus in focus_items if normalize_text(focus)}
+                    else lexical_overlap_score(focus_text, item[0])
+                ),
+                -item[1],
+                item[0],
+            ),
+        )[:limit]
+    ]
+
+
+def _merge_groups_to_aspect(query, query_contract, aspect_index, aspect_label, focus_items, reason, member_groups, chunk_store):
+    root_chunk_ids = set()
+    supporting_chunk_ids = set()
+    anchor_candidates = []
+    node_ids = set()
+    edge_ids = set()
+    relation_counter = Counter()
+    focus_counter = Counter()
+    region_kind_counter = Counter()
+    doc_ids = []
+    growth_traces = []
+    member_ids = []
+    member_labels = []
+    region_count = 0
+    for group in member_groups:
+        root_chunk_ids.update(group.get("root_chunk_ids", []))
+        supporting_chunk_ids.update(group.get("supporting_chunk_ids", []))
+        node_ids.update(group.get("nodes", []))
+        edge_ids.update(group.get("edges", []))
+        relation_counter.update(group.get("relation_themes", []))
+        focus_counter.update(group.get("focus_entities", []))
+        region_count += int(group.get("region_count", 0))
+        member_ids.append(group.get("group_id"))
+        member_labels.append(group.get("facet_label"))
+        for kind, count in group.get("region_kind_counts", {}).items():
+            region_kind_counter[kind] += count
+        for doc_id in group.get("doc_ids", []):
+            if doc_id not in doc_ids:
+                doc_ids.append(doc_id)
+        for chunk_id in group.get("anchor_chunk_ids", []):
+            if chunk_id not in anchor_candidates:
+                anchor_candidates.append(chunk_id)
+        for trace in group.get("growth_traces", []):
+            if trace not in growth_traces:
+                growth_traces.append(trace)
+    normalized_focus_items = [normalize_text(item) for item in focus_items if normalize_text(item)]
+    focus_query = " ".join([query] + normalized_focus_items).strip()
+    ranked_supporting_chunks = _rank_chunks(focus_query, supporting_chunk_ids, chunk_store, root_chunk_ids)
+    filtered_supporting_chunk_ids = ranked_supporting_chunks[: min(18, max(10, len(anchor_candidates) * 2, len(member_groups) * 4))]
+    supporting_chunk_ids = set(filtered_supporting_chunk_ids)
+    anchor_chunk_ids = _rank_chunks(focus_query, anchor_candidates, chunk_store, root_chunk_ids)[:5]
+    relation_themes = _priority_sort_texts(list(relation_counter.elements()), normalized_focus_items, limit=5)
+    focus_entities = _priority_sort_texts(list(focus_counter.elements()), normalized_focus_items, limit=8)
+    descriptor_text = _evidence_descriptor_text(
+        aspect_label,
+        relation_themes,
+        focus_entities,
+        anchor_chunk_ids,
+        chunk_store,
+    )
+    summary = (
+        reason.strip()
+        or f"This {query_contract} aspect centers on {aspect_label} and merges related evidence units."
+    )
+    return {
+        "group_id": f"llm-aspect-{aspect_index:02d}",
+        "facet_label": normalize_text(aspect_label),
+        "organization_contract": query_contract,
+        "facet_prompt": _facet_prompt(query, query_contract, aspect_label),
+        "group_score": round(lexical_overlap_score(query, descriptor_text), 6),
+        "query_rel": round(lexical_overlap_score(query, descriptor_text), 6),
+        "anchor_support": len(anchor_chunk_ids),
+        "root_anchor_count": len(set(anchor_chunk_ids) & root_chunk_ids),
+        "node_count": len(node_ids),
+        "edge_count": len(edge_ids),
+        "region_count": region_count,
+        "unique_doc_count": len(doc_ids),
+        "unique_root_count": len(root_chunk_ids),
+        "root_chunk_ids": sorted(root_chunk_ids),
+        "doc_ids": doc_ids,
+        "region_kinds": sorted(region_kind_counter),
+        "region_kind_counts": dict(region_kind_counter),
+        "root_region_count": region_kind_counter.get("root", 0),
+        "bridge_region_count": region_kind_counter.get("bridge", 0),
+        "theme_region_count": region_kind_counter.get("theme", 0),
+        "section_region_count": region_kind_counter.get("section", 0),
+        "relation_themes": relation_themes,
+        "focus_entities": focus_entities,
+        "supporting_chunk_ids": sorted(supporting_chunk_ids),
+        "anchor_chunk_ids": anchor_chunk_ids,
+        "source_previews": [
+            {
+                "chunk_id": chunk_id,
+                "preview": normalize_text(chunk_store.get(chunk_id, {}).get("content", ""))[:220],
+            }
+            for chunk_id in anchor_chunk_ids[:3]
+        ],
+        "growth_traces": growth_traces[:4],
+        "group_summary": summary,
+        "nodes": sorted(node_ids),
+        "edges": sorted(edge_ids),
+        "member_group_ids": member_ids,
+        "member_facet_labels": member_labels,
+        "focus_items": normalized_focus_items[:6],
+        "selection_reason": reason.strip(),
+        "selection_priority": len(member_groups) + min(len(doc_ids), 3) + min(len(root_chunk_ids), 3),
+    }
+
+
+def regroup_facet_groups_with_llm(query, facet_groups, query_contract, llm_client, chunk_store, group_limit):
+    """Use the LLM to regroup facet units into query-facing aspects.
+
+    This only changes how existing support is grouped. It does not add facts or
+    evidence outside the current facet groups.
+    """
+    if query_contract not in {"theme-grounded", "comparison-grounded"}:
+        return facet_groups
+    if llm_client is None or len(facet_groups) < 2:
+        return facet_groups
+    try:
+        prompt = _aspect_grouping_prompt(query, query_contract, facet_groups, group_limit)
+        raw = llm_client.generate(
+            prompt,
+            system_prompt=ASPECT_GROUPING_SYSTEM_PROMPT,
+            temperature=0.0,
+            max_tokens=900,
+        )
+        payload = _extract_json(raw)
+        requested_groups = payload.get("groups", [])
+        if not requested_groups:
+            return facet_groups
+        group_by_id = {group["group_id"]: group for group in facet_groups}
+        regrouped = []
+        used = set()
+        for index, item in enumerate(requested_groups, start=1):
+            unit_ids = [unit_id for unit_id in item.get("unit_ids", []) if unit_id in group_by_id]
+            unit_ids = [unit_id for unit_id in unit_ids if unit_id not in used]
+            if not unit_ids:
+                continue
+            focus_items = []
+            allowed_focus_pool = {
+                focus_item
+                for unit_id in unit_ids
+                for focus_item in _group_focus_pool(group_by_id[unit_id], limit=12)
+            }
+            for focus_item in item.get("focus_items", []):
+                text = normalize_text(focus_item)
+                if text and text in allowed_focus_pool and text not in focus_items:
+                    focus_items.append(text)
+            if not focus_items:
+                focus_items = list(allowed_focus_pool)[:3]
+            member_groups = [group_by_id[unit_id] for unit_id in unit_ids]
+            regrouped.append(
+                _merge_groups_to_aspect(
+                    query=query,
+                    query_contract=query_contract,
+                    aspect_index=index,
+                    aspect_label=item.get("aspect_label", f"aspect {index}"),
+                    focus_items=focus_items,
+                    reason=item.get("reason", ""),
+                    member_groups=member_groups,
+                    chunk_store=chunk_store,
+                )
+            )
+            used.update(unit_ids)
+            if len(regrouped) >= group_limit:
+                break
+        if len(regrouped) < min(3, len(facet_groups)):
+            leftovers = [group for group in facet_groups if group["group_id"] not in used]
+            for group in leftovers:
+                if len(regrouped) >= min(group_limit, 3):
+                    break
+                regrouped.append(group)
+        return regrouped or facet_groups
+    except Exception:
+        return facet_groups
+
+
 def build_answer_facet_groups(
     *,
     query,
@@ -1175,9 +1863,11 @@ def build_answer_facet_groups(
     edge_to_chunks,
     chunk_store,
     group_limit,
+    query_contract=None,
+    allowed_doc_ids=None,
 ):
     """Build one-contract-only facet groups from the final subgraph."""
-    contract = detect_query_contract(query)
+    contract = query_contract or detect_query_contract(query)
     root_regions, bridge_regions, theme_regions = collect_overlapping_regions(
         query=query,
         root_chunk_ids=root_chunk_ids,
@@ -1189,6 +1879,7 @@ def build_answer_facet_groups(
         node_to_chunks=node_to_chunks,
         edge_to_chunks=edge_to_chunks,
         chunk_store=chunk_store,
+        allowed_doc_ids=allowed_doc_ids,
     )
     if contract == "section-grounded":
         groups = _build_section_groups(

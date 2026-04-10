@@ -278,47 +278,29 @@ def _aggregate_metric_votes(metric_names, dimension_votes):
     return counter
 
 
-def _contract_secondary_metrics(query_contract):
-    primary = set(CONTRACT_PRIMARY_METRICS.get(query_contract, CONTRACT_PRIMARY_METRICS["theme-grounded"]))
-    return [metric for metric in NON_OVERALL_CRITERIA_KEYS if metric not in primary]
-
-
 def _resolve_contract_conditioned_decision(query_contract, dimension_votes, llm_overall_votes):
     primary_metrics = CONTRACT_PRIMARY_METRICS.get(query_contract, CONTRACT_PRIMARY_METRICS["theme-grounded"])
-    secondary_metrics = _contract_secondary_metrics(query_contract)
     primary_counter = _aggregate_metric_votes(primary_metrics, dimension_votes)
     primary_winner = _winner_from_counter(primary_counter)
-    if primary_winner != "tie":
-        return {
-            "winner": primary_winner,
-            "decided_by": "primary_metrics",
-            "primary_metrics": primary_metrics,
-            "secondary_metrics": secondary_metrics,
-            "primary_vote_totals": dict(primary_counter),
-            "secondary_vote_totals": dict(_aggregate_metric_votes(secondary_metrics, dimension_votes)),
-        }
-
-    secondary_counter = _aggregate_metric_votes(secondary_metrics, dimension_votes)
-    secondary_winner = _winner_from_counter(secondary_counter)
-    if secondary_winner != "tie":
-        return {
-            "winner": secondary_winner,
-            "decided_by": "secondary_metrics",
-            "primary_metrics": primary_metrics,
-            "secondary_metrics": secondary_metrics,
-            "primary_vote_totals": dict(primary_counter),
-            "secondary_vote_totals": dict(secondary_counter),
-        }
-
-    llm_winner = _winner_from_counter(Counter(llm_overall_votes))
     return {
-        "winner": llm_winner,
-        "decided_by": "llm_overall_votes",
+        "winner": primary_winner,
+        "decided_by": "primary_metrics_only",
         "primary_metrics": primary_metrics,
-        "secondary_metrics": secondary_metrics,
         "primary_vote_totals": dict(primary_counter),
-        "secondary_vote_totals": dict(secondary_counter),
+        "llm_overall_vote_totals": dict(llm_overall_votes),
     }
+
+
+def _metric_pass_summary(metric_names, dimension_summary):
+    summary = {}
+    for metric_name in metric_names:
+        metric = dimension_summary.get(metric_name, {})
+        candidate_probability = metric.get("candidate_probability", 0.0)
+        summary[metric_name] = {
+            "candidate_probability": candidate_probability,
+            "passes_threshold": candidate_probability > 0.5,
+        }
+    return summary
 
 
 def _generate_verdict(prompt, llm_client, max_attempts=3):
@@ -506,6 +488,23 @@ def run_winrate_judgement(questions, candidate_answers, baseline_answers, llm_cl
                     counts["baseline"] / max(counts["candidate"] + counts["baseline"] + counts["tie"], 1), 4
                 ),
                 "primary_metrics": CONTRACT_PRIMARY_METRICS.get(query_contract, CONTRACT_PRIMARY_METRICS["theme-grounded"]),
+                "primary_metric_summary": _metric_pass_summary(
+                    CONTRACT_PRIMARY_METRICS.get(query_contract, CONTRACT_PRIMARY_METRICS["theme-grounded"]),
+                    dimension_summary_by_contract.get(query_contract, {}),
+                ),
+                "all_primary_metrics_above_50": all(
+                    dimension_summary_by_contract.get(query_contract, {})
+                    .get(metric_name, {})
+                    .get("candidate_probability", 0.0)
+                    > 0.5
+                    for metric_name in CONTRACT_PRIMARY_METRICS.get(
+                        query_contract, CONTRACT_PRIMARY_METRICS["theme-grounded"]
+                    )
+                ),
+                "overall_win_above_50": round(
+                    counts["candidate"] / max(counts["candidate"] + counts["baseline"] + counts["tie"], 1), 4
+                )
+                > 0.5,
             }
             for query_contract, counts in contract_conditioned_counter_by_contract.items()
         },

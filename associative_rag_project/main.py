@@ -36,6 +36,22 @@ def build_parser():
     common.add_argument("--retrieval-mode", choices=["bm25", "dense", "hybrid"], default="dense")
     common.add_argument("--dense-weight", type=float, default=0.75)
     common.add_argument("--bm25-weight", type=float, default=0.25)
+    common.add_argument(
+        "--embedding-provider",
+        choices=["openai_compatible", "bge_m3_local"],
+        help="Dense query embedding backend. Defaults to config/env value.",
+    )
+    common.add_argument("--embedding-model", help="OpenAI-compatible embedding model override.")
+    common.add_argument("--embedding-base-url", help="OpenAI-compatible embedding base URL override.")
+    common.add_argument("--embedding-api-key", help="OpenAI-compatible embedding API key override.")
+    common.add_argument("--local-embedding-model", help="Local HF model path/name, e.g. BAAI/bge-m3.")
+    common.add_argument("--local-embedding-device", help="Local embedding device: auto/cuda/mps/cpu.")
+    common.add_argument("--local-embedding-batch-size", type=int, help="Local embedding batch size.")
+    common.add_argument("--local-embedding-max-length", type=int, help="Local embedding max token length.")
+    common.add_argument(
+        "--local-embedding-query-instruction",
+        help="Optional prefix for local query embedding (kept empty by default).",
+    )
     common.add_argument("--top-root-nodes", type=int, default=12)
     common.add_argument("--top-root-edges", type=int, default=16)
     common.add_argument("--max-hop", type=int, default=4)
@@ -48,7 +64,7 @@ def build_parser():
     common.add_argument("--group-limit", type=int, default=8)
     common.add_argument("--max-source-chunks", type=int, default=14)
     common.add_argument("--max-source-word-budget", type=int, default=4500)
-    common.add_argument("--max-workers", type=int)
+    common.add_argument("--max-workers", type=int, default=12)
 
     subparsers.add_parser("retrieve", parents=[common])
 
@@ -84,6 +100,15 @@ def retrieval_config_from_args(args):
         "retrieval_mode": args.retrieval_mode,
         "dense_weight": args.dense_weight,
         "bm25_weight": args.bm25_weight,
+        "embedding_provider": args.embedding_provider,
+        "embedding_model": args.embedding_model,
+        "embedding_base_url": args.embedding_base_url,
+        "embedding_api_key": args.embedding_api_key,
+        "local_embedding_model": args.local_embedding_model,
+        "local_embedding_device": args.local_embedding_device,
+        "local_embedding_batch_size": args.local_embedding_batch_size,
+        "local_embedding_max_length": args.local_embedding_max_length,
+        "local_embedding_query_instruction": args.local_embedding_query_instruction,
         "top_root_nodes": args.top_root_nodes,
         "top_root_edges": args.top_root_edges,
         "max_hop": args.max_hop,

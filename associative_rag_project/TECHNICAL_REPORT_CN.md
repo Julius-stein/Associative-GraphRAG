@@ -1301,3 +1301,349 @@ judge 同时要求模型输出三项 contract 标签：
 - `art` 数据集对“例子密度、历史跨度、综述宽度”的要求显著高于 `agriculture`，因此同一套 `theme` 组织策略会出现明显域间差异。
 
 这组案例说明，后续优化重点不在于继续强化 theme 的证据收缩，而在于为 `theme-grounded` 增加显式的 coverage planning，并把“方面覆盖”和“写作锚点”分成两个独立步骤。
+
+## 14. ret4 Aspect Case Study
+
+`runs_ret4` 对当前系统有一个很重要的诊断价值：`Candidate Points` 已经不再是 `ret3` 那种由 chunk 表层词拼出来的短语，而是直接由 `facet_groups` 投影出来的 aspect。换句话说，aspect 的表现形式已经稳定下来，当前的核心问题转移到了 aspect 语义是否真正对题。
+
+本节关心三个层次：
+
+- `retrieve` 阶段是否把 query 需要的支持材料召回到了正确的语义轴上。
+- `organization` 阶段是否把这些支持材料合成了 query-facing aspects。
+- `prompt / generation` 阶段是否把已经成形的 aspects 用满。
+
+### 14.1 总体观察
+
+`ret4` 的整体结果如下：
+
+- `art` 总胜率提升到 `0.544`，`theme-grounded` 的 overall 也超过 `0.5`。
+- `agriculture` 总胜率为 `0.512`，`theme-grounded` overall 仍然没有达到理想水平。
+- 两个数据集的 `theme-grounded` 依然共同表现出很低的 `Comprehensiveness` 和 `Diversity`。
+
+这说明当前链路已经可以稳定生成多个 aspect，但 broad theme 问题上的方面覆盖仍然不足。当前短板集中在两个地方：
+
+- 一部分 query 的 aspect 轴线从检索阶段就开始偏移。
+- 一部分 query 的 final graph 足够大，但 region/group 的合成结果没有形成用户问题真正需要的几个方面。
+
+### 14.2 类型一：retrieve 轴线偏移
+
+这类样本的特点是：`final graph` 并不小，但检索阶段把问题带到了错误的主题轴上，后续组织只是在错误语义带里继续整理。
+
+#### 案例 A：art-31
+
+- Query: `How did urbanization influence the types of art that were produced and valued?`
+- Judge contract: `mechanism-grounded`
+- Retrieval contract: `mechanism-grounded`
+- 结果: `candidate`
+- 关键迹象:
+  - facets 为 `literary influence historical reference -> individualism cultural critique`、`diplomacy cultural exchange -> historical narrative cultural context`、`art appreciation emotional connection -> geographical context art history` 等。
+  - candidate 在 `Focus Match`、`Evidence Anchoring`、`Scope Discipline`、`Scenario Fidelity` 上取胜。
+  - baseline 在 `Comprehensiveness` 和 `Diversity` 上双胜。
+- 归因:
+  - 检索得到的是一组“文化与城市经验相关”的材料，但没有稳定落在 `urbanization -> production / valuation` 这条机制轴上。
+  - 这种情况下，organization 只能整理已有材料，难以补出 baseline 那种市场、机构、材料、受众变化的完整框架。
+
+#### 案例 B：agriculture-5
+
+- Query: `Which external resources are recommended for novice beekeepers?`
+- Judge contract: `theme-grounded`
+- Retrieval contract: `theme-grounded`
+- 结果: `baseline`
+- 关键迹象:
+  - 只有一个主 aspect：`chemical impact agricultural practices`。
+  - 七个维度全部输给 baseline。
+- 归因:
+  - 这是检索轴严重偏离的样本。query 需要的是 `books / associations / courses / forums / mentors` 这一类资源型方面，final graph 提供的却是化学与农业实践相关材料。
+  - 后续 organization 与 prompt 都没有足够空间进行补救。
+
+#### 案例 C：art-33
+
+- Query: `How did public commissions and artworks contribute to city landscapes?`
+- Judge contract: `mechanism-grounded`
+- Retrieval contract: `theme-grounded`
+- 结果: `candidate`
+- 关键迹象:
+  - aspects 为 `media influence public discourse`、`location education`、`regulation public sales`、`urban design analysis`。
+  - candidate 最终取胜，主要依赖 `Empowerment`、`Focus Match`、`Evidence Anchoring`。
+- 归因:
+  - query 需要的是“公共委托如何塑造城市空间”的机制解释，但检索阶段把问题拆成了若干松散的主题轴。
+  - 当前结果还能赢，依赖的是后续答案收得更紧、更 grounded；但这类样本说明 retrieval contract 与 query real need 之间仍然存在偏差。
+
+### 14.3 类型二：organization 组面偏移
+
+这类样本的特点是：检索已经带回了不少相关支持材料，`final graph` 规模也足够大，但 facet group 把材料合成了不够 query-facing 的方面。
+
+#### 案例 D：art-3
+
+- Query: `Can we infer any patterns of political upheaval that led to significant art movements?`
+- Contract: `theme-grounded`
+- 结果: `candidate`
+- 关键迹象:
+  - aspects 为 `art economics aesthetics`、`educational influence aesthetic measure`、`series theme`。
+  - candidate 赢下 overall，但 `Comprehensiveness` 与 `Diversity` 全部输给 baseline。
+- 归因:
+  - judge 想要的是 `political upheaval -> named movements / countries / periods` 这类模式面。
+  - 当前 group 更像把支持材料整理成几个抽象文化主题，没有把“政治动荡导致哪些运动出现”这个隐含子问题拆出来。
+  - 这是典型的 organization 层组面不对题。
+
+#### 案例 E：art-106
+
+- Query: `How did the industrial revolution shift artist themes and methodologies?`
+- Contract: `theme-grounded`
+- 结果: `baseline`
+- 关键迹象:
+  - aspects 为 `art revolution historical significance`、`series theme`、`artist responsibility perspective`、`collaboration artist involvement`。
+  - baseline 在 `Comprehensiveness`、`Diversity`、`Empowerment`、`Focus Match`、`Evidence Anchoring` 上全部占优。
+- 归因:
+  - final graph 中已有若干与 “revolution / artist / collaboration” 相关的材料，但这些 group 没有被组合成 `subject matter / technique / industrial materials / audience / modern labor` 之类的标准方面。
+  - 当前问题出现在“把什么放在一起”这一层，说明 region 到 aspect 的上层聚合仍然缺一个 query-facing 的约束。
+
+#### 案例 F：agriculture-64
+
+- Query: `What strategies are suggested for ensuring the safety of hive products?`
+- Contract: `theme-grounded`
+- 结果: `baseline`
+- 关键迹象:
+  - aspects 为 `species identification beekeeping`、`conflict safety`、`hazard safety`、`health implications agricultural impact`、`beekeeping hive management`。
+  - baseline 在 `Comprehensiveness`、`Diversity`、`Empowerment` 上稳定占优。
+- 归因:
+  - 这些 groups 都和安全有关，但还没有被整理成用户可直接采用的策略框架，例如 testing、handling、contamination control、regulation、traceability。
+  - 从报告视角看，这已经不只是 recall 问题，更是 organization 没有把已有支持材料组合成“策略型方面”。
+
+### 14.4 类型三：prompt / generation 没有用满 aspects
+
+这类样本的特点是：retrieval 和 organization 已经提供了较合理的 aspects，答案仍然只展开了其中一部分，导致 breadth 不足。
+
+#### 案例 G：agriculture-31
+
+- Query: `What management tools are suggested for improving farm efficiency?`
+- Contract: `theme-grounded`
+- 结果: `baseline`
+- 关键迹象:
+  - aspects 为 `economic efficiency resource management`、`mechanization efficiency`、`financial tools management practices`、`livestock management efficiency` 等。
+  - candidate 在 `Evidence Anchoring`、`Scope Discipline`、`Scenario Fidelity` 上双胜。
+  - baseline 在 `Comprehensiveness`、`Diversity`、`Empowerment` 上双胜。
+- 归因:
+  - 这组 aspects 已经接近 query 所需的 broad management categories。
+  - candidate answer 实际只展开了 mechanization、rotation、sustainability 等少数方面，没有把 financial / labor / management-system 一起铺开。
+  - 这是一个很清楚的 generation underuse 样本。
+
+#### 案例 H：art-43
+
+- Query: `How did the commodification of art alter its perception and value in society?`
+- Contract: `theme-grounded`
+- 结果: `baseline`
+- 关键迹象:
+  - aspects 为 `historical event collection sale`、`art consumerism`、`valuation perception`、`art purchase auction` 等。
+  - candidate 在 `Evidence Anchoring` 上双胜。
+  - baseline 在 `Comprehensiveness`、`Diversity`、`Empowerment`、`Focus Match` 上双胜。
+- 归因:
+  - 现有 aspects 已经能支持市场、拍卖、消费文化、价值判断几个方向。
+  - candidate answer 实际仍然围绕市场逻辑与价值变化的主线展开，没有充分吸收全部 aspects。
+  - 这类样本说明，当 aspects 质量达到可用水平后，prompt 需要明确鼓励 theme 问题至少覆盖多个 aspect。
+
+#### 案例 I：agriculture-18
+
+- Query: `How can beekeepers market and sell their honey and other hive products?`
+- Contract: `theme-grounded`
+- 结果: `candidate`
+- 关键迹象:
+  - aspects 为 `honey extraction utility`、`management care`、`market collaboration organic supply`、`support market enhancement` 等。
+  - candidate 在 `Comprehensiveness`、`Diversity`、`Empowerment` 上双胜。
+- 归因:
+  - 这个样本说明当前 prompt 并非无法使用 aspect。
+  - 当 aspects 本身足够贴题、语义也足够清晰时，LLM 可以把它们转成多方面的回答，并直接反映在关键指标上。
+
+### 14.5 ret4 归因结论
+
+`ret4` 给出的结论比较稳定：
+
+- aspect 的外在表现已经基本稳定，`Candidate Points` 可以直接反映 facet group。
+- broad theme 问题的主瓶颈仍然在 retrieve 与 organization 之间的衔接层，也就是“支持材料如何聚成 query-facing aspects”。
+- prompt / generation 仍有改进空间，但它更像第二层问题。只有在 aspect 本身已经对题时，生成端是否用满 breadth 才会成为主矛盾。
+
+因此，下一阶段的优化重点应放在：
+
+- 让 `theme` 与 `comparison` 的 region/group 聚合显式对齐 query 的隐含子问题。
+- 让同一 aspect 内的支持材料更同质，让不同 aspect 之间的边界更清晰。
+- 在生成端加入最小 breadth 约束，鼓励 theme 答案覆盖多个已给出的 aspects。
+
+## 15. det1 Case Study：Theme Retrieval 的 Same-Root Collapse 与伪发散
+
+`runs_det1` 的结果把一个更基础的问题暴露得很清楚：当前 `theme` 的主要瓶颈已经不是 prompt，也不只是 organization，而是 retrieval 本身没有稳定地为 QFS 型总结任务召回“多方面骨架”。
+
+### 15.1 结果信号
+
+在 `runs_det1` 中：
+
+- `art` 的 `theme-grounded` overall 只有 `0.3488`。
+- `art` 的 `Comprehensiveness = 0.093`，`Diversity = 0.1453`。
+- `agriculture` 的 `theme-grounded` overall 为 `0.4479`。
+- `agriculture` 的 `Comprehensiveness = 0.2135`，`Diversity = 0.2188`。
+
+这组结果说明：
+
+- 当前策略还能保证 `Focus Match / Scope Discipline / Scenario Fidelity`。
+- 但它无法稳定提供 broad theme 问题所需要的“多个标准方面”。
+
+### 15.2 代码层诊断：语义联想并没有真正发散
+
+从当前实现看，`theme` 的语义链路仍然是高度 query-centered 的。
+
+#### 1. root 选择的主序仍然是 query 相似度
+
+在 `retrieval.py` 的 `select_diverse_root_chunks(...)` 中：
+
+- `_query_alignment(item)` 优先复用 `dense_score_norm`。
+- `theme-grounded` 与 `comparison-grounded` 的 `_root_sort_key(...)` 以 `-query_alignment` 为第一排序键。
+
+这意味着 root 选择首先是在找“最像 query 的 chunks”，而不是在找“能补齐不同方面的 chunks”。
+
+#### 2. semantic association 对 theme 仍以 query_alignment 为第一排序键
+
+在 `association.py` 中：
+
+- `_query_band_alignment(...)` 会取 candidate 所在 chunk band 中与 query 最相似的 chunk 分数。
+- `coverage_association(...)` 中的 `scored_edges` 与 `scored_nodes`，在 `theme-grounded / comparison-grounded / section-grounded` 下，排序第一位仍是 `-query_alignment`。
+- `_chunk_coverage_association(...)` 在 `theme-grounded` 下同样以 `-query_alignment` 作为第一排序键。
+
+这意味着所谓的 semantic association 虽然形式上是在 graph 上扩展：
+
+- `chunk -> nodes/edges`
+- `nodes/edges -> supporting chunks`
+- `chunk band -> neighboring chunks`
+
+但排序主逻辑仍然是：
+
+- 当前候选与原始 query 有多像
+
+而不是：
+
+- 当前候选是否提供了一个 query 还缺失的新方面
+
+因此它更像是一种“沿 query 核心词和核心语义带继续扩写”的过程，而不是 aspect-seeking 的真正发散。
+
+### 15.3 art：最典型的问题是 same-root collapse
+
+`art` 的 theme 输题里，top roots 会反复落回同一条语义带。
+
+高频重复节点包括：
+
+- `MODERNISM`
+- `DAMIEN HIRST`
+- `ART`
+- `ARTWORKS`
+- `CULTURE INDUSTRY`
+- `SOTHEBY'S`
+- `BERTOLT BRECHT`
+
+同时，theme 输题反复复用同几份 root 文档：
+
+- `doc-5ee09e8...`
+- `doc-86c7bd...`
+- `doc-ec7cbb...`
+- `doc-b1f6d9...`
+
+这说明很多不同 query 最终并没有召回不同的方面，而是被打回同一组高相似、高中心性的艺术 hub。
+
+#### 案例 A：art-3
+
+- Query: `Can we infer any patterns of political upheaval that led to significant art movements?`
+- top roots: `MODERNISM / DAMIEN HIRST / ZHANG XIAOGANG / SOTHEBY'S / BERTOLT BRECHT`
+- facets: `art economics aesthetics`、`educational influence aesthetic measure`、`series theme`
+
+这个 query 需要的是：
+
+- political upheaval
+- movement examples
+- pattern inference
+
+但 retrieval 召回的主轴已经偏到：
+
+- modernism / market / contemporary art / education
+
+这不是 organization 后处理能救的偏差，而是 root frontier 一开始就没有落在正确方面上。
+
+#### 案例 B：art-106
+
+- Query: `How did the industrial revolution shift artist themes and methodologies?`
+- top roots: `MODERNISM / DAMIEN HIRST / ARTWORKS / CUBISM / IMPRESSIONISM / BERTOLT BRECHT`
+- facets: `art revolution historical significance`、`series theme`、`artist responsibility perspective`
+
+这题本应强烈依赖 period-specific 的工业革命材料，但 root 仍然塌回现代主义/当代艺术带。说明当前 theme retrieval 并不会优先寻找“与 query 对应的不同历史方面”，而是优先寻找“对 query 词面最相似的艺术 hub”。
+
+### 15.4 agriculture：问题更像 non-canonical aspect recall
+
+`agriculture` 没有 `art` 那么严重的 same-root collapse，但依然存在一个明显问题：
+
+- raw support 往往能召回
+- 但召回的不是 baseline 式的标准方面
+
+#### 案例 C：agriculture-5
+
+- Query: `Which external resources are recommended for novice beekeepers?`
+- top roots: `BEES / NUCLEUS COLONY / HIVES / WAX MOTH / TWO HIVES / LANGSTROTH-STYLE HIVE / NATURAL ALTERNATIVES / MENTOR`
+- facets 只有：`chemical impact agricultural practices`
+
+这里不是 breadth 不够，而是 root 轴线直接错了。真正需要的方面应是：
+
+- associations
+- mentors
+- books / courses
+- online resources
+
+#### 案例 D：agriculture-35
+
+- Query: `What are the key elements of successful farm planning and management?`
+- top roots: `LONG-TERM GOALS / FARM MANAGEMENT / COWS / WEATHER / CASH FLOW / MARKETPLACE / FARMING PLAN / PRODUCTION STRATEGY`
+
+这组 root 本身并不坏，说明 raw support 已经部分到位。  
+但 facets 仍然只是：
+
+- `Effects and outcomes`
+- `Contexts and conditions: agricultural education management`
+- `Strategies, practices, and practical tools: leadership management`
+- `Representative examples and cases`
+
+这说明问题不是“完全没检到”，而是：
+
+- 检到了 planning 相关材料
+- 但没有把它们转成规划型 query 所需的 canonical aspects
+
+### 15.5 结论：当前 theme retrieval 是 query-centered expansion，不是 aspect-seeking retrieval
+
+综合 `runs_det1` 的 case study 与代码实现，可以把当前问题概括为：
+
+- structural association 能找到桥，这是它的长处。
+- semantic association 的排序中心仍是 `query_alignment`。
+- 于是 graph 上的扩展虽然形式上很多，但实质上仍然在重复命中 query 的核心词和核心语义带。
+
+因此，当前流程中的“联想”更接近：
+
+- query-centered reranking
+- query-neighborhood expansion
+
+而不是：
+
+- aspect-seeking divergence
+- coverage-seeking retrieval for QFS
+
+这也解释了为什么：
+
+- 一旦 prompt 使用专门为 theme 写的 broad 模板，`Comprehensiveness / Diversity` 会明显上升；
+- 但只靠 retrieval + association + organization 的小修补，`theme` 的关键指标长期停留在 `0.1 ~ 0.2` 这一带。
+
+### 15.6 对后续重构的启示
+
+如果目标是让系统真正支持 QFS 型 broad theme 任务，retrieval 的目标函数必须从：
+
+- 找最像 query 的根
+- 在 query 相似带上继续扩图
+
+改成：
+
+- 召回 query 所需的多个方面
+- 奖励“补新方面”的 root 与 region
+- 惩罚在同一 semantic band 内重复加密 support
+
+也就是说，后续应从 `query-centered retrieval` 转向 `aspect-seeking retrieval`。

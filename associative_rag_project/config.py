@@ -10,6 +10,16 @@ from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
 
+def _env_int(name, default):
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"Environment variable {name} must be an integer, got: {raw}") from exc
+
+
 def _load_scheme4_config():
     """Load the shared OpenAI-compatible config from the original repo."""
     module_path = Path(__file__).resolve().parents[1] / "llm_config.py"
@@ -26,9 +36,15 @@ def load_llm_config():
     env_name = config.get("api_key_env")
     if env_name and os.getenv(env_name):
         config["api_key"] = os.getenv(env_name)
+    config.setdefault("embedding_provider", "openai_compatible")
     config.setdefault("embedding_model", os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"))
     config.setdefault("embedding_base_url", os.getenv("OPENAI_EMBEDDING_BASE_URL", config.get("base_url")))
     config.setdefault("embedding_api_key", os.getenv("OPENAI_EMBEDDING_API_KEY", config.get("api_key")))
+    config.setdefault("local_embedding_model", os.getenv("LOCAL_EMBEDDING_MODEL", "BAAI/bge-m3"))
+    config.setdefault("local_embedding_device", os.getenv("LOCAL_EMBEDDING_DEVICE", "auto"))
+    config.setdefault("local_embedding_batch_size", _env_int("LOCAL_EMBEDDING_BATCH_SIZE", 16))
+    config.setdefault("local_embedding_max_length", _env_int("LOCAL_EMBEDDING_MAX_LENGTH", 8192))
+    config.setdefault("local_embedding_query_instruction", os.getenv("LOCAL_EMBEDDING_QUERY_INSTRUCTION", ""))
     return config
 
 

@@ -146,6 +146,22 @@ python -m associative_rag_project.main retrieve \
   --retrieval-mode dense
 ```
 
+### Local BGE-M3 Dense Retrieval
+
+```bash
+python -m associative_rag_project.main retrieve \
+  --corpus-dir art \
+  --retrieval-mode dense \
+  --embedding-provider bge_m3_local \
+  --local-embedding-model BAAI/bge-m3 \
+  --local-embedding-device auto \
+  --local-embedding-batch-size 16
+```
+
+Important: `vdb_chunks.json` must be rebuilt with the same embedding model (`bge-m3`).
+If index vectors and query vectors are not from the same model, dense retrieval quality
+will collapse and the pipeline will now raise an explicit dimension mismatch error.
+
 ### BM25-Only Retrieval
 
 ```bash
@@ -214,6 +230,12 @@ python -m associative_rag_project.main run-all \
 Retrieval-related:
 
 - `--retrieval-mode {bm25,dense,hybrid}`
+- `--embedding-provider {openai_compatible,bge_m3_local}`
+- `--embedding-model`
+- `--embedding-base-url`
+- `--local-embedding-model`
+- `--local-embedding-device`
+- `--local-embedding-batch-size`
 - `--top-chunks`
 - `--chunk-candidate-multiplier`
 - `--dense-weight`

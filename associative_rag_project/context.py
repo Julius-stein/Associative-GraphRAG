@@ -69,6 +69,96 @@ def _violates_local_band_cap(chunk_store, chunk_id, selected_orders_by_doc, band
     return nearby >= band_cap
 
 
+def _truncate_to_words(text, max_words):
+    if max_words is None or max_words <= 0:
+        return text
+    words = text.split()
+    if len(words) <= max_words:
+        return text
+    return " ".join(words[:max_words])
+
+
+_THEME_SUMMARY_BUCKETS = {
+    "context_event": {
+        "political",
+        "war",
+        "revolution",
+        "regime",
+        "state",
+        "society",
+        "historical",
+        "period",
+        "context",
+        "crisis",
+    },
+    "movement_example": {
+        "movement",
+        "movements",
+        "style",
+        "school",
+        "artist",
+        "artists",
+        "example",
+        "examples",
+        "avant",
+        "modernism",
+    },
+    "driver_mechanism": {
+        "influence",
+        "influenced",
+        "response",
+        "reaction",
+        "mechanism",
+        "driver",
+        "cause",
+        "causal",
+        "shift",
+        "change",
+    },
+    "outcome_impact": {
+        "impact",
+        "effects",
+        "effect",
+        "outcome",
+        "transformation",
+        "emergence",
+        "result",
+        "consequence",
+        "value",
+        "perception",
+    },
+    "institution_channel": {
+        "museum",
+        "academy",
+        "institution",
+        "market",
+        "publication",
+        "media",
+        "patronage",
+        "education",
+        "audience",
+        "circulation",
+    },
+}
+
+
+def _theme_query_bucket_weights(query_text):
+    query_tokens = set(normalize_text(query_text).split())
+    weights = {}
+    for bucket, keywords in _THEME_SUMMARY_BUCKETS.items():
+        overlap = len(query_tokens & keywords)
+        weights[bucket] = 1.0 + (0.3 if overlap > 0 else 0.0)
+    return weights
+
+
+def _theme_bucket_scores(text):
+    tokens = set(normalize_text(text).split())
+    scores = {}
+    for bucket, keywords in _THEME_SUMMARY_BUCKETS.items():
+        scores[bucket] = len(tokens & keywords)
+    return scores
+
+
 def choose_diverse_source_chunks(
     facet_groups,
     ranked_chunk_ids,
@@ -76,6 +166,13 @@ def choose_diverse_source_chunks(
     root_chunk_ids,
     max_source_chunks,
     max_source_word_budget,
+    preferred_chunk_ids=None,
+    per_chunk_word_cap=None,
+    query_text="",
+    query_contract="",
+    chunk_role_lookup=None,
+    chunk_to_group_ids=None,
+    group_label_lookup=None,
 ):
     """Pick source chunks with group diversity before falling back to global rank.
 
@@ -91,9 +188,13 @@ def choose_diverse_source_chunks(
     used_words = 0
     seen = set()
     root_chunk_id_set = set(root_chunk_ids)
+    preferred_chunk_ids = list(dict.fromkeys(preferred_chunk_ids or []))
     rank_index = {chunk_id: idx for idx, chunk_id in enumerate(ranked_chunk_ids)}
     selected_orders_by_doc = defaultdict(list)
     group_candidates = []
+    chunk_role_lookup = chunk_role_lookup or {}
+    chunk_to_group_ids = chunk_to_group_ids or {}
+    group_label_lookup = group_label_lookup or {}
 
     for group in facet_groups:
         roots, supports = _ranked_group_chunks(group["supporting_chunk_ids"], rank_index, root_chunk_id_set)
@@ -112,7 +213,8 @@ def choose_diverse_source_chunks(
             return False
         if _violates_local_band_cap(chunk_store, chunk_id, selected_orders_by_doc):
             return False
-        word_count = approx_word_count(chunk.get("content", ""))
+        content = _truncate_to_words(chunk.get("content", ""), per_chunk_word_cap)
+        word_count = approx_word_count(content)
         if selected_ids and used_words + word_count > max_source_word_budget:
             return False
         selected_ids.append(chunk_id)
@@ -122,6 +224,54 @@ def choose_diverse_source_chunks(
         if doc_id is not None and order is not None:
             selected_orders_by_doc[doc_id].append(order)
         return True
+
+    for chunk_id in preferred_chunk_ids:
+        try_add(chunk_id)
+        if len(selected_ids) >= max_source_chunks:
+            break
+
+    if query_contract == "theme-grounded" and len(selected_ids) < max_source_chunks:
+        query_bucket_weights = _theme_query_bucket_weights(query_text)
+        bucket_best = {}
+        for chunk_id in ranked_chunk_ids[:240]:
+            if chunk_id in seen:
+                continue
+            chunk = chunk_store.get(chunk_id)
+            if chunk is None:
+                continue
+            linked_groups = chunk_to_group_ids.get(chunk_id, [])
+            linked_labels = " ".join(group_label_lookup.get(group_id, "") for group_id in linked_groups)
+            text = f"{chunk.get('content', '')} {linked_labels}".strip()
+            bucket_scores = _theme_bucket_scores(text)
+            if not any(score > 0 for score in bucket_scores.values()):
+                continue
+            query_overlap = lexical_overlap_score(query_text, text)
+            roles = set(chunk_role_lookup.get(chunk_id, {}).get("roles", []))
+            role_bonus = 0.0
+            if "support-chunk" in roles:
+                role_bonus += 0.2
+            if "bridge-chunk" in roles:
+                role_bonus += 0.12
+            if "query-root" in roles:
+                role_bonus += 0.05
+            for bucket, bucket_score in bucket_scores.items():
+                if bucket_score <= 0:
+                    continue
+                final_score = (
+                    query_bucket_weights.get(bucket, 1.0) * bucket_score
+                    + 0.45 * query_overlap
+                    + role_bonus
+                )
+                current = bucket_best.get(bucket)
+                if current is None or final_score > current["score"]:
+                    bucket_best[bucket] = {"chunk_id": chunk_id, "score": final_score}
+        for bucket in sorted(
+            bucket_best.keys(),
+            key=lambda name: -bucket_best[name]["score"],
+        ):
+            try_add(bucket_best[bucket]["chunk_id"])
+            if len(selected_ids) >= max_source_chunks:
+                break
 
     # Round 1: let each facet secure one chunk if possible.
     for ordered_chunk_ids in group_candidates:
@@ -150,7 +300,11 @@ def choose_diverse_source_chunks(
         if len(selected_ids) >= max_source_chunks:
             break
 
-    selected = [(chunk_id, chunk_store[chunk_id], approx_word_count(chunk_store[chunk_id].get("content", ""))) for chunk_id in selected_ids]
+    selected = []
+    for chunk_id in selected_ids:
+        chunk_data = dict(chunk_store[chunk_id])
+        chunk_data["content"] = _truncate_to_words(chunk_data.get("content", ""), per_chunk_word_cap)
+        selected.append((chunk_id, chunk_data, approx_word_count(chunk_data.get("content", ""))))
     return selected, used_words
 
 
@@ -207,6 +361,45 @@ def _coverage_checklist_lines(facet_groups, limit=6):
         lines.append(f"- {label}{theme_suffix}")
         if len(lines) >= limit:
             break
+    return lines
+
+
+def _candidate_point_rows(candidate_points):
+    rows = [["id", "type", "label", "query_alignment", "chunk_alignment", "doc_count", "supporting_chunks"]]
+    for index, point in enumerate(candidate_points, start=1):
+        support_size = point.get("support_count", len(point.get("supporting_chunk_ids", [])))
+        rows.append(
+            [
+                f"pt-{index:02d}",
+                point.get("point_type", ""),
+                normalize_text(point.get("label", ""))[:120],
+                f"{point.get('query_alignment', 0.0):.4f}",
+                f"{point.get('chunk_alignment', 0.0):.4f}",
+                len(point.get("doc_ids", [])),
+                support_size,
+            ]
+        )
+    return rows
+
+
+def _candidate_point_lines(candidate_points):
+    lines = []
+    for index, point in enumerate(candidate_points, start=1):
+        doc_suffix = f" docs={len(point.get('doc_ids', []))}" if point.get("doc_ids") else ""
+        if point.get("point_type") == "aspect":
+            support_labels = ", ".join(normalize_text(label) for label in point.get("support_labels", [])[:4])
+            support_suffix = f" supports={support_labels}" if support_labels else ""
+            lines.append(
+                f"- pt-{index:02d}: {normalize_text(point.get('label', ''))[:160]} "
+                f"[aspect; q={point.get('query_alignment', 0.0):.3f}; "
+                f"c={point.get('chunk_alignment', 0.0):.3f}; support_items={point.get('support_count', 0)}{doc_suffix}]{support_suffix}"
+            )
+            continue
+        lines.append(
+            f"- pt-{index:02d}: {normalize_text(point.get('label', ''))[:160]} "
+            f"[{point.get('point_type', '')}; q={point.get('query_alignment', 0.0):.3f}; "
+            f"c={point.get('chunk_alignment', 0.0):.3f}; chunks={len(point.get('supporting_chunk_ids', []))}{doc_suffix}]"
+        )
     return lines
 
 
@@ -406,6 +599,9 @@ def build_prompt_context(
     final_nodes,
     final_edges,
     facet_groups,
+    candidate_points,
+    chunk_roles,
+    theme_selected_chunks,
     chunk_store,
     node_to_chunks,
     edge_to_chunks,
@@ -414,29 +610,53 @@ def build_prompt_context(
 ):
     """Assemble the final evidence package shown to the answer-generation LLM."""
     root_chunk_ids = [item["chunk_id"] for item in root_chunk_hits]
+    chunk_role_lookup = {item["chunk_id"]: item for item in (chunk_roles or [])}
+    preferred_chunk_ids = []
+    per_chunk_word_cap = None
+    source_chunk_limit = max_source_chunks
+    if query_contract == "theme-grounded" and theme_selected_chunks:
+        for bucket in ("core", "bridge", "support", "peripheral"):
+            preferred_chunk_ids.extend(theme_selected_chunks.get(bucket, []))
+        # Theme QFS needs more independent evidence angles.
+        source_chunk_limit = max(max_source_chunks, 12)
+        per_chunk_word_cap = 220
+    chunk_to_group_ids = {}
+    for group in facet_groups:
+        for chunk_id in group["supporting_chunk_ids"]:
+            chunk_to_group_ids.setdefault(chunk_id, []).append(group["group_id"])
+    group_label_lookup = {
+        group["group_id"]: normalize_text(group.get("facet_label", ""))
+        for group in facet_groups
+    }
     chunk_rank = rank_supporting_chunks(final_nodes, final_edges, root_chunk_ids, node_to_chunks, edge_to_chunks)
     selected_source_chunks, used_words = choose_diverse_source_chunks(
         facet_groups=facet_groups,
         ranked_chunk_ids=chunk_rank,
         chunk_store=chunk_store,
         root_chunk_ids=root_chunk_ids,
-        max_source_chunks=max_source_chunks,
+        max_source_chunks=source_chunk_limit,
         max_source_word_budget=max_source_word_budget,
+        preferred_chunk_ids=preferred_chunk_ids,
+        per_chunk_word_cap=per_chunk_word_cap,
+        query_text=query_row["query"],
+        query_contract=query_contract,
+        chunk_role_lookup=chunk_role_lookup,
+        chunk_to_group_ids=chunk_to_group_ids,
+        group_label_lookup=group_label_lookup,
     )
     root_chunk_id_set = set(root_chunk_ids)
-    chunk_to_group_ids = {}
-    for group in facet_groups:
-        for chunk_id in group["supporting_chunk_ids"]:
-            chunk_to_group_ids.setdefault(chunk_id, []).append(group["group_id"])
     source_id_map = {chunk_id: f"src-{index:02d}" for index, (chunk_id, _, _) in enumerate(selected_source_chunks, start=1)}
 
-    root_chunk_rows = [["id", "score", "chunk_order", "content_preview"]]
+    root_chunk_rows = [["id", "score", "role", "basin", "chunk_order", "content_preview"]]
     for item in root_chunk_hits:
         chunk = chunk_store[item["chunk_id"]]
+        role_text = " | ".join(chunk_role_lookup.get(item["chunk_id"], {}).get("roles", [])) or item.get("root_role", "root")
         root_chunk_rows.append(
             [
                 item["chunk_id"],
                 f"{item['score_norm']:.4f}",
+                role_text,
+                normalize_text(item.get("basin_signature", ""))[:80],
                 chunk.get("chunk_order_index", -1),
                 " ".join(chunk.get("content", "").split())[:220],
             ]
@@ -556,7 +776,8 @@ def build_prompt_context(
             linked_source_rows.append(
                 [
                     source_id_map[chunk_id],
-                    "root" if chunk_id in root_chunk_id_set else "support",
+                    " | ".join(chunk_role_lookup.get(chunk_id, {}).get("roles", []))
+                    or ("root" if chunk_id in root_chunk_id_set else "support"),
                     approx_word_count(chunk_data.get("content", "")),
                     " ".join(chunk_data.get("content", "").split())[:220],
                 ]
@@ -610,7 +831,8 @@ def build_prompt_context(
         source_rows.append(
             [
                 source_id_map[chunk_id],
-                "root" if chunk_id in root_chunk_id_set else "support",
+                " | ".join(chunk_role_lookup.get(chunk_id, {}).get("roles", []))
+                or ("root" if chunk_id in root_chunk_id_set else "support"),
                 " | ".join(chunk_to_group_ids.get(chunk_id, [])[:4]),
                 word_count,
                 chunk_data.get("content", "").replace("\n", " "),
@@ -618,6 +840,24 @@ def build_prompt_context(
         )
 
     coverage_checklist = _coverage_checklist_lines(facet_groups)
+    candidate_point_rows = _candidate_point_rows(candidate_points[:8])
+    candidate_point_lines = _candidate_point_lines(candidate_points[:8])
+    theme_chunk_lines = []
+    if query_contract == "theme-grounded" and theme_selected_chunks:
+        role_labels = {
+            "core": "Core Chunks",
+            "bridge": "Bridge Chunks",
+            "support": "Support Chunks",
+            "peripheral": "Peripheral Chunks",
+        }
+        for bucket in ("core", "bridge", "support", "peripheral"):
+            chunk_ids = theme_selected_chunks.get(bucket, [])
+            if not chunk_ids:
+                continue
+            theme_chunk_lines.append(f"{role_labels[bucket]}:")
+            for chunk_id in chunk_ids[:4]:
+                chunk_data = chunk_store.get(chunk_id, {})
+                theme_chunk_lines.append(f"- {chunk_id}: {' '.join(chunk_data.get('content', '').split())[:160]}")
 
     context = f"""
 -----Root Chunks-----
@@ -636,6 +876,13 @@ def build_prompt_context(
 ```csv
 {build_csv(group_rows)}
 ```
+-----Candidate Points-----
+```csv
+{build_csv(candidate_point_rows)}
+```
+{chr(10).join(candidate_point_lines) if candidate_point_lines else '- n/a'}
+-----Theme Chunk Roles-----
+{chr(10).join(theme_chunk_lines) if theme_chunk_lines else '- n/a'}
 -----Coverage Checklist-----
 {chr(10).join(coverage_checklist) if coverage_checklist else '- n/a'}
 -----Facet Group Dossiers-----

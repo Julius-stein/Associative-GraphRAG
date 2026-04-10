@@ -1,33 +1,41 @@
+# Python build/cache
 __pycache__/
-*.pyc
-*.pyo
-*.pyd
+*.py[cod]
 *.egg-info/
-dist/
 build/
+dist/
 
+# OS / editor
 .DS_Store
 .idea/
 .vscode/
 
+# Tool cache
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
 
+# Virtual environments
+.venv/
+venv/
+
+# Logs and local env
 *.log
-datasets/
-# Local secrets / machine-specific config
-lightrag/llm_config.py
 .env
 .env.*
-old*
-result/   
-# Generated experiment outputs
+
+# Generated experiment outputs / drafts
+result/
+associative_rag_project/result/
 associative_rag_project/runs/
 associative_rag_project/runs_*/
+associative_rag_project/tmp*/
+associative_rag_project/tmp_*
 associative_rag_project/query_shape_annotation_template.csv
 
-# Large local corpora / indexes / vectors
+# Local corpora / indexes / vectors (large)
+Datasets/
+datasets/
 agriculture/
 art/
 biography/
@@ -37,12 +45,12 @@ legal/
 mix/
 mix-new/
 news/
+olddata/
 
-# Benchmark / baseline artifacts copied locally
+# External baselines / tool workdirs
 FG-RAG/
-
 lightrag/
-.pre-commit-config.yaml
+lightrag-dev/
+
 # Misc local files
 book.txt
-lightrag-dev/

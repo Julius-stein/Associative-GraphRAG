@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .common import GRAPH_FIELD_SEP, lexical_overlap_score, normalize_text, safe_mean, tokenize
+from .common import GRAPH_FIELD_SEP, STOPWORDS, lexical_overlap_score, normalize_text, safe_mean, tokenize
 
 
 @dataclass
@@ -119,6 +119,124 @@ class DenseChunkIndex:
 
 
 @dataclass
+class GraphKeywordIndex:
+    """Precomputed graph keyword view for chunk-level root selection."""
+
+    chunk_term_weights: dict[str, dict[str, float]]
+    chunk_anchor_terms: dict[str, list[str]]
+    vocabulary: set[str]
+    ignored_terms: set[str]
+    ignored_threshold: int
+
+
+def _keyword_tokens(text):
+    return [
+        token
+        for token in tokenize(normalize_text(text))
+        if len(token) >= 3 and not token.isdigit()
+    ]
+
+
+def build_graph_keyword_index(graph, chunk_to_nodes, chunk_to_edges, chunk_store, max_terms_per_chunk=18):
+    """Build a corpus-adaptive keyword index from graph nodes/edges.
+
+    The index is intentionally corpus-specific:
+    - terms frequent in too many chunks are auto-pruned
+    - no dataset hardcoded keyword list is required
+    """
+    if not chunk_store:
+        return GraphKeywordIndex({}, {}, set(), set(), 0)
+
+    raw_chunk_terms = {}
+    term_df = Counter()
+    chunk_count = len(chunk_store)
+    high_df_threshold = max(6, int(chunk_count * 0.12))
+    blocked_terms = set(STOPWORDS) | {
+        "unknown",
+        "relation",
+        "entity",
+        "entities",
+        "section",
+        "theme",
+        "themes",
+        "comparison",
+        "mechanism",
+        "process",
+        "effect",
+        "effects",
+        "factor",
+        "factors",
+    }
+
+    for chunk_id in chunk_store:
+        weighted_terms = defaultdict(float)
+        for node_id in chunk_to_nodes.get(chunk_id, set()):
+            degree = graph.degree(node_id) if graph is not None and graph.has_node(node_id) else 0
+            degree_weight = 1.0 / max(1.0, 1.0 + math.log1p(max(degree, 1)))
+            node_data = graph.nodes[node_id] if graph is not None and graph.has_node(node_id) else {}
+            for token in _keyword_tokens(node_id):
+                weighted_terms[token] += 1.0 * degree_weight
+            for token in _keyword_tokens(node_data.get("entity_type", "")):
+                weighted_terms[token] += 0.55 * degree_weight
+            for token in _keyword_tokens(node_data.get("description", "")):
+                weighted_terms[token] += 0.35 * degree_weight
+
+        for edge_id in chunk_to_edges.get(chunk_id, set()):
+            edge_data = graph.get_edge_data(edge_id[0], edge_id[1]) if graph is not None else {}
+            edge_text = " ".join(
+                [
+                    str(edge_id[0]),
+                    str(edge_id[1]),
+                    normalize_relation_category(edge_data or {}),
+                    normalize_text((edge_data or {}).get("keywords", "")),
+                    normalize_text((edge_data or {}).get("description", "")),
+                ]
+            )
+            for token in _keyword_tokens(edge_text):
+                weighted_terms[token] += 0.22
+
+        # Safety fallback so chunks with sparse graph links still get lexical keys.
+        if not weighted_terms:
+            for token in _keyword_tokens(chunk_store.get(chunk_id, {}).get("content", "")):
+                weighted_terms[token] += 0.08
+
+        cleaned = {
+            term: weight
+            for term, weight in weighted_terms.items()
+            if term not in blocked_terms and len(term) >= 3
+        }
+        if not cleaned:
+            cleaned = dict(weighted_terms)
+        ranked_terms = sorted(cleaned.items(), key=lambda item: (-item[1], item[0]))[:max_terms_per_chunk]
+        raw_chunk_terms[chunk_id] = dict(ranked_terms)
+        for term in raw_chunk_terms[chunk_id]:
+            term_df[term] += 1
+
+    ignored_terms = {term for term, df in term_df.items() if df >= high_df_threshold}
+    chunk_term_weights = {}
+    chunk_anchor_terms = {}
+    vocabulary = set()
+    for chunk_id, term_weights in raw_chunk_terms.items():
+        filtered = {term: weight for term, weight in term_weights.items() if term not in ignored_terms}
+        if not filtered:
+            filtered = term_weights
+        ranked_terms = sorted(filtered.items(), key=lambda item: (-item[1], item[0]))[:max_terms_per_chunk]
+        final = dict(ranked_terms)
+        chunk_term_weights[chunk_id] = final
+        anchors = [term for term, _ in ranked_terms[:3]]
+        chunk_anchor_terms[chunk_id] = anchors
+        vocabulary.update(final)
+
+    return GraphKeywordIndex(
+        chunk_term_weights=chunk_term_weights,
+        chunk_anchor_terms=chunk_anchor_terms,
+        vocabulary=vocabulary,
+        ignored_terms=ignored_terms,
+        ignored_threshold=high_df_threshold,
+    )
+
+
+@dataclass
 class HybridChunkRetriever:
     bm25_index: BM25Index
     dense_index: DenseChunkIndex | None
@@ -137,6 +255,12 @@ class HybridChunkRetriever:
             if self.dense_index is None or self.embedding_client is None:
                 raise ValueError("Dense retrieval requested but dense index or embedding client is unavailable")
             query_vector = self.embedding_client.embed_text(query)
+            if self.dense_index.normalized_matrix.ndim == 2 and self.dense_index.normalized_matrix.shape[1] != len(query_vector):
+                raise ValueError(
+                    "Dense embedding dimension mismatch: "
+                    f"index_dim={self.dense_index.normalized_matrix.shape[1]} vs query_dim={len(query_vector)}. "
+                    "Please rebuild vdb_chunks.json with the same embedding model used at retrieval time."
+                )
             dense_hits = self.dense_index.search(query_vector, top_k=top_k)
         merged = {}
         for item in bm25_hits:
@@ -179,6 +303,261 @@ class HybridChunkRetriever:
         return [{**item, "score_norm": item["retrieval_score"] / max(top_score, 1e-9)} for item in scored[:top_k]]
 
 
+def search_graph_keyword_chunks(
+    query,
+    graph,
+    node_to_chunks,
+    edge_to_chunks,
+    top_chunk_k,
+    top_node_k=180,
+    top_edge_k=180,
+):
+    """Direct query->(node/edge)->chunk lexical retrieval.
+
+    This is a recall-side channel that does not depend on dense chunk retrieval.
+    """
+    if graph is None:
+        return []
+    chunk_scores = defaultdict(float)
+    node_hits = []
+    for node_id, node_data in graph.nodes(data=True):
+        node_text = " ".join(
+            [
+                normalize_text(node_id),
+                normalize_text(node_data.get("entity_type", "")),
+                normalize_text(node_data.get("description", "")),
+            ]
+        )
+        rel = lexical_overlap_score(query, node_text)
+        if rel <= 0:
+            continue
+        degree = graph.degree(node_id) if graph.has_node(node_id) else 0
+        specificity = 1.0 / max(1.0, 1.0 + math.log1p(max(degree, 1)))
+        node_hits.append((node_id, rel, specificity))
+    node_hits.sort(key=lambda item: (-item[1], -item[2], item[0]))
+    for node_id, rel, specificity in node_hits[:top_node_k]:
+        contribution = rel * (0.7 + 0.3 * specificity)
+        for chunk_id in node_to_chunks.get(node_id, set()):
+            chunk_scores[chunk_id] += contribution
+
+    edge_hits = []
+    for edge_id in edge_to_chunks:
+        edge_data = graph.get_edge_data(edge_id[0], edge_id[1]) or {}
+        edge_text = " ".join(
+            [
+                normalize_text(edge_id[0]),
+                normalize_text(edge_id[1]),
+                normalize_text(edge_data.get("relation", "")),
+                normalize_text(edge_data.get("keywords", "")),
+                normalize_text(edge_data.get("description", "")),
+            ]
+        )
+        rel = lexical_overlap_score(query, edge_text)
+        if rel <= 0:
+            continue
+        edge_hits.append((edge_id, rel))
+    edge_hits.sort(key=lambda item: (-item[1], item[0]))
+    for edge_id, rel in edge_hits[:top_edge_k]:
+        contribution = rel * 0.9
+        for chunk_id in edge_to_chunks.get(edge_id, set()):
+            chunk_scores[chunk_id] += contribution
+
+    if not chunk_scores:
+        return []
+    ranked = sorted(chunk_scores.items(), key=lambda item: (-item[1], item[0]))[:top_chunk_k]
+    top_score = ranked[0][1] if ranked else 1.0
+    return [
+        {
+            "chunk_id": chunk_id,
+            "graph_keyword_score": float(score),
+            "graph_keyword_score_norm": float(score / max(top_score, 1e-9)),
+        }
+        for chunk_id, score in ranked
+    ]
+
+
+def search_graph_focus_chunks(
+    query,
+    graph,
+    node_to_chunks,
+    edge_to_chunks,
+    top_chunk_k,
+    top_node_k=220,
+    top_edge_k=220,
+):
+    """Theme-focused retrieval using non-syntactic query terms on graph text.
+
+    Pipeline:
+    - extract query focus terms (content terms only)
+    - match these terms against node/edge texts
+    - project top node/edge hits back to chunks
+    - aggregate weighted chunk scores
+    """
+    if graph is None:
+        return []
+    query_terms = _query_focus_terms(query)
+    if not query_terms:
+        return []
+
+    chunk_scores = defaultdict(float)
+    chunk_hit_terms = defaultdict(set)
+
+    node_hits = []
+    for node_id, node_data in graph.nodes(data=True):
+        node_text = " ".join(
+            [
+                normalize_text(node_id),
+                normalize_text(node_data.get("entity_type", "")),
+                normalize_text(node_data.get("description", "")),
+            ]
+        )
+        node_terms = set(_keyword_tokens(node_text))
+        hit_terms = sorted(query_terms & node_terms)
+        if not hit_terms:
+            continue
+        hit_count = len(hit_terms)
+        coverage = hit_count / max(len(query_terms), 1)
+        degree = graph.degree(node_id) if graph.has_node(node_id) else 0
+        specificity = 1.0 / max(1.0, 1.0 + math.log1p(max(degree, 1)))
+        score = coverage * (0.72 + 0.28 * specificity) * (1.0 + 0.18 * min(hit_count, 4))
+        node_hits.append((node_id, score, hit_terms))
+
+    node_hits.sort(key=lambda item: (-item[1], -len(item[2]), item[0]))
+    for node_id, score, hit_terms in node_hits[:top_node_k]:
+        contribution = score
+        for chunk_id in node_to_chunks.get(node_id, set()):
+            chunk_scores[chunk_id] += contribution
+            chunk_hit_terms[chunk_id].update(hit_terms)
+
+    edge_hits = []
+    for edge_id in edge_to_chunks:
+        edge_data = graph.get_edge_data(edge_id[0], edge_id[1]) or {}
+        edge_text = " ".join(
+            [
+                normalize_text(edge_id[0]),
+                normalize_text(edge_id[1]),
+                normalize_text(edge_data.get("relation", "")),
+                normalize_text(edge_data.get("keywords", "")),
+                normalize_text(edge_data.get("description", "")),
+            ]
+        )
+        edge_terms = set(_keyword_tokens(edge_text))
+        hit_terms = sorted(query_terms & edge_terms)
+        if not hit_terms:
+            continue
+        hit_count = len(hit_terms)
+        coverage = hit_count / max(len(query_terms), 1)
+        score = coverage * 0.9 * (1.0 + 0.12 * min(hit_count, 4))
+        edge_hits.append((edge_id, score, hit_terms))
+
+    edge_hits.sort(key=lambda item: (-item[1], -len(item[2]), item[0]))
+    for edge_id, score, hit_terms in edge_hits[:top_edge_k]:
+        contribution = score
+        for chunk_id in edge_to_chunks.get(edge_id, set()):
+            chunk_scores[chunk_id] += contribution
+            chunk_hit_terms[chunk_id].update(hit_terms)
+
+    if not chunk_scores:
+        return []
+
+    ranked = sorted(
+        chunk_scores.items(),
+        key=lambda item: (-item[1], -len(chunk_hit_terms.get(item[0], set())), item[0]),
+    )[:top_chunk_k]
+    top_score = ranked[0][1] if ranked else 1.0
+    return [
+        {
+            "chunk_id": chunk_id,
+            "graph_focus_score": float(score),
+            "graph_focus_score_norm": float(score / max(top_score, 1e-9)),
+            "graph_focus_hit_count": len(chunk_hit_terms.get(chunk_id, set())),
+            "graph_focus_hit_terms": sorted(chunk_hit_terms.get(chunk_id, set()))[:8],
+            "retrieval_score": float(score / max(top_score, 1e-9)),
+            "score_norm": float(score / max(top_score, 1e-9)),
+            "dense_score_norm": 0.0,
+            "bm25_score_norm": 0.0,
+        }
+        for chunk_id, score in ranked
+    ]
+
+
+def merge_candidate_hits_with_graph(primary_hits, graph_hits, graph_weight=0.25):
+    """Merge dense/bm25 candidates with graph-side candidates."""
+    if not graph_hits:
+        return primary_hits
+    merged = {}
+    for item in primary_hits:
+        merged[item["chunk_id"]] = dict(item)
+    for item in graph_hits:
+        chunk_id = item["chunk_id"]
+        graph_norm = float(
+            item.get(
+                "graph_keyword_score_norm",
+                item.get("graph_focus_score_norm", item.get("score_norm", 0.0)),
+            )
+        )
+        if chunk_id not in merged:
+            payload = {
+                "chunk_id": chunk_id,
+                "score": graph_weight * graph_norm,
+                "score_norm": graph_weight * graph_norm,
+                "bm25_score": 0.0,
+                "bm25_score_norm": 0.0,
+                "dense_score": 0.0,
+                "dense_score_norm": 0.0,
+                "retrieval_score": graph_weight * graph_norm,
+            }
+            for key in (
+                "graph_keyword_score",
+                "graph_keyword_score_norm",
+                "graph_focus_score",
+                "graph_focus_score_norm",
+                "graph_focus_hit_count",
+                "graph_focus_hit_terms",
+            ):
+                if key in item:
+                    payload[key] = item[key]
+            if "graph_keyword_score_norm" not in payload and "graph_keyword_score" in payload:
+                payload["graph_keyword_score_norm"] = graph_norm
+            merged[chunk_id] = payload
+            continue
+        current = merged[chunk_id]
+        for key in (
+            "graph_keyword_score",
+            "graph_keyword_score_norm",
+            "graph_focus_score",
+            "graph_focus_score_norm",
+            "graph_focus_hit_count",
+            "graph_focus_hit_terms",
+        ):
+            if key in item:
+                current[key] = item[key]
+        retrieval_score = float(current.get("retrieval_score", current.get("score_norm", 0.0)))
+        boosted = (1.0 - graph_weight) * retrieval_score + graph_weight * graph_norm
+        current["retrieval_score"] = boosted
+        current["score"] = boosted
+
+    scored = list(merged.values())
+    scored.sort(
+        key=lambda item: (
+            -item.get("retrieval_score", item.get("score_norm", 0.0)),
+            -item.get("dense_score_norm", 0.0),
+            -item.get("bm25_score_norm", 0.0),
+            -item.get("graph_focus_score_norm", 0.0),
+            -item.get("graph_keyword_score_norm", 0.0),
+            item["chunk_id"],
+        )
+    )
+    top = scored[0].get("retrieval_score", scored[0].get("score_norm", 1.0)) if scored else 1.0
+    return [
+        {
+            **item,
+            "score_norm": float(item.get("retrieval_score", item.get("score_norm", 0.0)) / max(top, 1e-9)),
+        }
+        for item in scored
+    ]
+
+
 def support_score(source_chunks, root_chunk_score_lookup):
     """How well does a candidate align with the current root evidence pool?"""
     if not source_chunks:
@@ -215,6 +594,51 @@ def relation_entropy(categories):
     return entropy
 
 
+def _chunk_relation_entropy(chunk_id, chunk_to_edges, graph):
+    """Estimate how relation-diverse a chunk looks through its attached edges."""
+    if graph is None:
+        return 0.0
+    categories = []
+    for edge_id in chunk_to_edges.get(chunk_id, set()):
+        edge_data = graph.get_edge_data(edge_id[0], edge_id[1]) or {}
+        categories.append(normalize_relation_category(edge_data))
+    return relation_entropy([item for item in categories if item not in {"unknown_relation", "unknown relation"}])
+
+
+def _query_alignment(item):
+    """Reuse dense similarity when available; otherwise fall back to retrieval score."""
+    if item.get("dense_score_norm", 0.0) > 0:
+        return float(item["dense_score_norm"])
+    return float(item.get("retrieval_score", item.get("score_norm", 0.0)))
+
+
+def _root_sort_key(item, query_contract):
+    if query_contract in {"theme-grounded", "comparison-grounded"}:
+        return (
+            -item.get("keyword_match_score", 0.0),
+            -item["query_alignment"],
+            -item["relation_entropy"],
+            -item["base_score"],
+            -len(item["graph_nodes"]),
+            item["chunk_id"],
+        )
+    if query_contract == "section-grounded":
+        return (
+            -item.get("keyword_match_score", 0.0),
+            -item["query_alignment"],
+            -item["base_score"],
+            -item["relation_entropy"],
+            item["chunk_id"],
+        )
+    return (-item["base_score"], -len(item["graph_nodes"]), item["chunk_id"])
+
+
+def _root_primary_quota(top_k, query_contract):
+    if query_contract in {"theme-grounded", "comparison-grounded"}:
+        return min(top_k, max(2, (top_k // 2) + 1))
+    return top_k
+
+
 def _root_base_score(item):
     """Prefer dense grounding when available; fall back to retrieval score."""
     if item.get("dense_score_norm", 0.0) > 0:
@@ -226,6 +650,146 @@ def _chunk_graph_signature(chunk_id, chunk_to_nodes, chunk_to_edges):
     nodes = set(chunk_to_nodes.get(chunk_id, set()))
     edges = set(chunk_to_edges.get(chunk_id, set()))
     return nodes, edges
+
+
+_QUERY_STOPWORDS = {
+    "the",
+    "a",
+    "an",
+    "in",
+    "on",
+    "of",
+    "to",
+    "for",
+    "and",
+    "or",
+    "is",
+    "are",
+    "was",
+    "were",
+    "be",
+    "been",
+    "being",
+    "that",
+    "this",
+    "those",
+    "these",
+    "it",
+    "its",
+    "as",
+    "by",
+    "with",
+    "from",
+    "at",
+    "into",
+    "about",
+    "how",
+    "what",
+    "which",
+    "who",
+    "whom",
+    "when",
+    "where",
+    "why",
+    "can",
+    "could",
+    "would",
+    "should",
+    "do",
+    "does",
+    "did",
+    "we",
+    "our",
+    "you",
+    "your",
+    "their",
+    "there",
+    "than",
+    "then",
+    "infer",
+    "significant",
+    "pattern",
+    "patterns",
+    "lead",
+    "led",
+} | set(STOPWORDS)
+
+
+def _query_focus_terms(query, keyword_index=None):
+    tokens = {
+        token
+        for token in tokenize(normalize_text(query))
+        if len(token) >= 3 and token not in _QUERY_STOPWORDS
+    }
+    if not tokens:
+        return set()
+    if keyword_index is None or not getattr(keyword_index, "vocabulary", None):
+        return tokens
+    in_vocab = {
+        token
+        for token in tokens
+        if token in keyword_index.vocabulary and token not in keyword_index.ignored_terms
+    }
+    return in_vocab or tokens
+
+
+def _anchor_query_overlap(anchor_terms, focus_terms):
+    if not anchor_terms or not focus_terms:
+        return 0.0
+    anchor_tokens = set()
+    for term in anchor_terms:
+        anchor_tokens.update(tokenize(normalize_text(term)))
+    if not anchor_tokens:
+        return 0.0
+    return len(anchor_tokens & focus_terms) / max(len(focus_terms), 1)
+
+
+def _focus_term_hit_count(text, focus_terms):
+    if not text or not focus_terms:
+        return 0
+    text_tokens = set(tokenize(normalize_text(text)))
+    return len(text_tokens & focus_terms)
+
+
+def _chunk_anchor_terms(chunk_id, chunk_to_nodes, chunk_to_edges, graph, keyword_index=None):
+    if keyword_index is not None:
+        anchors = list(keyword_index.chunk_anchor_terms.get(chunk_id, []))
+        if anchors:
+            return anchors
+    counter = Counter()
+    for node_id in chunk_to_nodes.get(chunk_id, set()):
+        label = normalize_text(node_id).strip()
+        if not label:
+            continue
+        degree = graph.degree(node_id) if graph is not None and graph.has_node(node_id) else 0
+        weight = 1.0 / max(1.0, 1.0 + math.log1p(degree))
+        counter[label] += weight
+    for edge_id in chunk_to_edges.get(chunk_id, set()):
+        edge_data = graph.get_edge_data(edge_id[0], edge_id[1]) if graph is not None else {}
+        category = normalize_relation_category(edge_data or {})
+        if category and category not in {"unknown relation", "unknown_relation"}:
+            counter[category] += 0.35
+    ranked = sorted(counter.items(), key=lambda item: (-item[1], item[0]))
+    return [label for label, _ in ranked[:3]]
+
+
+def _chunk_basin_signature(chunk_id, chunk_store, chunk_to_nodes, chunk_to_edges, graph, keyword_index=None):
+    chunk = chunk_store.get(chunk_id, {})
+    anchors = _chunk_anchor_terms(
+        chunk_id,
+        chunk_to_nodes,
+        chunk_to_edges,
+        graph,
+        keyword_index=keyword_index,
+    )
+    doc_id = chunk.get("full_doc_id") or "no-doc"
+    if anchors:
+        basin_key = tuple(anchors[:2])
+        basin_signature = " | ".join(anchors[:2])
+    else:
+        basin_key = (doc_id, chunk.get("chunk_order_index", -1))
+        basin_signature = doc_id
+    return basin_key, basin_signature, anchors
 
 
 def _same_doc_band(chunk_a, chunk_b, window):
@@ -244,12 +808,148 @@ def _provenance_overlap(nodes_a, edges_a, nodes_b, edges_b):
     return len(left & right) / max(len(left | right), 1)
 
 
+def _candidate_query_terms(candidate):
+    terms = candidate.get("keyword_hit_terms") or []
+    if not terms:
+        terms = candidate.get("graph_focus_hit_terms") or []
+    if not terms:
+        terms = candidate.get("graph_keyword_hit_terms") or []
+    return set(terms)
+
+
+def _chunk_keyword_match(chunk_id, query_terms, keyword_index):
+    if keyword_index is None or not query_terms:
+        return 0.0, 0, []
+    term_weights = keyword_index.chunk_term_weights.get(chunk_id, {})
+    if not term_weights:
+        return 0.0, 0, []
+    hit_terms = [term for term in sorted(query_terms) if term in term_weights]
+    if not hit_terms:
+        return 0.0, 0, []
+    total_weight = sum(term_weights.values())
+    hit_weight = sum(term_weights[term] for term in hit_terms)
+    score = hit_weight / max(total_weight, 1e-9)
+    return float(score), len(hit_terms), hit_terms[:6]
+
+
+def _select_theme_root_chunks(candidates, chunk_store, top_k, same_doc_window, primary_quota):
+    basin_groups = defaultdict(list)
+    for candidate in candidates:
+        basin_groups[candidate["basin_key"]].append(candidate)
+
+    ordered_groups = []
+    for basin_key, items in basin_groups.items():
+        items.sort(key=lambda item: _root_sort_key(item, "theme-grounded"))
+        ordered_groups.append((basin_key, items))
+    ordered_groups.sort(key=lambda item: _root_sort_key(item[1][0], "theme-grounded"))
+
+    selected = []
+    doc_counts = Counter()
+    covered_query_terms = set()
+    max_group_len = max((len(items) for _, items in ordered_groups), default=0)
+
+    for pass_index in range(max_group_len):
+        if len(selected) >= top_k:
+            break
+        any_added = False
+        for _, items in ordered_groups:
+            if len(selected) >= top_k or pass_index >= len(items):
+                continue
+            candidate = items[pass_index]
+            same_doc_count = doc_counts.get(candidate.get("full_doc_id"), 0)
+            same_band = any(
+                _same_doc_band(
+                    chunk_store.get(existing["chunk_id"], {}),
+                    chunk_store.get(candidate["chunk_id"], {}),
+                    same_doc_window,
+                )
+                for existing in selected
+            )
+            overlaps = [
+                _provenance_overlap(
+                    candidate["graph_nodes"],
+                    candidate["graph_edges"],
+                    existing["graph_nodes"],
+                    existing["graph_edges"],
+                )
+                for existing in selected
+            ]
+            max_overlap = max(overlaps) if overlaps else 0.0
+            same_doc_limit = 1 if pass_index <= 1 else 2
+            overlap_limit = 0.42 if pass_index == 0 else 0.58
+            term_gain = len(_candidate_query_terms(candidate) - covered_query_terms)
+            if same_doc_count >= same_doc_limit or same_band or max_overlap > overlap_limit:
+                continue
+            if pass_index <= 1 and selected and term_gain <= 0:
+                continue
+            selected.append(
+                {
+                    **candidate,
+                    "root_role": "primary" if len(selected) < primary_quota else "diversity",
+                    "novelty_gain": len(candidate["graph_nodes"]) + len(candidate["graph_edges"]),
+                    "query_term_gain": term_gain,
+                    "max_selected_overlap": round(max_overlap, 6),
+                }
+            )
+            covered_query_terms.update(_candidate_query_terms(candidate))
+            if candidate.get("full_doc_id"):
+                doc_counts[candidate["full_doc_id"]] += 1
+            any_added = True
+        if not any_added:
+            break
+
+    if len(selected) < top_k:
+        leftovers = [item for _, items in ordered_groups for item in items if item["chunk_id"] not in {s["chunk_id"] for s in selected}]
+        leftovers.sort(
+            key=lambda item: (
+                doc_counts.get(item.get("full_doc_id"), 0),
+                -len(_candidate_query_terms(item) - covered_query_terms),
+                -item["query_alignment"],
+                -item["relation_entropy"],
+                -item["base_score"],
+                item["chunk_id"],
+            )
+        )
+        for candidate in leftovers:
+            if len(selected) >= top_k:
+                break
+            overlaps = [
+                _provenance_overlap(
+                    candidate["graph_nodes"],
+                    candidate["graph_edges"],
+                    existing["graph_nodes"],
+                    existing["graph_edges"],
+                )
+                for existing in selected
+            ]
+            max_overlap = max(overlaps) if overlaps else 0.0
+            if max_overlap > 0.72:
+                continue
+            selected.append(
+                {
+                    **candidate,
+                    "root_role": "primary" if len(selected) < primary_quota else "diversity",
+                    "novelty_gain": len(candidate["graph_nodes"]) + len(candidate["graph_edges"]),
+                    "query_term_gain": len(_candidate_query_terms(candidate) - covered_query_terms),
+                    "max_selected_overlap": round(max_overlap, 6),
+                }
+            )
+            covered_query_terms.update(_candidate_query_terms(candidate))
+            if candidate.get("full_doc_id"):
+                doc_counts[candidate["full_doc_id"]] += 1
+    return selected[:top_k]
+
+
 def select_diverse_root_chunks(
+    query,
     candidate_hits,
     chunk_store,
     chunk_to_nodes,
     chunk_to_edges,
     top_k,
+    query_contract="theme-grounded",
+    graph=None,
+    keyword_index=None,
     same_doc_window=1,
     max_same_doc_roots=1,
     relaxed_max_same_doc_roots=2,
@@ -271,25 +971,117 @@ def select_diverse_root_chunks(
         return []
 
     candidates = []
+    query_focus_terms = _query_focus_terms(query, keyword_index=keyword_index)
     for item in candidate_hits:
         chunk_id = item["chunk_id"]
         chunk = chunk_store.get(chunk_id, {})
         nodes, edges = _chunk_graph_signature(chunk_id, chunk_to_nodes, chunk_to_edges)
+        basin_key, basin_signature, anchor_terms = _chunk_basin_signature(
+            chunk_id,
+            chunk_store,
+            chunk_to_nodes,
+            chunk_to_edges,
+            graph,
+            keyword_index=keyword_index,
+        )
+        keyword_match_score, keyword_hit_count, keyword_hit_terms = _chunk_keyword_match(
+            chunk_id,
+            query_focus_terms,
+            keyword_index,
+        )
         candidates.append(
             {
                 **item,
                 "base_score": round(_root_base_score(item), 6),
+                "query_alignment": round(_query_alignment(item), 6),
+                "relation_entropy": round(_chunk_relation_entropy(chunk_id, chunk_to_edges, graph), 6),
                 "full_doc_id": chunk.get("full_doc_id"),
                 "chunk_order_index": chunk.get("chunk_order_index", -1),
                 "graph_nodes": nodes,
                 "graph_edges": edges,
+                "basin_key": basin_key,
+                "basin_signature": basin_signature,
+                "anchor_terms": anchor_terms,
+                "query_lexical": round(lexical_overlap_score(query, chunk.get("content", "")), 6),
+                "anchor_query_overlap": round(_anchor_query_overlap(anchor_terms, query_focus_terms), 6),
+                "focus_term_hit_count": _focus_term_hit_count(chunk.get("content", ""), query_focus_terms),
+                "keyword_match_score": round(keyword_match_score, 6),
+                "keyword_hit_count": int(keyword_hit_count),
+                "keyword_hit_terms": keyword_hit_terms,
             }
         )
-    candidates.sort(key=lambda item: (-item["base_score"], -len(item["graph_nodes"]), item["chunk_id"]))
+    candidates.sort(key=lambda item: _root_sort_key(item, query_contract))
+
+    if query_contract == "section-grounded" and candidates:
+        anchor_doc_id = candidates[0].get("full_doc_id")
+        if anchor_doc_id:
+            candidates = [item for item in candidates if item.get("full_doc_id") == anchor_doc_id]
+            max_same_doc_roots = top_k
+            relaxed_max_same_doc_roots = top_k
 
     selected = []
     deferred = []
     doc_counts = Counter()
+    primary_quota = _root_primary_quota(top_k, query_contract)
+
+    if query_contract == "theme-grounded":
+        eligible = []
+        residual = []
+        for item in candidates:
+            query_signal = (
+                0.34 * item["query_alignment"]
+                + 0.25 * item["query_lexical"]
+                + 0.18 * item["anchor_query_overlap"]
+                + 0.23 * item["keyword_match_score"]
+            )
+            hard_keep = (
+                item["anchor_query_overlap"] >= 0.06
+                or item["query_lexical"] >= 0.04
+                or item["query_alignment"] >= 0.75
+                or item["keyword_hit_count"] >= 1
+            )
+            if query_signal >= 0.11 and hard_keep:
+                eligible.append(item)
+            else:
+                residual.append(item)
+
+        # Ensure we do not over-prune when query signals are weak/noisy.
+        if len(eligible) < max(2, top_k // 3):
+            fallback = sorted(
+                candidates,
+                key=lambda item: (
+                    -item["keyword_match_score"],
+                    -item["keyword_hit_count"],
+                    -item["anchor_query_overlap"],
+                    -item["query_lexical"],
+                    -item["query_alignment"],
+                    -item["focus_term_hit_count"],
+                    -item["relation_entropy"],
+                    item["chunk_id"],
+                ),
+            )
+            eligible = fallback[: max(2, top_k // 3)]
+            residual = [item for item in candidates if item["chunk_id"] not in {row["chunk_id"] for row in eligible}]
+
+        selected = _select_theme_root_chunks(
+            candidates=eligible,
+            chunk_store=chunk_store,
+            top_k=top_k,
+            same_doc_window=same_doc_window,
+            primary_quota=primary_quota,
+        )
+        if len(selected) < top_k and residual:
+            fill = _select_theme_root_chunks(
+                candidates=[item for item in residual if item["chunk_id"] not in {s["chunk_id"] for s in selected}],
+                chunk_store=chunk_store,
+                top_k=top_k - len(selected),
+                same_doc_window=same_doc_window,
+                primary_quota=max(0, primary_quota - len(selected)),
+            )
+            selected.extend(fill)
+        for item in selected:
+            item["selection_score"] = item["base_score"]
+        return selected
 
     for candidate in candidates:
         if len(selected) >= top_k:
@@ -298,6 +1090,7 @@ def select_diverse_root_chunks(
             selected.append(
                 {
                     **candidate,
+                    "root_role": "primary",
                     "novelty_gain": len(candidate["graph_nodes"]) + len(candidate["graph_edges"]),
                     "max_selected_overlap": 0.0,
                 }
@@ -332,6 +1125,7 @@ def select_diverse_root_chunks(
         selected.append(
             {
                 **candidate,
+                "root_role": "primary" if len(selected) < primary_quota else "diversity",
                 "novelty_gain": len(candidate["graph_nodes"]) + len(candidate["graph_edges"]),
                 "max_selected_overlap": round(max_overlap, 6),
             }
@@ -343,6 +1137,8 @@ def select_diverse_root_chunks(
         deferred.sort(
             key=lambda item: (
                 doc_counts.get(item.get("full_doc_id"), 0),
+                -item["query_alignment"] if query_contract in {"theme-grounded", "comparison-grounded", "section-grounded"} else 0.0,
+                -item["relation_entropy"] if query_contract in {"theme-grounded", "comparison-grounded"} else 0.0,
                 max(
                     [
                         _provenance_overlap(
@@ -390,6 +1186,7 @@ def select_diverse_root_chunks(
             selected.append(
                 {
                     **candidate,
+                    "root_role": "diversity" if query_contract in {"theme-grounded", "comparison-grounded"} else "primary",
                     "novelty_gain": len(candidate["graph_nodes"]) + len(candidate["graph_edges"]),
                     "max_selected_overlap": round(max_overlap, 6),
                 }

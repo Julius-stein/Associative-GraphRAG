@@ -151,11 +151,32 @@ def resolve_baseline_file(corpus_name: str, explicit_path: str | None):
     return None
 
 
+def resolve_corpus_index_dir(corpus_dir: Path):
+    """Resolve the actual indexed corpus directory.
+
+    The project historically passed `Datasets/<name>/corpus`, while newer runs
+    store graph/index artifacts under `Datasets/<name>/index`. We accept either
+    and resolve to the directory that contains the indexed graph artifacts.
+    """
+    corpus_dir = Path(corpus_dir)
+    candidates = [corpus_dir]
+    if corpus_dir.name == "corpus":
+        candidates.append(corpus_dir.parent / "index")
+    if corpus_dir.name == "index":
+        candidates.append(corpus_dir.parent / "corpus")
+    candidates.append(corpus_dir / "index")
+    for candidate in candidates:
+        if (candidate / "graph_chunk_entity_relation.graphml").exists() and (candidate / "kv_store_text_chunks.json").exists():
+            return candidate
+    return corpus_dir
+
+
 def load_graph_corpus(corpus_dir: Path):
     """Load the graph and chunk store produced by the LightRAG preprocessing stage."""
-    graph = nx.read_graphml(corpus_dir / "graph_chunk_entity_relation.graphml")
-    chunk_store = json.loads((corpus_dir / "kv_store_text_chunks.json").read_text(encoding="utf-8"))
-    return graph, chunk_store
+    index_dir = resolve_corpus_index_dir(corpus_dir)
+    graph = nx.read_graphml(index_dir / "graph_chunk_entity_relation.graphml")
+    chunk_store = json.loads((index_dir / "kv_store_text_chunks.json").read_text(encoding="utf-8"))
+    return graph, chunk_store, index_dir
 
 
 def build_chunk_mappings(graph, chunk_ids):

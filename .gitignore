@@ -28,7 +28,7 @@ venv/
 result/
 associative_rag_project/result/
 associative_rag_project/runs/
-associative_rag_project/runs_*/
+associative_rag_project/runs*/
 associative_rag_project/tmp*/
 associative_rag_project/tmp_*
 associative_rag_project/query_shape_annotation_template.csv

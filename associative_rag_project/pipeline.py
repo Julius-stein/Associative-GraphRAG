@@ -214,6 +214,27 @@ def _contract_max_hop(cfg, query_contract):
     return cfg["max_hop"]
 
 
+def _contract_graph_merge_weights(query_contract):
+    if query_contract == "section-grounded":
+        return 0.22, 0.12
+    if query_contract == "mechanism-grounded":
+        return 0.28, 0.16
+    if query_contract == "comparison-grounded":
+        return 0.30, 0.18
+    return 0.32, 0.18
+
+
+def _pick_section_doc_ids(root_chunk_hits, chunk_store):
+    doc_ids = [
+        chunk_store.get(item["chunk_id"], {}).get("full_doc_id")
+        for item in root_chunk_hits
+        if chunk_store.get(item["chunk_id"], {}).get("full_doc_id")
+    ]
+    if not doc_ids:
+        return None
+    return {doc_ids[0]}
+
+
 def run_query(
     query_row,
     graph,
@@ -242,50 +263,33 @@ def run_query(
     # Keep a wider pre-rerank candidate pool so retrieval-cliff estimation can
     # see whether the query really has a steep score drop or a broad frontier.
     candidate_top_k = _contract_candidate_top_k(cfg, query_contract)
-    retrieval_mode_label = cfg["retrieval_mode"]
-    if query_contract == "theme-grounded":
-        # Theme retrieval keeps dense as the primary anchor, then injects
-        # graph-side focus/keyword channels to expand aspect coverage.
-        candidate_chunk_hits = chunk_retriever.search(query_row["query"], top_k=candidate_top_k)
-        graph_focus_hits = search_graph_focus_chunks(
-            query=query_row["query"],
-            graph=graph,
-            node_to_chunks=node_to_chunks,
-            edge_to_chunks=edge_to_chunks,
-            top_chunk_k=max(candidate_top_k * 2, cfg["top_chunks"] * 10),
-        )
-        candidate_chunk_hits = merge_candidate_hits_with_graph(
-            primary_hits=candidate_chunk_hits,
-            graph_hits=graph_focus_hits,
-            graph_weight=0.32,
-        )[:candidate_top_k]
-        graph_keyword_hits = search_graph_keyword_chunks(
-            query=query_row["query"],
-            graph=graph,
-            node_to_chunks=node_to_chunks,
-            edge_to_chunks=edge_to_chunks,
-            top_chunk_k=max(candidate_top_k * 2, cfg["top_chunks"] * 10),
-        )
-        candidate_chunk_hits = merge_candidate_hits_with_graph(
-            primary_hits=candidate_chunk_hits,
-            graph_hits=graph_keyword_hits,
-            graph_weight=0.18,
-        )[:candidate_top_k]
-        retrieval_mode_label = "dense+graph_focus"
-    else:
-        candidate_chunk_hits = chunk_retriever.search(query_row["query"], top_k=candidate_top_k)
-        graph_keyword_hits = search_graph_keyword_chunks(
-            query=query_row["query"],
-            graph=graph,
-            node_to_chunks=node_to_chunks,
-            edge_to_chunks=edge_to_chunks,
-            top_chunk_k=max(candidate_top_k, cfg["top_chunks"] * 8),
-        )
-        candidate_chunk_hits = merge_candidate_hits_with_graph(
-            primary_hits=candidate_chunk_hits,
-            graph_hits=graph_keyword_hits,
-            graph_weight=0.24,
-        )[:candidate_top_k]
+    retrieval_mode_label = "dense+graph_focus"
+    graph_focus_weight, graph_keyword_weight = _contract_graph_merge_weights(query_contract)
+    candidate_chunk_hits = chunk_retriever.search(query_row["query"], top_k=candidate_top_k)
+    graph_focus_hits = search_graph_focus_chunks(
+        query=query_row["query"],
+        graph=graph,
+        node_to_chunks=node_to_chunks,
+        edge_to_chunks=edge_to_chunks,
+        top_chunk_k=max(candidate_top_k * 2, cfg["top_chunks"] * 10),
+    )
+    candidate_chunk_hits = merge_candidate_hits_with_graph(
+        primary_hits=candidate_chunk_hits,
+        graph_hits=graph_focus_hits,
+        graph_weight=graph_focus_weight,
+    )[:candidate_top_k]
+    graph_keyword_hits = search_graph_keyword_chunks(
+        query=query_row["query"],
+        graph=graph,
+        node_to_chunks=node_to_chunks,
+        edge_to_chunks=edge_to_chunks,
+        top_chunk_k=max(candidate_top_k * 2, cfg["top_chunks"] * 10),
+    )
+    candidate_chunk_hits = merge_candidate_hits_with_graph(
+        primary_hits=candidate_chunk_hits,
+        graph_hits=graph_keyword_hits,
+        graph_weight=graph_keyword_weight,
+    )[:candidate_top_k]
     log(f"{prefix}retrieval candidates={len(candidate_chunk_hits)} mode={retrieval_mode_label}")
     query_chunk_score_lookup = {
         item["chunk_id"]: item.get(
@@ -308,6 +312,28 @@ def run_query(
         graph=graph,
         keyword_index=keyword_index,
     )
+    allowed_doc_ids = None
+    if query_contract == "section-grounded":
+        allowed_doc_ids = _pick_section_doc_ids(root_chunk_hits, chunk_store)
+        if allowed_doc_ids:
+            section_candidate_hits = [
+                item
+                for item in candidate_chunk_hits
+                if chunk_store.get(item["chunk_id"], {}).get("full_doc_id") in allowed_doc_ids
+            ]
+            section_root_hits = select_diverse_root_chunks(
+                query=query_row["query"],
+                candidate_hits=section_candidate_hits,
+                chunk_store=chunk_store,
+                chunk_to_nodes=chunk_to_nodes,
+                chunk_to_edges=chunk_to_edges,
+                top_k=root_top_k,
+                query_contract=query_contract,
+                graph=graph,
+                keyword_index=keyword_index,
+            )
+            if section_root_hits:
+                root_chunk_hits = section_root_hits
     root_chunk_hits = [_serialize_root_chunk_hit(item) for item in root_chunk_hits]
     for line in _format_root_chunk_preview(root_chunk_hits, chunk_store):
         log(f"{prefix}root {line}")
@@ -315,12 +341,8 @@ def run_query(
     # evidence grounding when ranking nodes, edges, and semantic expansions.
     root_chunk_score_lookup = {item["chunk_id"]: item["score_norm"] for item in root_chunk_hits}
     root_chunk_ids = list(root_chunk_score_lookup)
-    section_doc_ids = {
-        chunk_store.get(chunk_id, {}).get("full_doc_id")
-        for chunk_id in root_chunk_ids
-        if chunk_store.get(chunk_id, {}).get("full_doc_id")
-    }
-    allowed_doc_ids = section_doc_ids if query_contract == "section-grounded" else None
+    if query_contract == "section-grounded" and not allowed_doc_ids:
+        allowed_doc_ids = _pick_section_doc_ids(root_chunk_hits, chunk_store)
     root_nodes = set()
     root_edges = set()
     for chunk_id in root_chunk_ids:

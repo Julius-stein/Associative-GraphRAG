@@ -1111,7 +1111,7 @@ def _build_mechanism_groups(query, root_regions, bridge_regions, theme_regions, 
             if theme and theme != primary:
                 secondary = theme
                 break
-        label = primary if secondary is None else f"{primary} -> {secondary}"
+        label = f"pathway: {primary}" if secondary is None else f"pathway: {primary} -> {secondary}"
         candidates.append(
             _build_group(
                 query,
@@ -1137,7 +1137,7 @@ def _build_mechanism_groups(query, root_regions, bridge_regions, theme_regions, 
                     query,
                     "mechanism-grounded",
                     f"facet-{len(candidates)+1:02d}",
-                    label,
+                    f"pathway: {label}",
                     regions,
                     chunk_store,
                 )
@@ -1163,12 +1163,21 @@ def _build_mechanism_groups(query, root_regions, bridge_regions, theme_regions, 
 
 def _build_comparison_groups(query, root_regions, bridge_regions, chunk_store, group_limit):
     candidates = []
-    for index, region in enumerate(root_regions, start=1):
+    for region in root_regions:
         label = _primary_theme(region)
-        candidates.append(_build_group(query, "comparison-grounded", f"facet-{index:02d}", label, [region], chunk_store))
+        candidates.append(
+            _build_group(
+                query,
+                "comparison-grounded",
+                f"facet-{len(candidates)+1:02d}",
+                f"comparison side {len(candidates)+1}: {label}",
+                [region],
+                chunk_store,
+            )
+        )
     for region in bridge_regions:
         if len(region.root_chunk_ids) >= 2:
-            label = f"contrast around {_primary_theme(region)}"
+            label = f"contrast axis: {_primary_theme(region)}"
             candidates.append(
                 _build_group(
                     query,

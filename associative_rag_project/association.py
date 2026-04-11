@@ -630,6 +630,7 @@ def _build_theme_reseed_candidate_hits(
 def _reseed_theme_root_chunks(
     *,
     query,
+    query_contract,
     graph,
     selected_chunk_ids,
     round_chunk_ids,
@@ -670,7 +671,7 @@ def _reseed_theme_root_chunks(
         chunk_to_nodes=chunk_to_nodes,
         chunk_to_edges=chunk_to_edges,
         top_k=top_k,
-        query_contract="theme-grounded",
+        query_contract=query_contract,
         graph=graph,
     )
     if not reseeded:
@@ -686,6 +687,7 @@ def _reseed_theme_root_chunks(
 def _expand_theme_chunk_graph(
     *,
     query,
+    query_contract,
     graph,
     root_chunk_ids,
     root_chunk_score_lookup,
@@ -700,35 +702,91 @@ def _expand_theme_chunk_graph(
     path_budget,
     semantic_edge_budget,
     semantic_node_budget,
+    allowed_doc_ids=None,
 ):
-    selected_chunk_ids = list(root_chunk_ids)
-    active_root_chunk_ids = list(root_chunk_ids)
-    active_root_chunk_score_lookup = dict(root_chunk_score_lookup)
-    effective_root_chunk_ids = list(root_chunk_ids)
-    effective_root_chunk_score_lookup = dict(root_chunk_score_lookup)
-    seen_root_chunk_ids = set(root_chunk_ids)
+    def _filter_chunk_ids(chunk_ids):
+        if not allowed_doc_ids:
+            return set(chunk_ids)
+        return _filter_allowed_chunks(set(chunk_ids), allowed_doc_ids, chunk_store)
+
+    def _filter_chunk_items(items):
+        if not allowed_doc_ids:
+            return items
+        return [
+            item
+            for item in items
+            if chunk_store.get(item["chunk_id"], {}).get("full_doc_id") in allowed_doc_ids
+        ]
+
+    def _round_limits():
+        bridge_limit = max(2, path_budget // 3)
+        support_limit = max(3, min(6, semantic_edge_budget // 4))
+        peripheral_limit = max(1, min(3, semantic_node_budget // 6))
+        if query_contract == "section-grounded":
+            return max(2, bridge_limit), max(2, min(4, support_limit)), 1
+        if query_contract == "mechanism-grounded":
+            return max(3, bridge_limit), max(3, min(5, support_limit)), 1
+        if query_contract == "comparison-grounded":
+            return max(3, bridge_limit), max(3, min(5, support_limit)), max(1, min(2, peripheral_limit))
+        return bridge_limit, support_limit, peripheral_limit
+
+    selected_chunk_ids = list(_filter_chunk_ids(root_chunk_ids))
+    active_root_chunk_ids = list(_filter_chunk_ids(root_chunk_ids))
+    active_root_chunk_score_lookup = {
+        chunk_id: score
+        for chunk_id, score in root_chunk_score_lookup.items()
+        if not allowed_doc_ids or chunk_store.get(chunk_id, {}).get("full_doc_id") in allowed_doc_ids
+    }
+    effective_root_chunk_ids = list(active_root_chunk_ids)
+    effective_root_chunk_score_lookup = dict(active_root_chunk_score_lookup)
+    seen_root_chunk_ids = set(active_root_chunk_ids)
     bridge_records = []
     support_records = []
     peripheral_records = []
     promoted_root_chunks = []
     rounds = []
 
-    local_query_chunk_score_lookup = dict(query_chunk_score_lookup)
-    candidate_chunk_ids = set(local_query_chunk_score_lookup) | set(root_chunk_ids)
+    local_query_chunk_score_lookup = {
+        chunk_id: score
+        for chunk_id, score in query_chunk_score_lookup.items()
+        if not allowed_doc_ids or chunk_store.get(chunk_id, {}).get("full_doc_id") in allowed_doc_ids
+    }
+    candidate_chunk_ids = set(local_query_chunk_score_lookup) | set(active_root_chunk_ids)
     for chunk_id in list(candidate_chunk_ids):
-        candidate_chunk_ids.update(_chunk_structural_neighbors(chunk_id, chunk_to_nodes, chunk_to_edges, node_to_chunks, edge_to_chunks, chunk_neighbors))
+        candidate_chunk_ids.update(
+            _filter_chunk_ids(
+                _chunk_structural_neighbors(
+                    chunk_id,
+                    chunk_to_nodes,
+                    chunk_to_edges,
+                    node_to_chunks,
+                    edge_to_chunks,
+                    chunk_neighbors,
+                )
+            )
+        )
 
     for round_index in range(1, max(association_rounds, 1) + 1):
         current_frontier = set()
         for chunk_id in active_root_chunk_ids or selected_chunk_ids:
-            current_frontier.update(_chunk_structural_neighbors(chunk_id, chunk_to_nodes, chunk_to_edges, node_to_chunks, edge_to_chunks, chunk_neighbors))
+            current_frontier.update(
+                _filter_chunk_ids(
+                    _chunk_structural_neighbors(
+                        chunk_id,
+                        chunk_to_nodes,
+                        chunk_to_edges,
+                        node_to_chunks,
+                        edge_to_chunks,
+                        chunk_neighbors,
+                    )
+                )
+            )
 
-        bridge_limit = max(2, path_budget // 3)
-        support_limit = max(3, min(6, semantic_edge_budget // 4))
-        peripheral_limit = max(1, min(3, semantic_node_budget // 6))
+        bridge_limit, support_limit, peripheral_limit = _round_limits()
 
         selected_set = set(selected_chunk_ids)
-        bridge_this_round = _rank_theme_bridge_chunks(
+        bridge_this_round = _filter_chunk_items(
+            _rank_theme_bridge_chunks(
             query=query,
             graph=graph,
             frontier_chunk_ids=current_frontier,
@@ -742,9 +800,11 @@ def _expand_theme_chunk_graph(
             edge_to_chunks=edge_to_chunks,
             chunk_neighbors=chunk_neighbors,
             limit=bridge_limit,
+            )
         )
         selected_set.update(item["chunk_id"] for item in bridge_this_round)
-        support_candidates = _rank_theme_support_chunks(
+        support_candidates = _filter_chunk_items(
+            _rank_theme_support_chunks(
             query=query,
             candidate_chunk_ids=candidate_chunk_ids,
             selected_chunk_ids=selected_set,
@@ -756,6 +816,7 @@ def _expand_theme_chunk_graph(
             edge_to_chunks=edge_to_chunks,
             chunk_neighbors=chunk_neighbors,
             limit=max(support_limit * 4, support_limit),
+            )
         )
         support_this_round = _select_diverse_support_chunks(
             scored_candidates=support_candidates,
@@ -766,17 +827,19 @@ def _expand_theme_chunk_graph(
             limit=support_limit,
         )
         selected_set.update(item["chunk_id"] for item in support_this_round)
-        peripheral_this_round = _rank_theme_peripheral_chunks(
-            seed_chunk_ids=[item["chunk_id"] for item in bridge_this_round + support_this_round],
-            selected_chunk_ids=selected_set,
-            query_chunk_score_lookup=local_query_chunk_score_lookup,
-            chunk_store=chunk_store,
-            chunk_to_nodes=chunk_to_nodes,
-            chunk_to_edges=chunk_to_edges,
-            node_to_chunks=node_to_chunks,
-            edge_to_chunks=edge_to_chunks,
-            chunk_neighbors=chunk_neighbors,
-            limit=peripheral_limit,
+        peripheral_this_round = _filter_chunk_items(
+            _rank_theme_peripheral_chunks(
+                seed_chunk_ids=[item["chunk_id"] for item in bridge_this_round + support_this_round],
+                selected_chunk_ids=selected_set,
+                query_chunk_score_lookup=local_query_chunk_score_lookup,
+                chunk_store=chunk_store,
+                chunk_to_nodes=chunk_to_nodes,
+                chunk_to_edges=chunk_to_edges,
+                node_to_chunks=node_to_chunks,
+                edge_to_chunks=edge_to_chunks,
+                chunk_neighbors=chunk_neighbors,
+                limit=peripheral_limit,
+            )
         )
 
         for item in bridge_this_round:
@@ -807,6 +870,7 @@ def _expand_theme_chunk_graph(
         round_chunk_ids = [item["chunk_id"] for item in bridge_this_round + support_this_round + peripheral_this_round]
         reseeded_roots = _reseed_theme_root_chunks(
             query=query,
+            query_contract=query_contract,
             graph=graph,
             selected_chunk_ids=selected_chunk_ids,
             round_chunk_ids=round_chunk_ids,
@@ -820,6 +884,7 @@ def _expand_theme_chunk_graph(
             chunk_neighbors=chunk_neighbors,
             top_k=max(len(root_chunk_ids), 1),
         )
+        reseeded_roots = _filter_chunk_items(reseeded_roots)
         next_active_root_chunk_ids = [item["chunk_id"] for item in reseeded_roots] or list(active_root_chunk_ids)
         next_active_root_chunk_score_lookup = {
             item["chunk_id"]: round(
@@ -2268,233 +2333,22 @@ def expand_associative_graph(
     allowed_doc_ids=None,
 ):
     """Run alternating bridge-association and coverage-association rounds."""
-    if query_contract == "theme-grounded":
-        return _expand_theme_chunk_graph(
-            query=query,
-            graph=graph,
-            root_chunk_ids=root_chunk_ids,
-            root_chunk_score_lookup=root_chunk_score_lookup,
-            query_chunk_score_lookup=query_chunk_score_lookup,
-            chunk_to_nodes=chunk_to_nodes,
-            chunk_to_edges=chunk_to_edges,
-            node_to_chunks=node_to_chunks,
-            edge_to_chunks=edge_to_chunks,
-            chunk_neighbors=chunk_neighbors,
-            chunk_store=chunk_store,
-            association_rounds=association_rounds,
-            path_budget=path_budget,
-            semantic_edge_budget=semantic_edge_budget,
-            semantic_node_budget=semantic_node_budget,
-        )
-
-    current_nodes = set(root_nodes)
-    current_edges = set(root_edges)
-    initial_core_chunk_ids = list(root_chunk_ids)
-    active_root_chunk_ids = list(root_chunk_ids)
-    active_root_chunk_score_lookup = dict(root_chunk_score_lookup)
-    all_structural_nodes = set()
-    all_structural_edges = set()
-    all_semantic_nodes = set()
-    all_semantic_edges = []
-    promoted_root_chunks = []
-    round_outputs = []
-    last_structural_output = {
-        "current_components": [],
-        "selected_paths": [],
-        "selected_path_nodes": [],
-        "selected_path_edges": [],
-    }
-
-    for round_index in range(1, max(association_rounds, 1) + 1):
-        scored_current_nodes = score_root_nodes(
-            query=query,
-            root_nodes=current_nodes,
-            graph=graph,
-            node_to_chunks=node_to_chunks,
-            root_chunk_score_lookup=active_root_chunk_score_lookup,
-        )
-        scored_current_edges = score_root_edges(
-            query=query,
-            root_edges=current_edges,
-            graph=graph,
-            edge_to_chunks=edge_to_chunks,
-            root_chunk_score_lookup=active_root_chunk_score_lookup,
-        )
-        structural_output = bridge_association(
-            graph=graph,
-            current_nodes=current_nodes,
-            current_edges=current_edges,
-            query_contract=query_contract,
-            root_chunk_ids=active_root_chunk_ids,
-            root_chunk_score_lookup=active_root_chunk_score_lookup,
-            top_nodes=scored_current_nodes[:top_root_nodes],
-            top_edges=scored_current_edges[:top_root_edges],
-            chunk_to_nodes=chunk_to_nodes,
-            chunk_to_edges=chunk_to_edges,
-            node_to_chunks=node_to_chunks,
-            edge_to_chunks=edge_to_chunks,
-            chunk_neighbors=chunk_neighbors,
-            chunk_store=chunk_store,
-            max_hop=max_hop,
-            path_budget=path_budget,
-        )
-        structural_new_nodes = set(structural_output["selected_path_nodes"]) - current_nodes
-        structural_new_edges = set(structural_output["selected_path_edges"]) - current_edges
-        current_nodes = current_nodes.union(structural_output["selected_path_nodes"])
-        current_edges = current_edges.union(structural_output["selected_path_edges"])
-
-        promoted_this_round = []
-        if query_contract == "theme-grounded":
-            frontier_scores = _theme_frontier_chunk_scores(
-                structural_output=structural_output,
-                node_to_chunks=node_to_chunks,
-                edge_to_chunks=edge_to_chunks,
-                chunk_neighbors=chunk_neighbors,
-            )
-            promoted_this_round = _promote_theme_frontier_roots(
-                frontier_scores=frontier_scores,
-                active_root_chunk_score_lookup=active_root_chunk_score_lookup,
-                query_chunk_score_lookup=query_chunk_score_lookup,
-                chunk_store=chunk_store,
-                chunk_to_nodes=chunk_to_nodes,
-                chunk_to_edges=chunk_to_edges,
-                chunk_neighbors=chunk_neighbors,
-                core_chunk_ids=initial_core_chunk_ids,
-                max_new_roots=2,
-            )
-            reseed_nodes = set()
-            reseed_edges = set()
-            for item in promoted_this_round:
-                active_root_chunk_score_lookup[item["chunk_id"]] = item["score_norm"]
-                if item["chunk_id"] not in active_root_chunk_ids:
-                    active_root_chunk_ids.append(item["chunk_id"])
-                reseed_nodes.update(chunk_to_nodes.get(item["chunk_id"], set()))
-                reseed_edges.update(chunk_to_edges.get(item["chunk_id"], set()))
-            reseed_new_nodes = reseed_nodes - current_nodes
-            reseed_new_edges = reseed_edges - current_edges
-            current_nodes.update(reseed_nodes)
-            current_edges.update(reseed_edges)
-            all_structural_nodes.update(reseed_new_nodes)
-            all_structural_edges.update(reseed_new_edges)
-            promoted_root_chunks.extend(promoted_this_round)
-
-        local_semantic_edge_budget = semantic_edge_budget
-        local_semantic_node_budget = semantic_node_budget
-        semantic_query_priority = True
-        if query_contract == "theme-grounded":
-            local_semantic_edge_budget = max(1, semantic_edge_budget // 2)
-            local_semantic_node_budget = max(1, semantic_node_budget // 2)
-            semantic_query_priority = False
-
-        semantic_output = coverage_association(
-            graph=graph,
-            query=query,
-            query_contract=query_contract,
-            current_nodes=current_nodes,
-            current_edges=current_edges,
-            root_chunk_ids=active_root_chunk_ids,
-            root_chunk_score_lookup=active_root_chunk_score_lookup,
-            query_chunk_score_lookup=query_chunk_score_lookup,
-            chunk_to_nodes=chunk_to_nodes,
-            chunk_to_edges=chunk_to_edges,
-            node_to_chunks=node_to_chunks,
-            edge_to_chunks=edge_to_chunks,
-            chunk_neighbors=chunk_neighbors,
-            chunk_store=chunk_store,
-            semantic_edge_budget=local_semantic_edge_budget,
-            semantic_node_budget=local_semantic_node_budget,
-            semantic_edge_min_score=semantic_edge_min_score,
-            semantic_node_min_score=semantic_node_min_score,
-            allowed_doc_ids=allowed_doc_ids,
-            query_priority=semantic_query_priority,
-        )
-        semantic_new_nodes = set(semantic_output["final_nodes"]) - current_nodes
-        semantic_new_edges = set(semantic_output["final_edges"]) - current_edges
-        current_nodes = set(semantic_output["final_nodes"])
-        current_edges = set(semantic_output["final_edges"])
-
-        all_structural_nodes.update(structural_new_nodes)
-        all_structural_edges.update(structural_new_edges)
-        all_semantic_nodes.update(semantic_new_nodes)
-        all_semantic_edges.extend(item for item in semantic_output["selected_edges"] if item["edge"] in semantic_new_edges)
-        round_outputs.append(
-            {
-                "round": round_index,
-                "structural_path_count": len(structural_output["selected_paths"]),
-                "structural_chunk_bridge_count": len(structural_output.get("selected_chunks", [])),
-                "structural_added_node_count": len(structural_new_nodes),
-                "structural_added_edge_count": len(structural_new_edges),
-                "semantic_added_node_count": len(semantic_new_nodes),
-                "semantic_added_edge_count": len(semantic_new_edges),
-                "semantic_chunk_coverage_count": len(semantic_output.get("selected_chunks", [])),
-                "current_node_count": len(current_nodes),
-                "current_edge_count": len(current_edges),
-                "promoted_root_count": len(promoted_this_round),
-                "promoted_root_node_count": len(reseed_new_nodes) if query_contract == "theme-grounded" else 0,
-                "promoted_root_edge_count": len(reseed_new_edges) if query_contract == "theme-grounded" else 0,
-                "structural_path_preview": [
-                    {
-                        "path": item["path"],
-                        "score": item["bridge_gain"],
-                        "new_source_count": item["new_source_count"],
-                        "path_length": item["path_length"],
-                    }
-                    for item in structural_output["selected_paths"][:3]
-                ],
-                "structural_chunk_preview": [
-                    {
-                        "chunk_id": item["chunk_id"],
-                        "bridge_gain": item["bridge_gain"],
-                        "frontier_touch": item["frontier_touch"],
-                        "new_source_count": item["new_source_count"],
-                    }
-                    for item in structural_output.get("selected_chunks", [])[:3]
-                ],
-                "semantic_edge_preview": [
-                    {
-                        "edge": item["edge"],
-                        "score": item["coverage_gain"],
-                        "category": item["category"],
-                        "new_source_count": item["new_source_count"],
-                        "new_relation": item["new_relation"],
-                    }
-                    for item in semantic_output["selected_edges"][:3]
-                ],
-                "semantic_node_preview": [
-                    {
-                        "id": item["id"],
-                        "score": item["coverage_gain"],
-                        "bridge_strength": item["bridge_strength"],
-                        "new_source_count": item["new_source_count"],
-                    }
-                    for item in semantic_output["selected_nodes"][:3]
-                ],
-                "semantic_chunk_preview": [
-                    {
-                        "chunk_id": item["chunk_id"],
-                        "new_node_count": item["new_node_count"],
-                        "new_edge_count": item["new_edge_count"],
-                        "new_source_count": item["new_source_count"],
-                    }
-                    for item in semantic_output.get("selected_chunks", [])[:3]
-                ],
-                "promoted_root_preview": promoted_this_round[:3],
-            }
-        )
-        last_structural_output = structural_output
-        if not structural_new_nodes and not structural_new_edges and not semantic_new_nodes and not semantic_new_edges:
-            break
-
-    return {
-        "final_nodes": sorted(current_nodes),
-        "final_edges": sorted(current_edges),
-        "all_structural_nodes": sorted(all_structural_nodes),
-        "all_structural_edges": sorted(all_structural_edges),
-        "all_semantic_nodes": sorted(all_semantic_nodes),
-        "all_semantic_edges": all_semantic_edges,
-        "promoted_root_chunks": promoted_root_chunks,
-        "effective_root_chunk_ids": active_root_chunk_ids,
-        "effective_root_chunk_score_lookup": active_root_chunk_score_lookup,
-        "rounds": round_outputs,
-        "last_structural_output": last_structural_output,
-    }
+    return _expand_theme_chunk_graph(
+        query=query,
+        query_contract=query_contract,
+        graph=graph,
+        root_chunk_ids=root_chunk_ids,
+        root_chunk_score_lookup=root_chunk_score_lookup,
+        query_chunk_score_lookup=query_chunk_score_lookup,
+        chunk_to_nodes=chunk_to_nodes,
+        chunk_to_edges=chunk_to_edges,
+        node_to_chunks=node_to_chunks,
+        edge_to_chunks=edge_to_chunks,
+        chunk_neighbors=chunk_neighbors,
+        chunk_store=chunk_store,
+        association_rounds=association_rounds,
+        path_budget=path_budget,
+        semantic_edge_budget=semantic_edge_budget,
+        semantic_node_budget=semantic_node_budget,
+        allowed_doc_ids=allowed_doc_ids,
+    )

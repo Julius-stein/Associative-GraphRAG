@@ -1,243 +1,103 @@
 # Associative RAG Project
 
-Independent research prototype for query-focused summarization built around:
+Research prototype for query-focused summarization over chunk-entity-relation graphs.
 
-- `chunk-first` anchoring
-- relation-aware structural association
-- semantic-gain association
-- adaptive control of association strength
-- knowledge-group context construction
-- OpenAI-compatible answer generation
-- FG-RAG-style pairwise evaluation
+## What This Module Does
 
-## Overview
+The current implementation answers a query with the following pipeline:
 
-The main retrieval flow is:
+1. detect the query contract
+2. retrieve chunk candidates from lexical/dense retrieval plus graph-side recall
+3. select diverse root chunks
+4. run multi-round chunk-level association on the graph
+5. organize the final subgraph into facet groups
+6. pack evidence into a prompt context
+7. generate the final answer with an OpenAI-compatible LLM
+8. judge the answer against a baseline with a contract-aware LLM judge
 
-1. retrieve root chunks with `bm25`, `dense`, or `hybrid`
-2. rerank root chunks with query-aware and graph-aware signals
-3. project root chunks into the entity-relation graph
-4. expand with alternating `structural association` and `semantic association`
-5. package the final graph into `knowledge groups`
-6. build a final evidence package for answer generation
+The important architectural choice in the current code is:
 
-The adaptive controller can shrink or expand association budgets per query based on:
-
-- generic query-form cues
-- root graph density
-- root graph fragmentation
-- support dispersion
-- retrieval score cliff
+- all contracts now share one theme-style retrieval and association backbone
+- the contracts mainly diverge at the organization layer
+- `section-grounded` keeps a strict single-`full_doc_id` constraint
+- `mechanism-grounded` uses pathway-style grouping
+- `comparison-grounded` uses side/axis-style grouping
+- `theme-grounded` uses slot-based multi-aspect grouping
 
 ## Code Map
 
 - [main.py](/Users/Admin/projects/Association/associative_rag_project/main.py): CLI entrypoint
 - [pipeline.py](/Users/Admin/projects/Association/associative_rag_project/pipeline.py): end-to-end retrieval pipeline
-- [retrieval.py](/Users/Admin/projects/Association/associative_rag_project/retrieval.py): chunk retrieval and root scoring
-- [association.py](/Users/Admin/projects/Association/associative_rag_project/association.py): structural and semantic association
-- [adaptive_control.py](/Users/Admin/projects/Association/associative_rag_project/adaptive_control.py): per-query association-strength controller
-- [context.py](/Users/Admin/projects/Association/associative_rag_project/context.py): knowledge groups and prompt context assembly
-- [llm_client.py](/Users/Admin/projects/Association/associative_rag_project/llm_client.py): answer generation
-- [judge.py](/Users/Admin/projects/Association/associative_rag_project/judge.py): FG-RAG-style evaluation
-- [analyze_query_shape.py](/Users/Admin/projects/Association/associative_rag_project/analyze_query_shape.py): inspect retrieval-side signals against manual broad/focused judgments
-- [data.py](/Users/Admin/projects/Association/associative_rag_project/data.py): corpus / question / baseline loading
-- [config.py](/Users/Admin/projects/Association/associative_rag_project/config.py): shared config loading from `lightrag/llm_config.py`
+- [data.py](/Users/Admin/projects/Association/associative_rag_project/data.py): corpus / query loading and graph-chunk mappings
+- [retrieval.py](/Users/Admin/projects/Association/associative_rag_project/retrieval.py): BM25/dense retrieval, graph-side recall, root selection, root node/edge scoring
+- [association.py](/Users/Admin/projects/Association/associative_rag_project/association.py): multi-round chunk association and root reseeding
+- [organization.py](/Users/Admin/projects/Association/associative_rag_project/organization.py): contract detection, region construction, facet grouping
+- [context.py](/Users/Admin/projects/Association/associative_rag_project/context.py): prompt context assembly and source packing
+- [llm_client.py](/Users/Admin/projects/Association/associative_rag_project/llm_client.py): answer prompt construction and generation
+- [judge.py](/Users/Admin/projects/Association/associative_rag_project/judge.py): pairwise FG-RAG-style evaluation
 
 ## Data Assumptions
 
-Each corpus directory is expected to contain at least:
+Each indexed corpus under `Datasets/<name>/index` should provide:
 
 - `graph_chunk_entity_relation.graphml`
 - `kv_store_text_chunks.json`
+- `vdb_chunks.json` if dense or hybrid retrieval is used
 
-Dense retrieval additionally expects:
+Typical query file:
 
-- `vdb_chunks.json`
+- `Datasets/<name>/query/<name>.json`
 
-Question files are resolved from:
+Typical baseline answer file:
 
-- `datasets/questions/<corpus>_questions.txt`
-
-Baseline files default to:
-
-- `FG-RAG/<corpus>/output/FG-RAG-4o-mini.json`
-
-You can override both with explicit CLI arguments.
+- `Datasets/<name>/output/FG-RAG-4o-mini.json`
 
 ## Main Commands
 
-### 1. End-to-End Run
-
-Run retrieval, answer generation, and pairwise judging in one command:
-
-```bash
-python -m associative_rag_project.main run-all \
-  --corpus-dir agriculture \
-  --max-workers 4
-```
-
-This writes files like:
-
-- `associative_rag_project/runs/agriculture_top5_hop4_assoc_project_retrieval.json`
-- `associative_rag_project/runs/agriculture_top5_hop4_assoc_project_answers.json`
-- `associative_rag_project/runs/agriculture_top5_hop4_assoc_project_vs_FG-RAG-4o-mini_winrate.json`
-
-### 2. Retrieval Only
-
-Useful when you want to inspect graph growth, root chunks, and evidence packages before generating answers.
+### Retrieve
 
 ```bash
 python -m associative_rag_project.main retrieve \
-  --corpus-dir mix \
-  --max-workers 4
-```
-
-### 3. Answer Only
-
-Generate answers from an existing retrieval file:
-
-```bash
-python -m associative_rag_project.main answer \
-  --retrieval-file associative_rag_project/runs/mix_top5_hop4_assoc_project_retrieval.json \
-  --max-workers 4
-```
-
-### 4. Judge Only
-
-Compare a candidate answer file against a baseline:
-
-```bash
-python -m associative_rag_project.main judge \
-  --questions-file datasets/questions/mix_questions.txt \
-  --candidate-file associative_rag_project/runs/mix_top5_hop4_assoc_project_answers.json \
-  --baseline-file FG-RAG/mix/output/FG-RAG-4o-mini.json \
-  --output-file associative_rag_project/runs/mix_top5_hop4_assoc_project_vs_FG-RAG-4o-mini_winrate.json \
-  --max-workers 4
-```
-
-## Common Examples
-
-### Small Sanity Run
-
-Run only the first 5 questions:
-
-```bash
-python -m associative_rag_project.main run-all \
-  --corpus-dir legal \
-  --limit-groups 5 \
-  --max-workers 4
-```
-
-### Hybrid Retrieval
-
-This is the default mode:
-
-```bash
-python -m associative_rag_project.main retrieve \
-  --corpus-dir art \
-  --retrieval-mode hybrid
-```
-
-### Dense-Only Retrieval
-
-```bash
-python -m associative_rag_project.main retrieve \
-  --corpus-dir art \
+  --corpus-dir Datasets/art/index \
+  --output-dir associative_rag_project/runs_demo \
   --retrieval-mode dense
 ```
 
-### Local BGE-M3 Dense Retrieval
+### Answer
 
 ```bash
-python -m associative_rag_project.main retrieve \
-  --corpus-dir art \
-  --retrieval-mode dense \
-  --embedding-provider bge_m3_local \
-  --local-embedding-model BAAI/bge-m3 \
-  --local-embedding-device auto \
-  --local-embedding-batch-size 16
+python -m associative_rag_project.main answer \
+  --retrieval-file associative_rag_project/runs_demo/art_top5_hop4_assoc_project_retrieval.json \
+  --output-file associative_rag_project/runs_demo/art_top5_hop4_assoc_project_answers.json
 ```
 
-Important: `vdb_chunks.json` must be rebuilt with the same embedding model (`bge-m3`).
-If index vectors and query vectors are not from the same model, dense retrieval quality
-will collapse and the pipeline will now raise an explicit dimension mismatch error.
-
-### BM25-Only Retrieval
+### Judge
 
 ```bash
-python -m associative_rag_project.main retrieve \
-  --corpus-dir art \
-  --retrieval-mode bm25
+python -m associative_rag_project.main judge \
+  --questions-file Datasets/art/query/art.json \
+  --candidate-file associative_rag_project/runs_demo/art_top5_hop4_assoc_project_answers.json \
+  --baseline-file Datasets/art/output/FG-RAG-4o-mini.json \
+  --output-file associative_rag_project/runs_demo/art_top5_hop4_assoc_project_vs_FG-RAG-4o-mini_winrate.json
 ```
 
-### No-Adaptive Ablation
-
-Run the same pipeline with fixed association strength:
+### End-to-End
 
 ```bash
 python -m associative_rag_project.main run-all \
-  --corpus-dir agriculture \
-  --max-workers 4 \
-  --disable-adaptive-control \
-  --output-dir associative_rag_project/runs_noadaptive \
-  --answer-output-file associative_rag_project/runs_noadaptive/agriculture_top5_hop4_assoc_project_answers_noadaptive.json \
-  --judge-output-file associative_rag_project/runs_noadaptive/agriculture_top5_hop4_assoc_project_vs_FG-RAG-4o-mini_winrate_noadaptive.json
-```
-
-### Query-Shape Inspection
-
-Inspect which queries sit at the low / high end of each retrieval-side metric:
-
-```bash
-python associative_rag_project/analyze_query_shape.py \
-  associative_rag_project/runs_linear2_60/art_top5_hop4_assoc_project_retrieval.json \
-  associative_rag_project/runs_linear2_60/agriculture_top5_hop4_assoc_project_retrieval.json
-```
-
-Export a CSV template for manual `broad / focused / mixed` annotation:
-
-```bash
-python associative_rag_project/analyze_query_shape.py \
-  associative_rag_project/runs_linear2_60/art_top5_hop4_assoc_project_retrieval.json \
-  associative_rag_project/runs_linear2_60/agriculture_top5_hop4_assoc_project_retrieval.json \
-  --top-n 10 \
-  --export-csv associative_rag_project/query_shape_annotation_template.csv
-```
-
-### Custom Retrieval Budget
-
-```bash
-python -m associative_rag_project.main retrieve \
-  --corpus-dir mix \
-  --top-chunks 5 \
-  --max-hop 4 \
-  --path-budget 12 \
-  --semantic-edge-budget 20 \
-  --semantic-node-budget 12
-```
-
-### Custom Output Directory
-
-```bash
-python -m associative_rag_project.main run-all \
-  --corpus-dir legal \
-  --output-dir associative_rag_project/exp_legal_v2 \
+  --corpus-dir Datasets/art/index \
+  --output-dir associative_rag_project/runs_demo \
   --max-workers 4
 ```
 
-## Important CLI Arguments
+## Useful CLI Arguments
 
-Retrieval-related:
+Retrieval:
 
 - `--retrieval-mode {bm25,dense,hybrid}`
-- `--embedding-provider {openai_compatible,bge_m3_local}`
-- `--embedding-model`
-- `--embedding-base-url`
-- `--local-embedding-model`
-- `--local-embedding-device`
-- `--local-embedding-batch-size`
 - `--top-chunks`
 - `--chunk-candidate-multiplier`
+- `--candidate-pool-size`
 - `--dense-weight`
 - `--bm25-weight`
 - `--top-root-nodes`
@@ -252,89 +112,88 @@ Retrieval-related:
 - `--group-limit`
 - `--max-source-chunks`
 - `--max-source-word-budget`
-- `--disable-adaptive-control`
 
-Run-control:
+Embedding:
+
+- `--embedding-provider {openai_compatible,bge_m3_local}`
+- `--embedding-model`
+- `--embedding-base-url`
+- `--embedding-api-key`
+- `--local-embedding-model`
+- `--local-embedding-device`
+- `--local-embedding-batch-size`
+
+Execution:
 
 - `--limit-groups`
-- `--max-workers`
 - `--output-dir`
-- `--questions-file`
-- `--baseline-file`
+- `--max-workers`
 
-## Output Files
+## Current Retrieval and Organization Logic
 
-### Retrieval JSON
+### 1. Unified candidate retrieval
 
-Contains:
+`run_query()` in [pipeline.py](/Users/Admin/projects/Association/associative_rag_project/pipeline.py) first retrieves chunk candidates from:
 
-- selected root chunks
-- adaptive profile
-- round-by-round structural / semantic association traces
-- final graph size statistics
-- prompt context
+- the primary retriever: `bm25`, `dense`, or `hybrid`
+- `search_graph_focus_chunks()`
+- `search_graph_keyword_chunks()`
 
-Typical file:
+The merged candidate pool is therefore both query-relevant and graph-aware.
 
-- [mix_top5_hop4_assoc_project_retrieval.json](/Users/Admin/projects/Association/associative_rag_project/runs/mix_top5_hop4_assoc_project_retrieval.json)
+### 2. Diverse root selection
 
-### Answer JSON
+[select_diverse_root_chunks()](/Users/Admin/projects/Association/associative_rag_project/retrieval.py) selects a small set of high-value roots while discouraging:
 
-Contains:
+- same-doc local-band duplication
+- provenance overlap
+- staying inside one query-term basin
 
-- `group_id`
-- `query`
-- `query_style`
-- `model_answer`
-- retrieval statistics
+### 3. Multi-round association
 
-Typical file:
+[expand_associative_graph()](/Users/Admin/projects/Association/associative_rag_project/association.py) now routes all contracts into the theme-style chunk association loop:
 
-- [mix_top5_hop4_assoc_project_answers.json](/Users/Admin/projects/Association/associative_rag_project/runs/mix_top5_hop4_assoc_project_answers.json)
+- bridge chunks connect current roots to new graph areas
+- support chunks bring new information mass
+- peripheral chunks add local graph context
+- root seeds are refreshed after each round
 
-### Winrate JSON
+### 4. Contract-specific grouping
 
-Contains:
+[build_answer_facet_groups()](/Users/Admin/projects/Association/associative_rag_project/organization.py) is where contracts diverge:
 
-- `summary`
-- `criteria_summary`
-- per-query `verdicts`
+- `section-grounded`: section bands inside one `full_doc_id`
+- `mechanism-grounded`: `pathway: ...` facets
+- `comparison-grounded`: `comparison side ...` and `contrast axis ...` facets
+- `theme-grounded`: slot-based aspect groups such as examples, drivers, contexts, outcomes
 
-`criteria_summary` follows the FG-RAG evaluation dimensions:
+## Output Artifacts
 
-- `Comprehensiveness`
-- `Diversity`
-- `Empowerment`
-- `Overall Winner`
+Each retrieval record includes:
 
-Typical file:
+- `candidate_root_chunks`
+- `root_chunks`
+- `promoted_root_chunks`
+- `theme_selected_chunks`
+- `facet_groups`
+- `candidate_points`
+- `prompt_context`
+- per-query `stats`
 
-- [mix_top5_hop4_assoc_project_vs_FG-RAG-4o-mini_winrate.json](/Users/Admin/projects/Association/associative_rag_project/runs/mix_top5_hop4_assoc_project_vs_FG-RAG-4o-mini_winrate.json)
+This makes the system easy to inspect when you want to debug whether a problem comes from retrieval, association, organization, or prompting.
 
-## Evaluation Notes
+## Recommended Reading Order
 
-- The judge uses the FG-RAG evaluation prompt template from [EvaluatorPrompt.py](/Users/Admin/projects/Association/FG-RAG/prompt/EvaluatorPrompt.py).
-- Judging is done in both answer orders to reduce position bias.
-- The output keeps both overall win rate and per-dimension probabilities.
+1. [pipeline.py](/Users/Admin/projects/Association/associative_rag_project/pipeline.py)
+2. [retrieval.py](/Users/Admin/projects/Association/associative_rag_project/retrieval.py)
+3. [association.py](/Users/Admin/projects/Association/associative_rag_project/association.py)
+4. [organization.py](/Users/Admin/projects/Association/associative_rag_project/organization.py)
+5. [context.py](/Users/Admin/projects/Association/associative_rag_project/context.py)
+6. [llm_client.py](/Users/Admin/projects/Association/associative_rag_project/llm_client.py)
+7. [judge.py](/Users/Admin/projects/Association/associative_rag_project/judge.py)
 
-## Config Notes
+## Detailed Report
 
-- Generation and embedding endpoints are loaded from [llm_config.py](/Users/Admin/projects/Association/lightrag/llm_config.py).
-- Judge model defaults to `gpt-5.4-mini`.
-- You can override generation / embedding / judge settings with environment variables consumed by [config.py](/Users/Admin/projects/Association/associative_rag_project/config.py).
+For the algorithm-level Chinese report, see:
 
-## Practical Workflow
-
-For normal experiments:
-
-1. run `retrieve` first when debugging graph behavior
-2. inspect retrieval JSON or sample context
-3. run `answer`
-4. run `judge`
-5. only use `run-all` once the setup is stable
-
-For ablations:
-
-1. keep the same corpus and output naming pattern
-2. change only one switch at a time
-3. place ablation outputs in a different directory such as `runs_noadaptive`
+- [TECHNICAL_REPORT_CN.md](/Users/Admin/projects/Association/associative_rag_project/TECHNICAL_REPORT_CN.md)

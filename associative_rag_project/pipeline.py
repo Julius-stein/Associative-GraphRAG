@@ -22,9 +22,9 @@ from .config import load_llm_config
 from .embedding_client import build_embedding_client
 from .logging_utils import log, shorten
 from .organization import (
-    build_answer_facet_groups,
+    build_layout_groups,
     build_candidate_points_from_groups,
-    detect_query_contract,
+    resolve_organization_layout,
 )
 from .retrieval import (
     BM25Index,
@@ -32,11 +32,10 @@ from .retrieval import (
     HybridChunkRetriever,
     build_graph_keyword_index,
     merge_candidate_hits_with_graph,
-    search_graph_focus_chunks,
-    search_graph_keyword_chunks,
+    search_graph_evidence_chunks,
     score_root_edges,
     score_root_nodes,
-    select_diverse_root_chunks,
+    select_anchor_root_chunks,
 )
 
 
@@ -187,41 +186,20 @@ def _format_round_preview(round_info):
     return lines
 
 
-def _contract_candidate_top_k(cfg, query_contract):
-    base = max(
+def _anchor_candidate_top_k(cfg):
+    return max(
         cfg["top_chunks"],
         cfg["top_chunks"] * max(cfg["chunk_candidate_multiplier"], 1),
         cfg.get("candidate_pool_size", 30),
     )
-    if query_contract == "theme-grounded":
-        return max(base * 3, cfg.get("candidate_pool_size", 30) * 2, 80)
-    if query_contract == "comparison-grounded":
-        return max(base, cfg.get("candidate_pool_size", 30) + cfg["top_chunks"] * 4)
-    return base
 
 
-def _contract_root_top_k(cfg, query_contract):
-    if query_contract == "theme-grounded":
-        return cfg["top_chunks"] + 3
-    if query_contract == "comparison-grounded":
-        return cfg["top_chunks"] + 1
+def _anchor_root_top_k(cfg):
     return cfg["top_chunks"]
 
 
-def _contract_max_hop(cfg, query_contract):
-    if query_contract == "theme-grounded":
-        return max(2, cfg["max_hop"] - 1)
+def _expand_max_hop(cfg):
     return cfg["max_hop"]
-
-
-def _contract_graph_merge_weights(query_contract):
-    if query_contract == "section-grounded":
-        return 0.22, 0.12
-    if query_contract == "mechanism-grounded":
-        return 0.28, 0.16
-    if query_contract == "comparison-grounded":
-        return 0.30, 0.18
-    return 0.32, 0.18
 
 
 def _pick_section_doc_ids(root_chunk_hits, chunk_store):
@@ -233,6 +211,266 @@ def _pick_section_doc_ids(root_chunk_hits, chunk_store):
     if not doc_ids:
         return None
     return {doc_ids[0]}
+
+
+def _run_anchor_stage(
+    *,
+    query_row,
+    organization_layout,
+    graph,
+    chunk_store,
+    chunk_retriever,
+    chunk_to_nodes,
+    chunk_to_edges,
+    node_to_chunks,
+    edge_to_chunks,
+    keyword_index,
+    cfg,
+):
+    candidate_top_k = _anchor_candidate_top_k(cfg)
+    root_top_k = _anchor_root_top_k(cfg)
+    max_hop = _expand_max_hop(cfg)
+
+    candidate_chunk_hits = chunk_retriever.search(query_row["query"], top_k=candidate_top_k)
+    graph_evidence_hits = search_graph_evidence_chunks(
+        query=query_row["query"],
+        graph=graph,
+        node_to_chunks=node_to_chunks,
+        edge_to_chunks=edge_to_chunks,
+        top_chunk_k=max(candidate_top_k * 2, cfg["top_chunks"] * 10),
+    )
+    candidate_chunk_hits = merge_candidate_hits_with_graph(
+        primary_hits=candidate_chunk_hits,
+        graph_hits=graph_evidence_hits,
+        graph_weight=0.28,
+    )[:candidate_top_k]
+
+    query_chunk_score_lookup = {
+        item["chunk_id"]: item.get(
+            "graph_evidence_score_norm",
+            item.get(
+                "graph_focus_score_norm",
+                item.get(
+                    "graph_keyword_score_norm",
+                    item.get("dense_score_norm", item.get("retrieval_score", item.get("score_norm", 0.0))),
+                ),
+            ),
+        )
+        for item in candidate_chunk_hits
+    }
+
+    root_chunk_hits = select_anchor_root_chunks(
+        query=query_row["query"],
+        candidate_hits=candidate_chunk_hits,
+        chunk_store=chunk_store,
+        chunk_to_nodes=chunk_to_nodes,
+        chunk_to_edges=chunk_to_edges,
+        top_k=root_top_k,
+        query_contract=organization_layout,
+        graph=graph,
+        keyword_index=keyword_index,
+    )
+
+    allowed_doc_ids = None
+    if organization_layout == "section-grounded":
+        allowed_doc_ids = _pick_section_doc_ids(root_chunk_hits, chunk_store)
+        if allowed_doc_ids:
+            section_candidate_hits = [
+                item
+                for item in candidate_chunk_hits
+                if chunk_store.get(item["chunk_id"], {}).get("full_doc_id") in allowed_doc_ids
+            ]
+            section_root_hits = select_anchor_root_chunks(
+                query=query_row["query"],
+                candidate_hits=section_candidate_hits,
+                chunk_store=chunk_store,
+                chunk_to_nodes=chunk_to_nodes,
+                chunk_to_edges=chunk_to_edges,
+                top_k=root_top_k,
+                query_contract=organization_layout,
+                graph=graph,
+                keyword_index=keyword_index,
+            )
+            if section_root_hits:
+                root_chunk_hits = section_root_hits
+
+    root_chunk_hits = [_serialize_root_chunk_hit(item) for item in root_chunk_hits]
+    if organization_layout == "section-grounded" and not allowed_doc_ids:
+        allowed_doc_ids = _pick_section_doc_ids(root_chunk_hits, chunk_store)
+
+    root_chunk_score_lookup = {item["chunk_id"]: item["score_norm"] for item in root_chunk_hits}
+    root_chunk_ids = list(root_chunk_score_lookup)
+    root_nodes = set()
+    root_edges = set()
+    for chunk_id in root_chunk_ids:
+        root_nodes.update(chunk_to_nodes.get(chunk_id, set()))
+        root_edges.update(chunk_to_edges.get(chunk_id, set()))
+
+    top_root_nodes = score_root_nodes(
+        query=query_row["query"],
+        root_nodes=root_nodes,
+        graph=graph,
+        node_to_chunks=node_to_chunks,
+        root_chunk_score_lookup=root_chunk_score_lookup,
+    )[: cfg["top_root_nodes"]]
+    top_root_edges = score_root_edges(
+        query=query_row["query"],
+        root_edges=root_edges,
+        graph=graph,
+        edge_to_chunks=edge_to_chunks,
+        root_chunk_score_lookup=root_chunk_score_lookup,
+    )[: cfg["top_root_edges"]]
+
+    return {
+        "retrieval_mode_label": "anchor:dense+graph_evidence",
+        "candidate_top_k": candidate_top_k,
+        "root_top_k": root_top_k,
+        "max_hop": max_hop,
+        "candidate_chunk_hits": candidate_chunk_hits,
+        "query_chunk_score_lookup": query_chunk_score_lookup,
+        "root_chunk_hits": root_chunk_hits,
+        "root_chunk_score_lookup": root_chunk_score_lookup,
+        "root_chunk_ids": root_chunk_ids,
+        "root_nodes": root_nodes,
+        "root_edges": root_edges,
+        "top_root_nodes": top_root_nodes,
+        "top_root_edges": top_root_edges,
+        "allowed_doc_ids": allowed_doc_ids,
+    }
+
+
+def _run_expand_stage(
+    *,
+    query_row,
+    organization_layout,
+    anchor_state,
+    graph,
+    chunk_to_nodes,
+    chunk_to_edges,
+    node_to_chunks,
+    edge_to_chunks,
+    chunk_store,
+    cfg,
+):
+    expansion = expand_associative_graph(
+        query=query_row["query"],
+        query_contract=organization_layout,
+        graph=graph,
+        root_nodes=anchor_state["root_nodes"],
+        root_edges=anchor_state["root_edges"],
+        root_chunk_ids=anchor_state["root_chunk_ids"],
+        root_chunk_score_lookup=anchor_state["root_chunk_score_lookup"],
+        query_chunk_score_lookup=anchor_state["query_chunk_score_lookup"],
+        chunk_to_nodes=chunk_to_nodes,
+        chunk_to_edges=chunk_to_edges,
+        node_to_chunks=node_to_chunks,
+        edge_to_chunks=edge_to_chunks,
+        chunk_neighbors=cfg["chunk_neighbors"],
+        chunk_store=chunk_store,
+        top_root_nodes=cfg["top_root_nodes"],
+        top_root_edges=cfg["top_root_edges"],
+        max_hop=anchor_state["max_hop"],
+        path_budget=cfg["path_budget"],
+        semantic_edge_budget=cfg["semantic_edge_budget"],
+        semantic_node_budget=cfg["semantic_node_budget"],
+        association_rounds=cfg["association_rounds"],
+        semantic_edge_min_score=cfg["semantic_edge_min_score"],
+        semantic_node_min_score=cfg["semantic_node_min_score"],
+        allowed_doc_ids=anchor_state["allowed_doc_ids"],
+    )
+    promoted_root_chunks = [_serialize_root_chunk_hit(item) for item in expansion.get("promoted_root_chunks", [])]
+    effective_root_chunk_ids = expansion.get("effective_root_chunk_ids", anchor_state["root_chunk_ids"])
+    effective_root_chunk_hits = anchor_state["root_chunk_hits"] + promoted_root_chunks
+    return {
+        "expansion": expansion,
+        "promoted_root_chunks": promoted_root_chunks,
+        "effective_root_chunk_ids": effective_root_chunk_ids,
+        "effective_root_chunk_hits": effective_root_chunk_hits,
+    }
+
+
+def _run_organize_stage(
+    *,
+    query_row,
+    organization_layout,
+    anchor_state,
+    expand_state,
+    graph,
+    chunk_store,
+    chunk_to_nodes,
+    chunk_to_edges,
+    node_to_chunks,
+    edge_to_chunks,
+    cfg,
+):
+    expansion = expand_state["expansion"]
+    node_roles = build_node_role_sets(
+        root_nodes=anchor_state["root_nodes"],
+        structural_nodes=set(expansion["all_structural_nodes"]),
+        semantic_nodes=set(expansion["all_semantic_nodes"]),
+    )
+    edge_roles = build_edge_role_sets(
+        root_edges=anchor_state["root_edges"],
+        structural_edges=set(expansion["all_structural_edges"]),
+        semantic_edges=expansion["all_semantic_edges"],
+    )
+    facet_groups, organization_layout = build_layout_groups(
+        query=query_row["query"],
+        graph=graph,
+        final_nodes=expansion["final_nodes"],
+        final_edges=expansion["final_edges"],
+        root_chunk_ids=expand_state["effective_root_chunk_ids"],
+        last_structural_output=expansion["last_structural_output"],
+        chunk_neighbors=cfg["chunk_neighbors"],
+        chunk_to_nodes=chunk_to_nodes,
+        chunk_to_edges=chunk_to_edges,
+        node_to_chunks=node_to_chunks,
+        edge_to_chunks=edge_to_chunks,
+        chunk_store=chunk_store,
+        group_limit=cfg["group_limit"],
+        query_contract=organization_layout,
+        allowed_doc_ids=anchor_state["allowed_doc_ids"],
+    )
+    candidate_points = build_candidate_points_from_groups(facet_groups, top_k=8)
+    theme_selected_chunks = expansion.get("theme_selected_chunks", {})
+    chunk_roles = _build_chunk_roles(
+        expand_state["effective_root_chunk_hits"],
+        expand_state["promoted_root_chunks"],
+        facet_groups,
+        theme_selected_chunks=theme_selected_chunks,
+    )
+    prompt_payload = build_prompt_context(
+        query_row=query_row,
+        query_contract=organization_layout,
+        root_chunk_hits=expand_state["effective_root_chunk_hits"],
+        top_root_nodes=anchor_state["top_root_nodes"],
+        top_root_edges=anchor_state["top_root_edges"],
+        node_roles=node_roles,
+        edge_roles=edge_roles,
+        semantic_nodes=[{"id": node_id} for node_id in expansion["all_semantic_nodes"]],
+        semantic_edges=expansion["all_semantic_edges"],
+        final_nodes=expansion["final_nodes"],
+        final_edges=expansion["final_edges"],
+        facet_groups=facet_groups,
+        candidate_points=candidate_points,
+        chunk_roles=chunk_roles,
+        theme_selected_chunks=theme_selected_chunks,
+        chunk_store=chunk_store,
+        node_to_chunks=node_to_chunks,
+        edge_to_chunks=edge_to_chunks,
+        max_source_chunks=cfg["max_source_chunks"],
+        max_source_word_budget=cfg["max_source_word_budget"],
+    )
+    return {
+        "organization_layout": organization_layout,
+        "node_roles": node_roles,
+        "edge_roles": edge_roles,
+        "facet_groups": facet_groups,
+        "candidate_points": candidate_points,
+        "theme_selected_chunks": theme_selected_chunks,
+        "chunk_roles": chunk_roles,
+        "prompt_payload": prompt_payload,
+    }
 
 
 def run_query(
@@ -257,248 +495,97 @@ def run_query(
     """
     prefix = f"[query {query_index}/{total_queries}] " if query_index is not None and total_queries is not None else ""
     log(f"{prefix}start {query_row['group_id']} :: {query_row['query']}")
-    query_contract = detect_query_contract(query_row["query"])
-    root_top_k = _contract_root_top_k(cfg, query_contract)
-    max_hop = _contract_max_hop(cfg, query_contract)
-    # Keep a wider pre-rerank candidate pool so retrieval-cliff estimation can
-    # see whether the query really has a steep score drop or a broad frontier.
-    candidate_top_k = _contract_candidate_top_k(cfg, query_contract)
-    retrieval_mode_label = "dense+graph_focus"
-    graph_focus_weight, graph_keyword_weight = _contract_graph_merge_weights(query_contract)
-    candidate_chunk_hits = chunk_retriever.search(query_row["query"], top_k=candidate_top_k)
-    graph_focus_hits = search_graph_focus_chunks(
-        query=query_row["query"],
-        graph=graph,
-        node_to_chunks=node_to_chunks,
-        edge_to_chunks=edge_to_chunks,
-        top_chunk_k=max(candidate_top_k * 2, cfg["top_chunks"] * 10),
+    organization_layout, controller_info = resolve_organization_layout(
+        query_row,
+        controller=cfg.get("organization_controller", "predicted"),
     )
-    candidate_chunk_hits = merge_candidate_hits_with_graph(
-        primary_hits=candidate_chunk_hits,
-        graph_hits=graph_focus_hits,
-        graph_weight=graph_focus_weight,
-    )[:candidate_top_k]
-    graph_keyword_hits = search_graph_keyword_chunks(
-        query=query_row["query"],
-        graph=graph,
-        node_to_chunks=node_to_chunks,
-        edge_to_chunks=edge_to_chunks,
-        top_chunk_k=max(candidate_top_k * 2, cfg["top_chunks"] * 10),
-    )
-    candidate_chunk_hits = merge_candidate_hits_with_graph(
-        primary_hits=candidate_chunk_hits,
-        graph_hits=graph_keyword_hits,
-        graph_weight=graph_keyword_weight,
-    )[:candidate_top_k]
-    log(f"{prefix}retrieval candidates={len(candidate_chunk_hits)} mode={retrieval_mode_label}")
-    query_chunk_score_lookup = {
-        item["chunk_id"]: item.get(
-            "graph_focus_score_norm",
-            item.get(
-                "graph_keyword_score_norm",
-                item.get("dense_score_norm", item.get("retrieval_score", item.get("score_norm", 0.0))),
-            ),
-        )
-        for item in candidate_chunk_hits
-    }
-    root_chunk_hits = select_diverse_root_chunks(
-        query=query_row["query"],
-        candidate_hits=candidate_chunk_hits,
-        chunk_store=chunk_store,
-        chunk_to_nodes=chunk_to_nodes,
-        chunk_to_edges=chunk_to_edges,
-        top_k=root_top_k,
-        query_contract=query_contract,
-        graph=graph,
-        keyword_index=keyword_index,
-    )
-    allowed_doc_ids = None
-    if query_contract == "section-grounded":
-        allowed_doc_ids = _pick_section_doc_ids(root_chunk_hits, chunk_store)
-        if allowed_doc_ids:
-            section_candidate_hits = [
-                item
-                for item in candidate_chunk_hits
-                if chunk_store.get(item["chunk_id"], {}).get("full_doc_id") in allowed_doc_ids
-            ]
-            section_root_hits = select_diverse_root_chunks(
-                query=query_row["query"],
-                candidate_hits=section_candidate_hits,
-                chunk_store=chunk_store,
-                chunk_to_nodes=chunk_to_nodes,
-                chunk_to_edges=chunk_to_edges,
-                top_k=root_top_k,
-                query_contract=query_contract,
-                graph=graph,
-                keyword_index=keyword_index,
-            )
-            if section_root_hits:
-                root_chunk_hits = section_root_hits
-    root_chunk_hits = [_serialize_root_chunk_hit(item) for item in root_chunk_hits]
-    for line in _format_root_chunk_preview(root_chunk_hits, chunk_store):
-        log(f"{prefix}root {line}")
-    # Root chunk scores are reused later as the project's main notion of
-    # evidence grounding when ranking nodes, edges, and semantic expansions.
-    root_chunk_score_lookup = {item["chunk_id"]: item["score_norm"] for item in root_chunk_hits}
-    root_chunk_ids = list(root_chunk_score_lookup)
-    if query_contract == "section-grounded" and not allowed_doc_ids:
-        allowed_doc_ids = _pick_section_doc_ids(root_chunk_hits, chunk_store)
-    root_nodes = set()
-    root_edges = set()
-    for chunk_id in root_chunk_ids:
-        root_nodes.update(chunk_to_nodes.get(chunk_id, set()))
-        root_edges.update(chunk_to_edges.get(chunk_id, set()))
-    budgets = {
-        "association_rounds": cfg["association_rounds"],
-        "path_budget": cfg["path_budget"],
-        "semantic_edge_budget": cfg["semantic_edge_budget"],
-        "semantic_node_budget": cfg["semantic_node_budget"],
-        "semantic_edge_min_score": cfg["semantic_edge_min_score"],
-        "semantic_node_min_score": cfg["semantic_node_min_score"],
-        "group_limit": cfg["group_limit"],
-        "max_source_chunks": cfg["max_source_chunks"],
-        "max_source_word_budget": cfg["max_source_word_budget"],
-    }
-
-    top_root_nodes = score_root_nodes(
-        query=query_row["query"],
-        root_nodes=root_nodes,
-        graph=graph,
-        node_to_chunks=node_to_chunks,
-        root_chunk_score_lookup=root_chunk_score_lookup,
-    )[: cfg["top_root_nodes"]]
-    top_root_edges = score_root_edges(
-        query=query_row["query"],
-        root_edges=root_edges,
-        graph=graph,
-        edge_to_chunks=edge_to_chunks,
-        root_chunk_score_lookup=root_chunk_score_lookup,
-    )[: cfg["top_root_edges"]]
-
-    expansion = expand_associative_graph(
-        query=query_row["query"],
-        query_contract=query_contract,
-        graph=graph,
-        root_nodes=root_nodes,
-        root_edges=root_edges,
-        root_chunk_ids=root_chunk_ids,
-        root_chunk_score_lookup=root_chunk_score_lookup,
-        query_chunk_score_lookup=query_chunk_score_lookup,
-        chunk_to_nodes=chunk_to_nodes,
-        chunk_to_edges=chunk_to_edges,
-        node_to_chunks=node_to_chunks,
-        edge_to_chunks=edge_to_chunks,
-        chunk_neighbors=cfg["chunk_neighbors"],
-        chunk_store=chunk_store,
-        top_root_nodes=cfg["top_root_nodes"],
-        top_root_edges=cfg["top_root_edges"],
-        max_hop=max_hop,
-        path_budget=budgets["path_budget"],
-        semantic_edge_budget=budgets["semantic_edge_budget"],
-        semantic_node_budget=budgets["semantic_node_budget"],
-        association_rounds=budgets["association_rounds"],
-        semantic_edge_min_score=budgets["semantic_edge_min_score"],
-        semantic_node_min_score=budgets["semantic_node_min_score"],
-        allowed_doc_ids=allowed_doc_ids,
-    )
-    effective_root_chunk_ids = expansion.get("effective_root_chunk_ids", root_chunk_ids)
-    promoted_root_chunks = [_serialize_root_chunk_hit(item) for item in expansion.get("promoted_root_chunks", [])]
-    effective_root_chunk_hits = root_chunk_hits + promoted_root_chunks
-    for round_info in expansion["rounds"]:
-        for line in _format_round_preview(round_info):
-            log(f"{prefix}{line}")
-
-    node_roles = build_node_role_sets(
-        root_nodes=root_nodes,
-        structural_nodes=set(expansion["all_structural_nodes"]),
-        semantic_nodes=set(expansion["all_semantic_nodes"]),
-    )
-    edge_roles = build_edge_role_sets(
-        root_edges=root_edges,
-        structural_edges=set(expansion["all_structural_edges"]),
-        semantic_edges=expansion["all_semantic_edges"],
-    )
-    facet_groups, query_contract = build_answer_facet_groups(
-        query=query_row["query"],
-        graph=graph,
-        final_nodes=expansion["final_nodes"],
-        final_edges=expansion["final_edges"],
-        root_chunk_ids=effective_root_chunk_ids,
-        last_structural_output=expansion["last_structural_output"],
-        chunk_neighbors=cfg["chunk_neighbors"],
-        chunk_to_nodes=chunk_to_nodes,
-        chunk_to_edges=chunk_to_edges,
-        node_to_chunks=node_to_chunks,
-        edge_to_chunks=edge_to_chunks,
-        chunk_store=chunk_store,
-        group_limit=budgets["group_limit"],
-        query_contract=query_contract,
-        allowed_doc_ids=allowed_doc_ids,
-    )
-    candidate_points = build_candidate_points_from_groups(facet_groups, top_k=8)
-    theme_selected_chunks = expansion.get("theme_selected_chunks", {})
-    chunk_roles = _build_chunk_roles(
-        effective_root_chunk_hits,
-        promoted_root_chunks,
-        facet_groups,
-        theme_selected_chunks=theme_selected_chunks,
-    )
-    prompt_payload = build_prompt_context(
+    anchor_state = _run_anchor_stage(
         query_row=query_row,
-        query_contract=query_contract,
-        root_chunk_hits=effective_root_chunk_hits,
-        top_root_nodes=top_root_nodes,
-        top_root_edges=top_root_edges,
-        node_roles=node_roles,
-        edge_roles=edge_roles,
-        semantic_nodes=[{"id": node_id} for node_id in expansion["all_semantic_nodes"]],
-        semantic_edges=expansion["all_semantic_edges"],
-        final_nodes=expansion["final_nodes"],
-        final_edges=expansion["final_edges"],
-        facet_groups=facet_groups,
-        candidate_points=candidate_points,
-        chunk_roles=chunk_roles,
-        theme_selected_chunks=theme_selected_chunks,
+        organization_layout=organization_layout,
+        graph=graph,
         chunk_store=chunk_store,
+        chunk_retriever=chunk_retriever,
+        chunk_to_nodes=chunk_to_nodes,
+        chunk_to_edges=chunk_to_edges,
         node_to_chunks=node_to_chunks,
         edge_to_chunks=edge_to_chunks,
-        max_source_chunks=budgets["max_source_chunks"],
-        max_source_word_budget=budgets["max_source_word_budget"],
+        keyword_index=keyword_index,
+        cfg=cfg,
     )
     log(
-        f"{prefix}done roots=({len(root_nodes)}n/{len(root_edges)}e) "
+        f"{prefix}anchor candidates={len(anchor_state['candidate_chunk_hits'])} "
+        f"mode={anchor_state['retrieval_mode_label']} layout={organization_layout} "
+        f"controller={controller_info['mode']}/{controller_info['source']}"
+    )
+    for line in _format_root_chunk_preview(anchor_state["root_chunk_hits"], chunk_store):
+        log(f"{prefix}root {line}")
+    expand_state = _run_expand_stage(
+        query_row=query_row,
+        organization_layout=organization_layout,
+        anchor_state=anchor_state,
+        graph=graph,
+        chunk_to_nodes=chunk_to_nodes,
+        chunk_to_edges=chunk_to_edges,
+        node_to_chunks=node_to_chunks,
+        edge_to_chunks=edge_to_chunks,
+        chunk_store=chunk_store,
+        cfg=cfg,
+    )
+    for round_info in expand_state["expansion"]["rounds"]:
+        for line in _format_round_preview(round_info):
+            log(f"{prefix}{line}")
+    organize_state = _run_organize_stage(
+        query_row=query_row,
+        organization_layout=organization_layout,
+        anchor_state=anchor_state,
+        expand_state=expand_state,
+        graph=graph,
+        chunk_store=chunk_store,
+        chunk_to_nodes=chunk_to_nodes,
+        chunk_to_edges=chunk_to_edges,
+        node_to_chunks=node_to_chunks,
+        edge_to_chunks=edge_to_chunks,
+        cfg=cfg,
+    )
+    expansion = expand_state["expansion"]
+    prompt_payload = organize_state["prompt_payload"]
+    log(
+        f"{prefix}done roots=({len(anchor_state['root_nodes'])}n/{len(anchor_state['root_edges'])}e) "
         f"final=({len(expansion['final_nodes'])}n/{len(expansion['final_edges'])}e) "
-        f"groups={len(facet_groups)} sources={prompt_payload['selected_source_chunk_count']} "
+        f"groups={len(organize_state['facet_groups'])} sources={prompt_payload['selected_source_chunk_count']} "
         f"words={prompt_payload['selected_source_word_count']}"
     )
+    effective_root_chunk_hits = expand_state["effective_root_chunk_hits"]
     primary_root_chunks = [item for item in effective_root_chunk_hits if item.get("root_role") == "primary"]
     diversity_root_chunks = [item for item in effective_root_chunk_hits if item.get("root_role") == "diversity"]
     root_basin_count = len({tuple(item.get("basin_key", (item["chunk_id"],))) for item in effective_root_chunk_hits})
-    initial_root_basin_count = len({tuple(item.get("basin_key", (item["chunk_id"],))) for item in root_chunk_hits})
+    initial_root_basin_count = len({tuple(item.get("basin_key", (item["chunk_id"],))) for item in anchor_state["root_chunk_hits"]})
     return {
         **query_row,
-        "candidate_root_chunks": candidate_chunk_hits,
+        "candidate_root_chunks": anchor_state["candidate_chunk_hits"],
         "root_chunks": effective_root_chunk_hits,
         "primary_root_chunks": primary_root_chunks,
         "diversity_root_chunks": diversity_root_chunks,
-        "promoted_root_chunks": promoted_root_chunks,
-        "theme_selected_chunks": theme_selected_chunks,
-        "chunk_roles": chunk_roles,
-        "query_contract": query_contract,
+        "promoted_root_chunks": expand_state["promoted_root_chunks"],
+        "theme_selected_chunks": organize_state["theme_selected_chunks"],
+        "chunk_roles": organize_state["chunk_roles"],
+        "query_contract": organize_state["organization_layout"],
+        "organization_layout": organize_state["organization_layout"],
+        "organization_controller": controller_info,
         "stats": {
-            "initial_root_chunk_count": len(root_chunk_hits),
-            "promoted_root_chunk_count": len(promoted_root_chunks),
+            "initial_root_chunk_count": len(anchor_state["root_chunk_hits"]),
+            "promoted_root_chunk_count": len(expand_state["promoted_root_chunks"]),
             "root_chunk_count": len(effective_root_chunk_hits),
             "primary_root_chunk_count": len(primary_root_chunks),
             "diversity_root_chunk_count": len(diversity_root_chunks),
             "initial_root_basin_count": initial_root_basin_count,
             "root_basin_count": root_basin_count,
-            "contract_root_top_k": root_top_k,
-            "contract_max_hop": max_hop,
-            "root_node_count": len(root_nodes),
-            "root_edge_count": len(root_edges),
-            "top_root_node_count": len(top_root_nodes),
-            "top_root_edge_count": len(top_root_edges),
+            "anchor_root_top_k": anchor_state["root_top_k"],
+            "expand_max_hop": anchor_state["max_hop"],
+            "root_node_count": len(anchor_state["root_nodes"]),
+            "root_edge_count": len(anchor_state["root_edges"]),
+            "top_root_node_count": len(anchor_state["top_root_nodes"]),
+            "top_root_edge_count": len(anchor_state["top_root_edges"]),
             "association_round_count": len(expansion["rounds"]),
             "structural_path_count": sum(item["structural_path_count"] for item in expansion["rounds"]),
             "structural_chunk_bridge_count": sum(
@@ -513,23 +600,23 @@ def run_query(
             ),
             "final_node_count": len(expansion["final_nodes"]),
             "final_edge_count": len(expansion["final_edges"]),
-            "facet_group_count": len(facet_groups),
-            "knowledge_group_count": len(facet_groups),
-            "candidate_point_count": len(candidate_points),
+            "facet_group_count": len(organize_state["facet_groups"]),
+            "knowledge_group_count": len(organize_state["facet_groups"]),
+            "candidate_point_count": len(organize_state["candidate_points"]),
             "selected_source_chunk_count": prompt_payload["selected_source_chunk_count"],
             "selected_source_word_count": prompt_payload["selected_source_word_count"],
         },
-        "top_root_nodes": top_root_nodes,
-        "top_root_edges": top_root_edges,
+        "top_root_nodes": anchor_state["top_root_nodes"],
+        "top_root_edges": anchor_state["top_root_edges"],
         "rounds": expansion["rounds"],
         "structural_association": expansion["last_structural_output"],
         "semantic_association": {
             "selected_edges": expansion["all_semantic_edges"],
             "selected_nodes": [{"id": node_id} for node_id in expansion["all_semantic_nodes"]],
         },
-        "candidate_points": candidate_points,
-        "facet_groups": facet_groups,
-        "knowledge_groups": facet_groups,
+        "candidate_points": organize_state["candidate_points"],
+        "facet_groups": organize_state["facet_groups"],
+        "knowledge_groups": organize_state["facet_groups"],
         "prompt_context": prompt_payload["context"],
     }
 

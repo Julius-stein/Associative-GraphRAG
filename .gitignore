@@ -27,7 +27,6 @@ venv/
 # Generated experiment outputs / drafts
 result/
 associative_rag_project/result/
-associative_rag_project/runs/
 associative_rag_project/runs*/
 associative_rag_project/tmp*/
 associative_rag_project/tmp_*
@@ -54,3 +53,4 @@ lightrag-dev/
 
 # Misc local files
 book.txt
+notes/

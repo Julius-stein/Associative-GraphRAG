@@ -117,7 +117,7 @@ For a corpus named `art`, the pipeline typically writes:
 
 - Project guide: [associative_rag_project/README.md](/Users/Admin/projects/Association/associative_rag_project/README.md)
 - Detailed Chinese technical report: [associative_rag_project/TECHNICAL_REPORT_CN.md](/Users/Admin/projects/Association/associative_rag_project/TECHNICAL_REPORT_CN.md)
-- Organization design memo: [associative_rag_project/ORGANIZATION_RESEARCH_MEMO_CN.md](/Users/Admin/projects/Association/associative_rag_project/ORGANIZATION_RESEARCH_MEMO_CN.md)
+- Chinese method draft: [associative_rag_project/METHOD_DRAFT_CN.md](/Users/Admin/projects/Association/associative_rag_project/METHOD_DRAFT_CN.md)
 
 ## Current Positioning
 

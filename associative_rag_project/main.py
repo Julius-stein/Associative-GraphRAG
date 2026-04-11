@@ -64,6 +64,12 @@ def build_parser():
     common.add_argument("--group-limit", type=int, default=8)
     common.add_argument("--max-source-chunks", type=int, default=14)
     common.add_argument("--max-source-word-budget", type=int, default=4500)
+    common.add_argument(
+        "--organization-controller",
+        choices=["off", "predicted", "oracle"],
+        default="predicted",
+        help="Lightweight organization controller: off uses a fixed theme layout, predicted uses heuristics, oracle reads layout from query metadata.",
+    )
     common.add_argument("--max-workers", type=int, default=12)
 
     subparsers.add_parser("retrieve", parents=[common])
@@ -121,6 +127,7 @@ def retrieval_config_from_args(args):
         "group_limit": args.group_limit,
         "max_source_chunks": args.max_source_chunks,
         "max_source_word_budget": args.max_source_word_budget,
+        "organization_controller": args.organization_controller,
     }
 
 

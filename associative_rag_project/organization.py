@@ -1,12 +1,12 @@
-"""Query-contract-driven organization over the final evidence subgraph.
+"""Evidence organization over the final evidence subgraph.
 
-Organization is the second stage after association:
+The current system uses a unified anchor/expand backbone and a lightweight
+organization controller:
 
-- association expands toward high-recall evidence
-- organization chooses one organization contract for the query and packages
-  the final evidence graph accordingly
+- anchor/expand builds a high-recall final evidence graph
+- organization chooses a layout for packaging that graph into answer facets
 
-Supported contracts:
+Supported layouts:
 - section-grounded
 - mechanism-grounded
 - comparison-grounded
@@ -29,6 +29,48 @@ QUERY_CONTRACTS = [
     "comparison-grounded",
     "theme-grounded",
 ]
+
+
+def _normalize_layout_label(raw_value: str | None) -> str | None:
+    value = normalize_text(raw_value or "").strip()
+    if value in QUERY_CONTRACTS:
+        return value
+    if "section" in value:
+        return "section-grounded"
+    if "mechan" in value or "process" in value or "cause" in value:
+        return "mechanism-grounded"
+    if "compar" in value or "contrast" in value:
+        return "comparison-grounded"
+    if "theme" in value or "aspect" in value or "overview" in value:
+        return "theme-grounded"
+    return None
+
+
+def resolve_organization_layout(query_row, controller="predicted", default_layout="theme-grounded"):
+    """Resolve the organization layout with a lightweight controller.
+
+    Modes:
+    - `off`: always use `default_layout`
+    - `predicted`: use heuristic detection from the query text
+    - `oracle`: read layout metadata from the query row
+    """
+    controller = (controller or "predicted").strip().lower()
+    if controller == "off":
+        layout = _normalize_layout_label(default_layout) or "theme-grounded"
+        return layout, {"mode": "off", "source": "default"}
+
+    if controller == "oracle":
+        for key in ("organization_contract", "query_contract", "contract", "layout"):
+            layout = _normalize_layout_label(query_row.get(key))
+            if layout:
+                return layout, {"mode": "oracle", "source": key}
+        raise ValueError(
+            "organization controller is set to oracle, but the query row has no valid "
+            "`organization_contract` / `query_contract` / `contract` / `layout` field"
+        )
+
+    layout = detect_query_contract(query_row["query"])
+    return layout, {"mode": "predicted", "source": "heuristic"}
 
 
 ASPECT_GROUPING_SYSTEM_PROMPT = """You plan query-facing evidence groups.
@@ -1274,7 +1316,7 @@ def _contains_any(text, items):
     return any(item in text for item in items)
 
 
-def _theme_slot_specs(query):
+def _aspect_layout_specs(query, group_limit=5):
     query_lower = " ".join(query.lower().split())
     slots = []
     seen = set()
@@ -1367,7 +1409,7 @@ def _theme_slot_specs(query):
             "Representative examples and cases",
             ("examples", "cases", "instances", "themes"),
         )
-    return slots[:5]
+    return slots[: max(3, min(group_limit, 5))]
 
 
 def _region_slot_affinity(query, slot, region):
@@ -1450,7 +1492,7 @@ def _build_theme_groups(query, root_regions, bridge_regions, theme_regions, chun
     if not candidate_regions:
         return _build_theme_groups_legacy(query, root_regions, bridge_regions, theme_regions, chunk_store, group_limit)
 
-    slots = _theme_slot_specs(query)
+    slots = _aspect_layout_specs(query, group_limit=group_limit)
     used_region_ids = set()
     candidates = []
     for index, slot in enumerate(slots, start=1):
@@ -1932,3 +1974,8 @@ def build_answer_facet_groups(
     for group in groups:
         group["query_contract"] = contract
     return groups, contract
+
+
+def build_layout_groups(**kwargs):
+    """Thin wrapper that exposes the organization stage in layout terms."""
+    return build_answer_facet_groups(**kwargs)

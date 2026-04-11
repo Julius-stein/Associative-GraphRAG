@@ -86,6 +86,27 @@ def load_query_rows(
         return rows
     if questions_file is None:
         raise ValueError("Either rewrites_file or questions_file must be provided")
+    if questions_file.suffix.lower() == ".json":
+        payload = json.loads(questions_file.read_text(encoding="utf-8"))
+        if isinstance(payload, list) and payload and all(isinstance(item, dict) for item in payload):
+            rows = []
+            selected_items = payload if limit_groups is None else payload[:limit_groups]
+            for index, item in enumerate(selected_items, start=1):
+                query = str(item.get("query", "")).strip()
+                if not query:
+                    continue
+                row = {
+                    "group_id": item.get("group_id", f"q{index:03d}"),
+                    "variant_id": item.get("variant_id", "base"),
+                    "query": query,
+                    "base_query": item.get("base_query", query),
+                }
+                for key in ("query_contract", "organization_contract", "contract", "layout"):
+                    if item.get(key):
+                        row[key] = item[key]
+                rows.append(row)
+            if rows:
+                return rows
     questions = extract_questions(questions_file)
     if limit_groups is not None:
         questions = questions[:limit_groups]

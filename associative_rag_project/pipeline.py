@@ -114,7 +114,7 @@ def _build_chunk_roles(root_chunk_hits, promoted_root_chunks, facet_groups, them
             "core": "query-root",
             "bridge": "bridge-chunk",
             "support": "support-chunk",
-            "peripheral": "peripheral-chunk",
+            "context": "context-chunk",
         }
         for bucket, chunk_ids in theme_selected_chunks.items():
             role = role_aliases.get(bucket, bucket)
@@ -163,10 +163,11 @@ def _format_round_preview(round_info):
         )
     for chunk_item in round_info.get("structural_chunk_preview", []):
         lines.append(
-            f"  structural-chunk: bridge={float(chunk_item.get('bridge_gain', chunk_item.get('selection_score', 0.0))):.3f} "
+            f"  structural-chunk: intro_qrel={chunk_item.get('introduced_query_rel', 0.0):.3f} "
             f"touch={chunk_item.get('frontier_touch', 0)} "
-            f"new_sources={chunk_item.get('new_source_count', 0)} "
-            f"qrel={chunk_item.get('introduced_query_rel', 0.0):.3f} {chunk_item['chunk_id']}"
+            f"nodes={chunk_item.get('introduced_node_count', len(chunk_item.get('introduced_node_ids', [])))} "
+            f"edges={chunk_item.get('introduced_edge_count', len(chunk_item.get('introduced_edge_ids', [])))} "
+            f"{chunk_item['chunk_id']}"
         )
     for edge_item in round_info.get("semantic_edge_preview", []):
         lines.append(
@@ -179,9 +180,10 @@ def _format_round_preview(round_info):
         )
     for chunk_item in round_info.get("semantic_chunk_preview", []):
         lines.append(
-            f"  coverage-chunk: nodes={chunk_item.get('new_node_count', len(chunk_item.get('node_ids', [])))} "
-            f"edges={chunk_item.get('new_edge_count', len(chunk_item.get('edge_ids', [])))} "
-            f"new_sources={chunk_item.get('new_source_count', 0)} {chunk_item['chunk_id']}"
+            f"  coverage-chunk: rels={chunk_item.get('introduced_relation_count', 0)} "
+            f"nodes={chunk_item.get('introduced_node_count', len(chunk_item.get('node_ids', [])))} "
+            f"edges={chunk_item.get('introduced_edge_count', len(chunk_item.get('edge_ids', [])))} "
+            f"{chunk_item['chunk_id']}"
         )
     return lines
 
@@ -420,6 +422,7 @@ def _run_organize_stage(
         final_nodes=expansion["final_nodes"],
         final_edges=expansion["final_edges"],
         root_chunk_ids=expand_state["effective_root_chunk_ids"],
+        root_traces=expansion.get("root_traces", []),
         last_structural_output=expansion["last_structural_output"],
         chunk_neighbors=cfg["chunk_neighbors"],
         chunk_to_nodes=chunk_to_nodes,

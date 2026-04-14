@@ -13,7 +13,7 @@ from .data import (
     resolve_baseline_file,
     resolve_questions_file,
 )
-from .judge import run_winrate_judgement
+from .judge import render_winrate_markdown_table, run_winrate_judgement
 from .llm_client import OpenAICompatibleClient, generate_answers
 from .logging_utils import log
 from .pipeline import retrieve_corpus_queries
@@ -82,8 +82,11 @@ def build_parser():
     judge = subparsers.add_parser("judge")
     judge.add_argument("--questions-file", required=True)
     judge.add_argument("--candidate-file", required=True)
-    judge.add_argument("--baseline-file", required=True)
+    judge.add_argument("--baseline-file")
+    judge.add_argument("--baseline-dir")
     judge.add_argument("--output-file")
+    judge.add_argument("--summary-file")
+    judge.add_argument("--candidate-label")
     judge.add_argument("--limit", type=int)
     judge.add_argument("--max-workers", type=int, default=12)
 
@@ -163,34 +166,102 @@ def command_answer(args):
 
 def command_judge(args):
     """Compare candidate answers against a baseline with the FG-RAG-style judge."""
-    log(f"[main] judge candidate={args.candidate_file} baseline={args.baseline_file}")
     candidate_answers = json.loads(Path(args.candidate_file).read_text(encoding="utf-8"))
-    baseline_answers = load_baseline_answers(Path(args.baseline_file))
     questions = extract_questions(Path(args.questions_file))
-    aligned_total = min(len(questions), len(candidate_answers), len(baseline_answers))
-    if len({len(questions), len(candidate_answers), len(baseline_answers)}) != 1:
-        log(
-            "[main] judge length mismatch "
-            f"questions={len(questions)} candidate={len(candidate_answers)} baseline={len(baseline_answers)}; "
-            f"auto-aligning to first {aligned_total}"
-        )
-    if args.limit is not None:
-        aligned_total = min(aligned_total, args.limit)
-    questions = questions[:aligned_total]
-    candidate_answers = candidate_answers[:aligned_total]
-    baseline_answers = baseline_answers[:aligned_total]
     llm_client = OpenAICompatibleClient(load_judge_config())
-    output_path = Path(args.output_file) if args.output_file else Path(args.candidate_file).with_name(Path(args.candidate_file).stem + "_vs_baseline_winrate.json")
-    payload = run_winrate_judgement(
-        questions,
-        candidate_answers,
-        baseline_answers,
-        llm_client,
-        output_path=output_path,
-        max_workers=args.max_workers,
+    candidate_label = args.candidate_label or Path(args.candidate_file).stem
+
+    if bool(args.baseline_file) == bool(args.baseline_dir):
+        raise ValueError("Please provide exactly one of --baseline-file or --baseline-dir")
+
+    def _align_inputs(baseline_answers):
+        aligned_total = min(len(questions), len(candidate_answers), len(baseline_answers))
+        if len({len(questions), len(candidate_answers), len(baseline_answers)}) != 1:
+            log(
+                "[main] judge length mismatch "
+                f"questions={len(questions)} candidate={len(candidate_answers)} baseline={len(baseline_answers)}; "
+                f"auto-aligning to first {aligned_total}"
+            )
+        if args.limit is not None:
+            aligned_total = min(aligned_total, args.limit)
+        return (
+            questions[:aligned_total],
+            candidate_answers[:aligned_total],
+            baseline_answers[:aligned_total],
+        )
+
+    if args.baseline_file:
+        log(f"[main] judge candidate={args.candidate_file} baseline={args.baseline_file}")
+        baseline_answers = load_baseline_answers(Path(args.baseline_file))
+        aligned_questions, aligned_candidates, aligned_baselines = _align_inputs(baseline_answers)
+        output_path = (
+            Path(args.output_file)
+            if args.output_file
+            else Path(args.candidate_file).with_name(Path(args.candidate_file).stem + "_vs_baseline_winrate.json")
+        )
+        payload = run_winrate_judgement(
+            aligned_questions,
+            aligned_candidates,
+            aligned_baselines,
+            llm_client,
+            output_path=output_path,
+            max_workers=args.max_workers,
+        )
+        print(output_path)
+        print(json.dumps(payload["summary"], ensure_ascii=False, indent=2))
+        return
+
+    baseline_dir = Path(args.baseline_dir)
+    baseline_files = sorted(path for path in baseline_dir.glob("*.json") if path.is_file())
+    if not baseline_files:
+        raise ValueError(f"No baseline json files found under: {baseline_dir}")
+    output_dir = Path(args.output_file).parent if args.output_file else Path(args.candidate_file).parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+    summary_file = (
+        Path(args.summary_file)
+        if args.summary_file
+        else output_dir / f"{Path(args.candidate_file).stem}_baseline_winrate_tables.md"
     )
-    print(output_path)
-    print(json.dumps(payload["summary"], ensure_ascii=False, indent=2))
+    per_baseline_payloads = []
+    markdown_sections = ["# Baseline Winrate Tables", ""]
+    for baseline_file in baseline_files:
+        log(f"[main] judge candidate={args.candidate_file} baseline={baseline_file}")
+        baseline_answers = load_baseline_answers(baseline_file)
+        aligned_questions, aligned_candidates, aligned_baselines = _align_inputs(baseline_answers)
+        baseline_name = baseline_file.stem
+        output_path = output_dir / f"{Path(args.candidate_file).stem}_vs_{baseline_name}_winrate.json"
+        payload = run_winrate_judgement(
+            aligned_questions,
+            aligned_candidates,
+            aligned_baselines,
+            llm_client,
+            output_path=output_path,
+            max_workers=args.max_workers,
+        )
+        per_baseline_payloads.append(
+            {
+                "baseline_name": baseline_name,
+                "baseline_file": str(baseline_file),
+                "output_file": str(output_path),
+                "summary": payload["summary"],
+            }
+        )
+        markdown_sections.append(
+            render_winrate_markdown_table(
+                payload,
+                candidate_label=candidate_label,
+                baseline_label=baseline_name,
+                title=baseline_name,
+            )
+        )
+        markdown_sections.append("")
+
+    summary_file.write_text("\n".join(markdown_sections), encoding="utf-8")
+    manifest_path = summary_file.with_suffix(".json")
+    manifest_path.write_text(json.dumps(per_baseline_payloads, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(summary_file)
+    print(manifest_path)
+    print(json.dumps({"baselines": len(per_baseline_payloads)}, ensure_ascii=False, indent=2))
 
 
 def command_run(args):

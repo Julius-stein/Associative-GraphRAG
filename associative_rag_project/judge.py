@@ -150,6 +150,17 @@ CRITERIA_KEYS = [
     "Overall Winner",
 ]
 
+WINRATE_TABLE_METRICS = [
+    "Overall Winner",
+    "Comprehensiveness",
+    "Diversity",
+    "Empowerment",
+    "Focus Match",
+    "Evidence Anchoring",
+    "Scope Discipline",
+    "Scenario Fidelity",
+]
+
 NON_OVERALL_CRITERIA_KEYS = [key for key in CRITERIA_KEYS if key != "Overall Winner"]
 
 ORGANIZATION_LABELS = {
@@ -521,3 +532,48 @@ def run_winrate_judgement(questions, candidate_answers, baseline_answers, llm_cl
         output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         log(f"[judge] wrote {output_path}")
     return payload
+
+
+def build_winrate_table_rows(payload):
+    """Normalize overall + per-criterion win rates into row objects for table rendering."""
+    rows = []
+    overall = payload.get("summary", {})
+    rows.append(
+        {
+            "metric": "Overall Winner",
+            "candidate_win_rate": overall.get("candidate_win_rate", 0.0),
+            "baseline_win_rate": overall.get("baseline_win_rate", 0.0),
+            "tie_rate": round(overall.get("ties", 0) / max(overall.get("total", 1), 1), 4),
+            "total_votes": overall.get("total", 0),
+        }
+    )
+    criteria_summary = payload.get("criteria_summary", {})
+    for metric_name in WINRATE_TABLE_METRICS[1:]:
+        metric = criteria_summary.get(metric_name, {})
+        rows.append(
+            {
+                "metric": metric_name,
+                "candidate_win_rate": metric.get("candidate_probability", 0.0),
+                "baseline_win_rate": metric.get("baseline_probability", 0.0),
+                "tie_rate": metric.get("tie_probability", 0.0),
+                "total_votes": metric.get("total_votes", 0),
+            }
+        )
+    return rows
+
+
+def render_winrate_markdown_table(payload, candidate_label, baseline_label, title=None):
+    """Render a compact Markdown win-rate table for one baseline comparison."""
+    rows = build_winrate_table_rows(payload)
+    lines = []
+    if title:
+        lines.append(f"## {title}")
+        lines.append("")
+    lines.append(f"| Metric | {candidate_label} | {baseline_label} | Tie | Total |")
+    lines.append("| --- | ---: | ---: | ---: | ---: |")
+    for row in rows:
+        lines.append(
+            f"| {row['metric']} | {row['candidate_win_rate']:.4f} | "
+            f"{row['baseline_win_rate']:.4f} | {row['tie_rate']:.4f} | {row['total_votes']} |"
+        )
+    return "\n".join(lines)

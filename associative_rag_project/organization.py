@@ -19,7 +19,9 @@ import json
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 
-from .common import edge_key, lexical_overlap_score, normalize_text
+import networkx as nx
+
+from .common import STOPWORDS, edge_key, lexical_overlap_score, normalize_text, tokenize
 from .retrieval import normalize_relation_category
 
 
@@ -1899,6 +1901,413 @@ def regroup_facet_groups_with_llm(query, facet_groups, query_contract, llm_clien
         return facet_groups
 
 
+def _group_overlap_ratio(left, right):
+    left = set(left)
+    right = set(right)
+    if not left or not right:
+        return 0.0
+    return len(left & right) / max(len(left | right), 1)
+
+
+def _trace_local_graph(
+    trace,
+    graph,
+    final_nodes,
+    final_edges,
+    chunk_to_nodes,
+    chunk_to_edges,
+):
+    final_node_set = set(final_nodes)
+    final_edge_set = set(final_edges)
+    node_ids = set()
+    edge_ids = set()
+    for chunk_id in trace.get("selected_chunk_ids", []):
+        node_ids.update(chunk_to_nodes.get(chunk_id, set()) & final_node_set)
+        edge_ids.update(edge_id for edge_id in chunk_to_edges.get(chunk_id, set()) if edge_id in final_edge_set)
+    local_graph = nx.Graph()
+    local_graph.add_nodes_from(sorted(node_ids))
+    local_graph.add_edges_from(sorted(edge_ids))
+    return local_graph, node_ids, edge_ids
+
+
+def _node_query_rel(query, node_id, graph):
+    node_data = graph.nodes.get(node_id) if graph is not None else {}
+    node_text = " ".join(
+        [
+            normalize_text(str(node_id)),
+            normalize_text((node_data or {}).get("entity_type", "")),
+            normalize_text((node_data or {}).get("description", "")),
+        ]
+    ).strip()
+    return lexical_overlap_score(query, node_text)
+
+
+def _query_content_terms(query):
+    return [
+        token
+        for token in tokenize(normalize_text(query))
+        if len(token) >= 3 and token not in STOPWORDS
+    ]
+
+
+def _clean_label_text(text):
+    return normalize_text(str(text)).strip().strip("\"' ")
+
+
+def _group_query_terms(query, focus_entities, relation_themes, supporting_chunk_ids, chunk_store, limit=3):
+    query_terms = _query_content_terms(query)
+    if not query_terms:
+        return []
+    support_text = " ".join(
+        [_clean_label_text(item) for item in focus_entities]
+        + [_clean_label_text(item) for item in relation_themes]
+        + [
+            normalize_text(chunk_store.get(chunk_id, {}).get("content", ""))[:240]
+            for chunk_id in supporting_chunk_ids[:3]
+        ]
+    )
+    return [term for term in query_terms if term in support_text][:limit]
+
+
+def _trace_seed_nodes(query, trace, final_node_set, chunk_to_nodes, graph):
+    root_nodes = set(chunk_to_nodes.get(trace["root_chunk_id"], set())) & set(final_node_set)
+    bridge_nodes = set()
+    for chunk_id in trace.get("bridge_chunk_ids", []):
+        bridge_nodes.update(chunk_to_nodes.get(chunk_id, set()))
+    bridge_nodes &= set(final_node_set)
+    seed_nodes = {
+        node_id
+        for node_id in (root_nodes | bridge_nodes)
+        if _node_query_rel(query, node_id, graph) > 0
+    }
+    return sorted(seed_nodes)
+
+
+def _ppr_subgraph_nodes(local_graph, seed_nodes):
+    if not seed_nodes:
+        return set()
+    if local_graph.number_of_edges() <= 0:
+        return set(seed_nodes)
+    nodes = list(local_graph.nodes())
+    personalization = {
+        node_id: (1.0 / len(seed_nodes) if node_id in seed_nodes else 0.0)
+        for node_id in nodes
+    }
+    try:
+        scores = nx.pagerank(
+            local_graph,
+            alpha=0.85,
+            personalization=personalization,
+            dangling=personalization,
+            max_iter=100,
+            tol=1.0e-6,
+        )
+    except Exception:
+        # Fallback keeps the pipeline runnable if the fast backend is unavailable.
+        scores = dict(personalization)
+        alpha = 0.85
+        for _ in range(40):
+            next_scores = {node_id: (1.0 - alpha) * personalization[node_id] for node_id in nodes}
+            dangling_mass = 0.0
+            for node_id in nodes:
+                degree = local_graph.degree(node_id)
+                if degree <= 0:
+                    dangling_mass += alpha * scores[node_id]
+                    continue
+                share = alpha * scores[node_id] / degree
+                for neighbor_id in local_graph.neighbors(node_id):
+                    next_scores[neighbor_id] += share
+            if dangling_mass > 0:
+                for node_id in nodes:
+                    next_scores[node_id] += dangling_mass * personalization[node_id]
+            delta = sum(abs(next_scores[node_id] - scores[node_id]) for node_id in nodes)
+            scores = next_scores
+            if delta < 1e-8:
+                break
+    ranked_nodes = [
+        node_id
+        for node_id, _ in sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+    ]
+    prefix_size = max(len(seed_nodes) * 4, 12)
+    prefix_size = min(prefix_size, max(24, min(len(ranked_nodes), 48)))
+    chosen_subgraph = local_graph.subgraph(ranked_nodes[:prefix_size]).copy()
+    if chosen_subgraph.number_of_nodes() <= 0:
+        return set(seed_nodes)
+    if chosen_subgraph.number_of_edges() <= 0:
+        return set(chosen_subgraph.nodes())
+    largest_component = max(nx.connected_components(chosen_subgraph), key=len)
+    return set(largest_component)
+
+
+def _group_chunks_for_trace_subgraph(trace, chosen_nodes, chosen_edges, chunk_to_nodes, chunk_to_edges):
+    chosen_nodes = set(chosen_nodes)
+    chosen_edges = set(chosen_edges)
+    supporting_chunk_ids = []
+    for chunk_id in trace.get("selected_chunk_ids", []):
+        chunk_nodes = set(chunk_to_nodes.get(chunk_id, set()))
+        chunk_edges = set(chunk_to_edges.get(chunk_id, set()))
+        if chunk_nodes & chosen_nodes or chunk_edges & chosen_edges:
+            supporting_chunk_ids.append(chunk_id)
+    return supporting_chunk_ids
+
+
+def _trace_group_label(query_contract, group_index, label_terms, focus_entities, relation_themes, doc_ids, anchor_chunk_ids, chunk_store):
+    focus_entities = [_clean_label_text(item) for item in focus_entities if _clean_label_text(item)]
+    relation_themes = [
+        _clean_label_text(item)
+        for item in relation_themes
+        if _clean_label_text(item) and _clean_label_text(item) not in {"unknown relation", "unknown_relation"}
+    ]
+    if query_contract == "section-grounded":
+        if doc_ids:
+            orders = [
+                chunk_store.get(chunk_id, {}).get("chunk_order_index")
+                for chunk_id in anchor_chunk_ids
+                if chunk_store.get(chunk_id, {}).get("chunk_order_index") is not None
+            ]
+            if orders:
+                return f"section band {doc_ids[0][-6:]}:{min(orders)}-{max(orders)}"
+            return f"section band {doc_ids[0][-6:]}"
+        return f"section band {group_index}"
+    if query_contract == "mechanism-grounded":
+        if label_terms:
+            return f"pathway: {' / '.join(label_terms[:2])}"
+        if relation_themes:
+            return f"pathway: {relation_themes[0]}"
+        if focus_entities:
+            return f"pathway: {focus_entities[0]}"
+        return f"pathway {group_index}"
+    if query_contract == "comparison-grounded":
+        if label_terms:
+            return f"comparison side {group_index}: {' / '.join(label_terms[:2])}"
+        if focus_entities:
+            return f"comparison side {group_index}: {focus_entities[0]}"
+        if relation_themes:
+            return f"comparison side {group_index}: {relation_themes[0]}"
+        return f"comparison side {group_index}"
+    if label_terms:
+        return " / ".join(label_terms[:2])
+    if focus_entities and relation_themes:
+        return f"{focus_entities[0]} via {relation_themes[0]}"
+    if focus_entities:
+        return focus_entities[0]
+    if relation_themes:
+        return relation_themes[0]
+    return f"aspect {group_index}"
+
+
+def _build_trace_group(
+    *,
+    query,
+    query_contract,
+    group_index,
+    trace,
+    graph,
+    final_nodes,
+    final_edges,
+    chunk_to_nodes,
+    chunk_to_edges,
+    chunk_store,
+):
+    local_graph, trace_nodes, trace_edges = _trace_local_graph(
+        trace,
+        graph,
+        final_nodes,
+        final_edges,
+        chunk_to_nodes,
+        chunk_to_edges,
+    )
+    if local_graph.number_of_nodes() <= 0:
+        return None
+    seed_nodes = _trace_seed_nodes(
+        query,
+        trace,
+        trace_nodes,
+        chunk_to_nodes,
+        graph,
+    )
+    if not seed_nodes:
+        return None
+    chosen_nodes = _ppr_subgraph_nodes(local_graph, seed_nodes)
+    if not chosen_nodes:
+        return None
+    chosen_edges = {
+        edge_key(left, right)
+        for left, right in local_graph.edges()
+        if left in chosen_nodes and right in chosen_nodes
+    }
+    supporting_chunk_ids = _group_chunks_for_trace_subgraph(
+        trace,
+        chosen_nodes,
+        chosen_edges,
+        chunk_to_nodes,
+        chunk_to_edges,
+    )
+    if not supporting_chunk_ids:
+        return None
+
+    root_chunk_id = trace["root_chunk_id"]
+    bridge_chunk_ids = [chunk_id for chunk_id in trace.get("bridge_chunk_ids", []) if chunk_id in supporting_chunk_ids]
+    support_chunk_ids = [chunk_id for chunk_id in trace.get("support_chunk_ids", []) if chunk_id in supporting_chunk_ids]
+    context_chunk_ids = [chunk_id for chunk_id in trace.get("context_chunk_ids", []) if chunk_id in supporting_chunk_ids]
+    anchor_chunk_ids = [root_chunk_id]
+    relation_themes = _relation_themes(sorted(chosen_edges), graph) if graph is not None else []
+    focus_entities = _focus_entities(query, sorted(chosen_nodes), graph) if graph is not None else sorted(chosen_nodes)[:6]
+    label_terms = _group_query_terms(
+        query,
+        focus_entities,
+        relation_themes,
+        supporting_chunk_ids,
+        chunk_store,
+    )
+    doc_ids = _doc_ids(supporting_chunk_ids, chunk_store)
+    label = _trace_group_label(
+        query_contract,
+        group_index,
+        label_terms,
+        focus_entities,
+        relation_themes,
+        doc_ids,
+        anchor_chunk_ids,
+        chunk_store,
+    )
+    descriptor_text = _evidence_descriptor_text(
+        label,
+        relation_themes,
+        focus_entities,
+        anchor_chunk_ids,
+        chunk_store,
+    )
+    growth_traces = [
+        f"root={root_chunk_id}",
+        f"bridge={len(bridge_chunk_ids)}",
+        f"support={len(support_chunk_ids)}",
+        f"context={len(context_chunk_ids)}",
+    ]
+    return {
+        "group_id": f"kg-{group_index:02d}",
+        "facet_label": label,
+        "primary_theme": relation_themes[0] if relation_themes else (focus_entities[0] if focus_entities else label),
+        "organization_contract": query_contract,
+        "query_contract": query_contract,
+        "facet_prompt": _facet_prompt(query, query_contract, label),
+        "group_score": round(lexical_overlap_score(query, descriptor_text), 6),
+        "query_rel": round(lexical_overlap_score(query, descriptor_text), 6),
+        "anchor_support": len(anchor_chunk_ids),
+        "root_anchor_count": 1,
+        "node_count": len(chosen_nodes),
+        "edge_count": len(chosen_edges),
+        "region_count": 1,
+        "unique_doc_count": len(doc_ids),
+        "unique_root_count": 1,
+        "root_chunk_ids": [root_chunk_id],
+        "doc_ids": doc_ids,
+        "region_kinds": [
+            kind
+            for kind, chunk_ids in (
+                ("root", [root_chunk_id]),
+                ("bridge", bridge_chunk_ids),
+                ("support", support_chunk_ids),
+                ("context", context_chunk_ids),
+            )
+            if chunk_ids
+        ],
+        "region_kind_counts": {
+            "root": 1,
+            "bridge": len(bridge_chunk_ids),
+            "support": len(support_chunk_ids),
+            "context": len(context_chunk_ids),
+        },
+        "root_region_count": 1,
+        "bridge_region_count": len(bridge_chunk_ids),
+        "theme_region_count": 0,
+        "section_region_count": 0,
+        "relation_themes": relation_themes,
+        "focus_entities": focus_entities,
+        "supporting_chunk_ids": supporting_chunk_ids,
+        "anchor_chunk_ids": anchor_chunk_ids,
+        "source_previews": [
+            {
+                "chunk_id": chunk_id,
+                "preview": normalize_text(chunk_store.get(chunk_id, {}).get("content", ""))[:220],
+            }
+            for chunk_id in supporting_chunk_ids[:3]
+        ],
+        "growth_traces": growth_traces,
+        "group_summary": (
+            f"This {query_contract} evidence group is anchored by {root_chunk_id} "
+            f"and keeps {len(bridge_chunk_ids)} bridge, {len(support_chunk_ids)} evidence, "
+            f"and {len(context_chunk_ids)} context chunks inside one PPR-local subgraph."
+        ),
+        "nodes": sorted(chosen_nodes),
+        "edges": sorted(chosen_edges),
+        "focus_items": list(dict.fromkeys(focus_entities[:4] + relation_themes[:3]))[:6],
+    }
+
+
+def _build_trace_groups(
+    *,
+    query,
+    query_contract,
+    root_traces,
+    graph,
+    final_nodes,
+    final_edges,
+    chunk_to_nodes,
+    chunk_to_edges,
+    chunk_store,
+    group_limit,
+):
+    candidates = []
+    for group_index, trace in enumerate(root_traces, start=1):
+        group = _build_trace_group(
+            query=query,
+            query_contract=query_contract,
+            group_index=group_index,
+            trace=trace,
+            graph=graph,
+            final_nodes=final_nodes,
+            final_edges=final_edges,
+            chunk_to_nodes=chunk_to_nodes,
+            chunk_to_edges=chunk_to_edges,
+            chunk_store=chunk_store,
+        )
+        if group is not None:
+            candidates.append(group)
+    candidates.sort(
+        key=lambda group: (
+            -group["query_rel"],
+            -group["node_count"],
+            -group["edge_count"],
+            group["facet_label"],
+        )
+    )
+    selected = []
+    for candidate in candidates:
+        redundant = False
+        for chosen in selected:
+            if _group_overlap_ratio(candidate["supporting_chunk_ids"], chosen["supporting_chunk_ids"]) >= 0.88:
+                redundant = True
+                break
+        if redundant:
+            continue
+        selected.append(candidate)
+        if len(selected) >= group_limit:
+            break
+    if query_contract == "comparison-grounded":
+        for index, group in enumerate(selected, start=1):
+            group["facet_label"] = _trace_group_label(
+                query_contract,
+                index,
+                group.get("focus_entities", []),
+                group.get("relation_themes", []),
+                group.get("doc_ids", []),
+                group.get("anchor_chunk_ids", []),
+                chunk_store,
+            )
+    return selected
+
+
 def build_answer_facet_groups(
     *,
     query,
@@ -1906,6 +2315,7 @@ def build_answer_facet_groups(
     graph,
     final_nodes,
     final_edges,
+    root_traces,
     last_structural_output,
     chunk_neighbors,
     chunk_to_nodes,
@@ -1917,60 +2327,20 @@ def build_answer_facet_groups(
     query_contract=None,
     allowed_doc_ids=None,
 ):
-    """Build one-contract-only facet groups from the final subgraph."""
+    """Build one-contract-only knowledge groups from root traces and the final graph."""
     contract = query_contract or detect_query_contract(query)
-    root_regions, bridge_regions, theme_regions = collect_overlapping_regions(
+    groups = _build_trace_groups(
         query=query,
-        root_chunk_ids=root_chunk_ids,
+        query_contract=contract,
+        root_traces=root_traces,
         graph=graph,
         final_nodes=final_nodes,
         final_edges=final_edges,
-        last_structural_output=last_structural_output,
-        chunk_neighbors=chunk_neighbors,
-        node_to_chunks=node_to_chunks,
-        edge_to_chunks=edge_to_chunks,
+        chunk_to_nodes=chunk_to_nodes,
+        chunk_to_edges=chunk_to_edges,
         chunk_store=chunk_store,
-        allowed_doc_ids=allowed_doc_ids,
+        group_limit=group_limit,
     )
-    if contract == "section-grounded":
-        groups = _build_section_groups(
-            query=query,
-            root_regions=root_regions,
-            chunk_store=chunk_store,
-            chunk_to_nodes=chunk_to_nodes,
-            chunk_to_edges=chunk_to_edges,
-            node_to_chunks=node_to_chunks,
-            edge_to_chunks=edge_to_chunks,
-            final_nodes=final_nodes,
-            final_edges=final_edges,
-            group_limit=group_limit,
-        )
-    elif contract == "mechanism-grounded":
-        groups = _build_mechanism_groups(
-            query=query,
-            root_regions=root_regions,
-            bridge_regions=bridge_regions,
-            theme_regions=theme_regions,
-            chunk_store=chunk_store,
-            group_limit=group_limit,
-        )
-    elif contract == "comparison-grounded":
-        groups = _build_comparison_groups(
-            query=query,
-            root_regions=root_regions,
-            bridge_regions=bridge_regions,
-            chunk_store=chunk_store,
-            group_limit=group_limit,
-        )
-    else:
-        groups = _build_theme_groups(
-            query=query,
-            root_regions=root_regions,
-            bridge_regions=bridge_regions,
-            theme_regions=theme_regions,
-            chunk_store=chunk_store,
-            group_limit=group_limit,
-        )
     for group in groups:
         group["query_contract"] = contract
     return groups, contract

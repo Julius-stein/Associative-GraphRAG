@@ -117,7 +117,7 @@ Requirements:
 - Answer the question in the form it asks for.
 - Start from the most direct answer, then add supporting synthesis only where it helps.
 - Synthesize across sources instead of listing isolated facts, but keep concrete examples and named items when they are central to the query.
-- Ignore isolated low-support peripheral items unless they clearly strengthen the answer.
+- Ignore isolated low-support context items unless they clearly strengthen the answer.
 - Focus on the substantive content of passages, characters, events, and themes.
 - Unless the query explicitly asks about datasets, models, benchmarks, or methods, do not center the answer on metadata, annotation schemes, or NLP systems.
 - If the evidence is partial or mixed, say so briefly.

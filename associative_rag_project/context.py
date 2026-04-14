@@ -615,7 +615,7 @@ def build_prompt_context(
     per_chunk_word_cap = None
     source_chunk_limit = max_source_chunks
     if query_contract == "theme-grounded" and theme_selected_chunks:
-        for bucket in ("core", "bridge", "support", "peripheral"):
+        for bucket in ("core", "bridge", "support", "context"):
             preferred_chunk_ids.extend(theme_selected_chunks.get(bucket, []))
         # Theme QFS needs more independent evidence angles.
         source_chunk_limit = max(max_source_chunks, 12)
@@ -848,9 +848,9 @@ def build_prompt_context(
             "core": "Core Chunks",
             "bridge": "Bridge Chunks",
             "support": "Support Chunks",
-            "peripheral": "Peripheral Chunks",
+            "context": "Context Chunks",
         }
-        for bucket in ("core", "bridge", "support", "peripheral"):
+        for bucket in ("core", "bridge", "support", "context"):
             chunk_ids = theme_selected_chunks.get(bucket, [])
             if not chunk_ids:
                 continue

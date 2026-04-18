@@ -1,4 +1,7 @@
-"""Embedding clients for dense retrieval."""
+"""Embedding clients for dense retrieval.
+
+提供向量化查询的两种后端：OpenAI 兼容 API 和本地 BGE 模型。
+"""
 
 from __future__ import annotations
 
@@ -12,7 +15,10 @@ from .config import load_llm_config
 
 
 class OpenAICompatibleEmbeddingClient:
-    """Wrapper around an OpenAI-compatible embeddings endpoint."""
+    """Wrapper around an OpenAI-compatible embeddings endpoint.
+
+    封装对 OpenAI 兼容 embeddings 接口的调用，并在本次运行中缓存结果。
+    """
 
     def __init__(self, llm_config=None):
         self.config = llm_config or load_llm_config()
@@ -34,9 +40,28 @@ class OpenAICompatibleEmbeddingClient:
         self._cache[text] = vector
         return vector
 
+    def embed_texts(self, texts):
+        """Embed a batch of query strings while preserving order and cache hits."""
+        texts = [str(text) for text in texts]
+        missing = []
+        seen_missing = set()
+        for text in texts:
+            if text not in self._cache and text not in seen_missing:
+                missing.append(text)
+                seen_missing.add(text)
+        if missing:
+            response = self.client.embeddings.create(model=self.model, input=missing)
+            ordered_items = sorted(response.data, key=lambda item: item.index)
+            for text, item in zip(missing, ordered_items):
+                self._cache[text] = np.asarray(item.embedding, dtype=np.float32)
+        return [self._cache[text] for text in texts]
+
 
 class LocalBGEM3EmbeddingClient:
-    """Local dense embedding client backed by Hugging Face `BAAI/bge-m3`."""
+    """Local dense embedding client backed by Hugging Face `BAAI/bge-m3`.
+
+    本地推理嵌入客户端，支持 MPS/CUDA/CPU 设备调度。
+    """
 
     def __init__(self, llm_config=None):
         try:
@@ -123,9 +148,27 @@ class LocalBGEM3EmbeddingClient:
         self._cache[text] = vector
         return vector
 
+    def embed_texts(self, texts):
+        """Embed a batch of query strings while preserving order and cache hits."""
+        texts = [str(text) for text in texts]
+        missing = []
+        seen_missing = set()
+        for text in texts:
+            if text not in self._cache and text not in seen_missing:
+                missing.append(text)
+                seen_missing.add(text)
+        if missing:
+            vectors = self._embed_uncached_texts(missing)
+            for text, vector in zip(missing, vectors):
+                self._cache[text] = vector
+        return [self._cache[text] for text in texts]
+
 
 def build_embedding_client(llm_config=None):
-    """Instantiate the configured embedding provider."""
+    """Instantiate the configured embedding provider.
+
+    根据配置选择 OpenAI 兼容或本地 BGE 模型嵌入客户端。
+    """
     config = llm_config or load_llm_config()
     provider = (config.get("embedding_provider") or "openai_compatible").strip().lower()
     if provider in {"openai_compatible", "openai", "api"}:

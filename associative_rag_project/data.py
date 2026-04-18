@@ -1,4 +1,7 @@
-"""Data loading helpers for corpora, questions, baselines, and provenance maps."""
+"""Data loading helpers for corpora, questions, baselines, and provenance maps.
+
+数据加载与路径解析工具，支持语料、问题、基线输出和 chunk provenance。
+"""
 
 import json
 import re
@@ -12,11 +15,19 @@ from .common import edge_key, parse_source_ids
 def infer_corpus_name(corpus_path: str | Path) -> str:
     """Infer a dataset name from either a corpus name or a dataset path.
 
+    参数:
+        corpus_path: 语料库目录或文件路径。
+
+    返回:
+        推断出的语料库名称。
+
     Supported examples:
     - `agriculture` -> `agriculture`
     - `Datasets/agriculture` -> `agriculture`
     - `Datasets/agriculture/corpus` -> `agriculture`
     - `Datasets/agriculture/corpus/agriculture_unique_contexts.json` -> `agriculture`
+
+    从路径中提取语料库名称，兼容旧目录结构与文件路径。
     """
     path = Path(corpus_path)
     parts = [part for part in path.parts if part not in {".", ""}]
@@ -37,7 +48,16 @@ def infer_corpus_name(corpus_path: str | Path) -> str:
 
 
 def extract_questions(file_path: Path) -> list[str]:
-    """Read benchmark questions from either text or JSON files."""
+    """Read benchmark questions from either text or JSON files.
+
+    参数:
+        file_path: 问题文件路径，支持 .json 或文本格式。
+
+    返回:
+        提取后的查询列表。
+
+    支持纯文本或 JSON 格式的问题列表输入。
+    """
     if file_path.suffix.lower() == ".json":
         payload = json.loads(file_path.read_text(encoding="utf-8"))
         if isinstance(payload, list):
@@ -65,7 +85,18 @@ def load_query_rows(
     questions_file: Path | None,
     limit_groups: int | None,
 ):
-    """Normalize either rewrite-groups or plain question lists into query rows."""
+    """Normalize either rewrite-groups or plain question lists into query rows.
+
+    参数:
+        rewrites_file: 可选的重写组 JSON 文件路径。
+        questions_file: 可选的原始问题文件路径。
+        limit_groups: 如果不为 None，则限制加载的查询数量。
+
+    返回:
+        标准化后的 query row 列表，每项包含 group_id、variant_id、query 和 base_query。
+
+    统一加载问题行，支持重写组和原始问题文件格式。
+    """
     if rewrites_file is not None:
         groups = json.loads(rewrites_file.read_text(encoding="utf-8"))
         selected_groups = groups if limit_groups is None else groups[:limit_groups]
@@ -122,7 +153,15 @@ def load_query_rows(
 
 
 def resolve_questions_file(corpus_name: str, explicit_path: str | None):
-    """Find the default question file for a corpus unless the user overrides it."""
+    """Find the default question file for a corpus unless the user overrides it.
+
+    参数:
+        corpus_name: 语料库名称。
+        explicit_path: 如果指定则直接使用该路径。
+
+    返回:
+        解析后的问题文件路径或 None。
+    """
     if explicit_path:
         return Path(explicit_path)
 
@@ -159,7 +198,15 @@ def resolve_questions_file(corpus_name: str, explicit_path: str | None):
 
 
 def resolve_baseline_file(corpus_name: str, explicit_path: str | None):
-    """Default to the FG-RAG 4o-mini outputs for head-to-head comparison."""
+    """Default to the FG-RAG 4o-mini outputs for head-to-head comparison.
+
+    参数:
+        corpus_name: 语料库名称。
+        explicit_path: 如果指定则直接使用该路径。
+
+    返回:
+        基线答案文件路径或 None。
+    """
     if explicit_path:
         return Path(explicit_path)
     candidates = [
@@ -175,9 +222,13 @@ def resolve_baseline_file(corpus_name: str, explicit_path: str | None):
 def resolve_corpus_index_dir(corpus_dir: Path):
     """Resolve the actual indexed corpus directory.
 
-    The project historically passed `Datasets/<name>/corpus`, while newer runs
-    store graph/index artifacts under `Datasets/<name>/index`. We accept either
-    and resolve to the directory that contains the indexed graph artifacts.
+    参数:
+        corpus_dir: 语料库根目录，可能是 corpus 或 index 子目录。
+
+    返回:
+        实际包含 graphml 和 kv_store 文档的索引目录。
+
+    兼容旧的 corpus 目录和新的 index 目录结构。
     """
     corpus_dir = Path(corpus_dir)
     candidates = [corpus_dir]
@@ -193,7 +244,14 @@ def resolve_corpus_index_dir(corpus_dir: Path):
 
 
 def load_graph_corpus(corpus_dir: Path):
-    """Load the graph and chunk store produced by the LightRAG preprocessing stage."""
+    """Load the graph and chunk store produced by the LightRAG preprocessing stage.
+
+    参数:
+        corpus_dir: 语料库目录，支持自动解析 index 子目录。
+
+    返回:
+        三元组 (graph, chunk_store, index_dir)。
+    """
     index_dir = resolve_corpus_index_dir(corpus_dir)
     graph = nx.read_graphml(index_dir / "graph_chunk_entity_relation.graphml")
     chunk_store = json.loads((index_dir / "kv_store_text_chunks.json").read_text(encoding="utf-8"))
@@ -201,7 +259,15 @@ def load_graph_corpus(corpus_dir: Path):
 
 
 def build_chunk_mappings(graph, chunk_ids):
-    """Build the provenance maps that connect chunks to nodes/edges and back."""
+    """Build the provenance maps that connect chunks to nodes/edges and back.
+
+    参数:
+        graph: NetworkX 图对象，其中节点/边含 source_id provenance。
+        chunk_ids: 目标 chunk id 列表。
+
+    返回:
+        chunk_to_nodes, chunk_to_edges, node_to_chunks, edge_to_chunks 四个映射。
+    """
     chunk_id_set = set(chunk_ids)
     chunk_to_nodes = {chunk_id: set() for chunk_id in chunk_ids}
     chunk_to_edges = {chunk_id: set() for chunk_id in chunk_ids}
@@ -228,8 +294,12 @@ def build_chunk_mappings(graph, chunk_ids):
 def build_chunk_neighborhoods(chunk_store, radius=1):
     """Build local same-document chunk neighborhoods.
 
-    This gives the pipeline a lightweight section-like continuity signal without
-    changing the original chunking scheme.
+    参数:
+        chunk_store: chunk 数据字典。
+        radius: 以同一文档中 chunk 顺序为半径构建邻居。
+
+    返回:
+        每个 chunk 与其同文档邻居 chunk id 集合。
     """
     by_doc = {}
     for chunk_id, chunk in chunk_store.items():
@@ -251,7 +321,14 @@ def build_chunk_neighborhoods(chunk_store, radius=1):
 
 
 def load_baseline_answers(result_path: Path):
-    """Load baseline outputs in the same list format used by our answers."""
+    """Load baseline outputs in the same list format used by our answers.
+
+    参数:
+        result_path: 基线结果 JSON 文件路径。
+
+    返回:
+        基线答案列表，若格式不对则抛出异常。
+    """
     data = json.loads(result_path.read_text(encoding="utf-8"))
     if not isinstance(data, list):
         raise ValueError(f"Expected list in baseline file: {result_path}")

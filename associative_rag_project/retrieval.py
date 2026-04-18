@@ -4,6 +4,8 @@ Current refactor direction:
 - keep chunk retrieval simple and grounded
 - select diverse root chunks instead of linearly reranking them by many factors
 - keep root node/edge scoring lightweight so later stages remain interpretable
+
+检索与根 chunk 打分模块，负责多通道候选采集与多样性锚点选择。
 """
 
 import base64
@@ -30,7 +32,10 @@ class BM25Index:
 
     @classmethod
     def build(cls, chunk_store):
-        """Build an in-memory BM25 index from the chunk text store."""
+        """Build an in-memory BM25 index from the chunk text store.
+
+        从 chunk 文本构建 BM25 倒排索引，用于快速词项检索。
+        """
         postings = defaultdict(dict)
         doc_lengths = {}
         for chunk_id, chunk_data in chunk_store.items():
@@ -86,7 +91,10 @@ class DenseChunkIndex:
 
     @classmethod
     def load(cls, vdb_file):
-        """Load a precomputed dense chunk matrix from the LightRAG vector store."""
+        """Load a precomputed dense chunk matrix from the LightRAG vector store.
+
+        从向量数据库文件加载预先计算的 chunk 嵌入矩阵。
+        """
         payload = json.loads(Path(vdb_file).read_text(encoding="utf-8"))
         chunk_ids = [item["__id__"] for item in payload.get("data", [])]
         dim = int(payload["embedding_dim"])
@@ -120,7 +128,10 @@ class DenseChunkIndex:
 
 @dataclass
 class GraphKeywordIndex:
-    """Precomputed graph keyword view for chunk-level root selection."""
+    """Precomputed graph keyword view for chunk-level root selection.
+
+    图结构关键词索引用于增强根 chunk 的语义对齐和多样性。
+    """
 
     chunk_term_weights: dict[str, dict[str, float]]
     chunk_anchor_terms: dict[str, list[str]]
@@ -246,7 +257,15 @@ class HybridChunkRetriever:
     bm25_weight: float = 0.25
 
     def search(self, query, top_k):
-        """Fuse bm25 and dense signals into one ranked candidate list."""
+        """Fuse bm25 and dense signals into one ranked candidate list.
+
+        参数:
+            query: 查询文本。
+            top_k: 返回候选 chunk 数量上限。
+
+        返回:
+            排序后的候选 chunk 列表，包含融合后的 score_norm。
+        """
         if self.mode not in {"bm25", "dense", "hybrid"}:
             raise ValueError(f"Unsupported retrieval mode: {self.mode}")
         bm25_hits = self.bm25_index.search(query, top_k=top_k) if self.mode in {"bm25", "hybrid"} else []
@@ -494,9 +513,19 @@ def search_graph_evidence_chunks(
 ):
     """Unified graph-to-chunk recall for the anchor stage.
 
-    Internally this combines:
-    - focus-term coverage over graph text
-    - direct lexical graph matching
+    参数:
+        query: 查询文本。
+        graph: 实体关系图对象。
+        node_to_chunks: 节点到 chunk 的映射。
+        edge_to_chunks: 边到 chunk 的映射。
+        top_chunk_k: 返回的 chunk 数量上限。
+        top_node_k: 节点检索的 top-k 限制。
+        top_edge_k: 边检索的 top-k 限制。
+        focus_weight: graph_focus 信号的融合权重。
+        keyword_weight: graph_keyword 信号的融合权重。
+
+    返回:
+        包含 graph_evidence_score 和归一化分数的 chunk 命中列表。
 
     The public abstraction is intentionally simple: graph-side evidence recall
     projects graph relevance back onto chunk candidates.
@@ -571,7 +600,16 @@ def search_graph_evidence_chunks(
 
 
 def merge_candidate_hits_with_graph(primary_hits, graph_hits, graph_weight=0.25):
-    """Merge dense/bm25 candidates with graph-side candidates."""
+    """Merge dense/bm25 candidates with graph-side candidates.
+
+    参数:
+        primary_hits: 来自 BM25/dense 检索的候选 chunk 列表。
+        graph_hits: 来自图检索的候选 chunk 列表。
+        graph_weight: 图检索信号在最终分数中的权重。
+
+    返回:
+        合并后的 chunk 列表，包含统一 retrieval_score 和 score_norm。
+    """
     if not graph_hits:
         return primary_hits
     merged = {}
@@ -707,18 +745,19 @@ def _query_alignment(item):
     return float(item.get("retrieval_score", item.get("score_norm", 0.0)))
 
 
-def _root_sort_key(item, query_contract=None):
+def _root_sort_key(item):
     return (
         -item["base_score"],
+        -item.get("structure_penalty", 1.0),
         -item.get("keyword_match_score", 0.0),
         -item["query_alignment"],
         -item["relation_entropy"],
-        -len(item["graph_nodes"]),
+        item.get("graph_mass", 0),
         item["chunk_id"],
     )
 
 
-def _root_primary_quota(top_k, query_contract):
+def _root_primary_quota(top_k):
     return min(top_k, max(2, (top_k // 2) + 1))
 
 
@@ -727,6 +766,27 @@ def _root_base_score(item):
     if item.get("dense_score_norm", 0.0) > 0:
         return float(item["dense_score_norm"])
     return float(item.get("score_norm", item.get("retrieval_score", 0.0)))
+
+
+def _inverse_sqrt_degree(size):
+    return 1.0 / math.sqrt(max(float(size), 1.0))
+
+
+def _chunk_structure_penalty(nodes, edges, node_to_chunks=None, edge_to_chunks=None):
+    """Down-weight chunks that win mainly because they touch too many/popular graph items."""
+    raw_mass = len(nodes) + len(edges)
+    if raw_mass <= 0:
+        return 1.0
+    weighted_terms = []
+    for node_id in nodes:
+        degree = len((node_to_chunks or {}).get(node_id, set()))
+        weighted_terms.append(_inverse_sqrt_degree(degree))
+    for edge_id in edges:
+        degree = len((edge_to_chunks or {}).get(edge_id, set()))
+        weighted_terms.append(_inverse_sqrt_degree(degree))
+    degree_term = sum(weighted_terms) / max(len(weighted_terms), 1)
+    size_term = 1.0 / math.sqrt(1.0 + (raw_mass / 6.0))
+    return max(0.18, min(1.0, degree_term * size_term))
 
 
 def _chunk_graph_signature(chunk_id, chunk_to_nodes, chunk_to_edges):
@@ -969,7 +1029,11 @@ def _select_anchor_root_chunks(candidates, chunk_store, top_k, same_doc_window, 
                 {
                     **candidate,
                     "root_role": "primary" if len(selected) < primary_quota else "diversity",
-                    "novelty_gain": len(candidate["graph_nodes"]) + len(candidate["graph_edges"]),
+                    "novelty_gain": round(
+                        (len(candidate["graph_nodes"]) + len(candidate["graph_edges"]))
+                        * candidate.get("structure_penalty", 1.0),
+                        6,
+                    ),
                     "query_term_gain": term_gain,
                     "max_selected_overlap": round(max_overlap, 6),
                 }
@@ -1012,7 +1076,11 @@ def _select_anchor_root_chunks(candidates, chunk_store, top_k, same_doc_window, 
                 {
                     **candidate,
                     "root_role": "primary" if len(selected) < primary_quota else "diversity",
-                    "novelty_gain": len(candidate["graph_nodes"]) + len(candidate["graph_edges"]),
+                    "novelty_gain": round(
+                        (len(candidate["graph_nodes"]) + len(candidate["graph_edges"]))
+                        * candidate.get("structure_penalty", 1.0),
+                        6,
+                    ),
                     "query_term_gain": len(_candidate_query_terms(candidate) - covered_query_terms),
                     "max_selected_overlap": round(max_overlap, 6),
                 }
@@ -1030,7 +1098,8 @@ def select_diverse_root_chunks(
     chunk_to_nodes,
     chunk_to_edges,
     top_k,
-    query_contract="theme-grounded",
+    node_to_chunks=None,
+    edge_to_chunks=None,
     graph=None,
     keyword_index=None,
     same_doc_window=1,
@@ -1045,6 +1114,8 @@ def select_diverse_root_chunks(
     - keep strong query-grounded anchors
     - spread anchors across different evidence basins
     - avoid local-band and provenance-near duplicates
+
+    在 anchor 阶段选择多样化根 chunk，以提高检索覆盖与图结构连贯性。
     """
     if not candidate_hits:
         return []
@@ -1055,6 +1126,12 @@ def select_diverse_root_chunks(
         chunk_id = item["chunk_id"]
         chunk = chunk_store.get(chunk_id, {})
         nodes, edges = _chunk_graph_signature(chunk_id, chunk_to_nodes, chunk_to_edges)
+        structure_penalty = _chunk_structure_penalty(
+            nodes,
+            edges,
+            node_to_chunks=node_to_chunks,
+            edge_to_chunks=edge_to_chunks,
+        )
         basin_key, basin_signature, anchor_terms = _chunk_basin_signature(
             chunk_id,
             chunk_store,
@@ -1071,13 +1148,16 @@ def select_diverse_root_chunks(
         candidates.append(
             {
                 **item,
-                "base_score": round(_root_base_score(item), 6),
+                "raw_base_score": round(_root_base_score(item), 6),
+                "base_score": round(_root_base_score(item) * structure_penalty, 6),
                 "query_alignment": round(_query_alignment(item), 6),
                 "relation_entropy": round(_chunk_relation_entropy(chunk_id, chunk_to_edges, graph), 6),
                 "full_doc_id": chunk.get("full_doc_id"),
                 "chunk_order_index": chunk.get("chunk_order_index", -1),
                 "graph_nodes": nodes,
                 "graph_edges": edges,
+                "graph_mass": len(nodes) + len(edges),
+                "structure_penalty": round(structure_penalty, 6),
                 "basin_key": basin_key,
                 "basin_signature": basin_signature,
                 "anchor_terms": anchor_terms,
@@ -1089,12 +1169,7 @@ def select_diverse_root_chunks(
                 "keyword_hit_terms": keyword_hit_terms,
             }
         )
-    candidates.sort(key=lambda item: _root_sort_key(item, query_contract))
-
-    if query_contract == "section-grounded" and candidates:
-        anchor_doc_id = candidates[0].get("full_doc_id")
-        if anchor_doc_id:
-            candidates = [item for item in candidates if item.get("full_doc_id") == anchor_doc_id]
+    candidates.sort(key=_root_sort_key)
     if not candidates:
         return []
     selected = _select_anchor_root_chunks(
@@ -1102,7 +1177,7 @@ def select_diverse_root_chunks(
         chunk_store=chunk_store,
         top_k=top_k,
         same_doc_window=same_doc_window,
-        primary_quota=_root_primary_quota(top_k, query_contract),
+        primary_quota=_root_primary_quota(top_k),
     )
 
     top_score = max((item["base_score"] for item in selected), default=1.0)

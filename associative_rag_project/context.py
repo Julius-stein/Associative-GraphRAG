@@ -1,4 +1,7 @@
-"""Turn the final graph into LLM-facing evidence groups and source bundles."""
+"""Turn the final graph into LLM-facing evidence groups and source bundles.
+
+将最终证据图组织成面向 LLM 的知识组与来源包，方便生成阶段使用。
+"""
 
 from collections import Counter, defaultdict
 
@@ -13,6 +16,8 @@ def rank_supporting_chunks(final_nodes, final_edges, root_chunk_ids, node_to_chu
 
     Root chunks are no longer forced to dominate via a huge constant boost.
     Grounding is preserved later through anchor selection inside each group.
+
+    按最终节点/边对 chunk 的直接支持度排序，便于后续来源选择。
     """
     chunk_scores = Counter()
     for node_id in final_nodes:
@@ -169,7 +174,6 @@ def choose_diverse_source_chunks(
     preferred_chunk_ids=None,
     per_chunk_word_cap=None,
     query_text="",
-    query_contract="",
     chunk_role_lookup=None,
     chunk_to_group_ids=None,
     group_label_lookup=None,
@@ -183,6 +187,8 @@ def choose_diverse_source_chunks(
 
     Adjacent chunks from the same document are capped so one dense support
     chain cannot crowd out other useful facets.
+
+    优先从不同知识组中选取来源 chunks，再补齐全局高排序 chunk。
     """
     selected_ids = []
     used_words = 0
@@ -230,7 +236,7 @@ def choose_diverse_source_chunks(
         if len(selected_ids) >= max_source_chunks:
             break
 
-    if query_contract == "theme-grounded" and len(selected_ids) < max_source_chunks:
+    if len(selected_ids) < max_source_chunks:
         query_bucket_weights = _theme_query_bucket_weights(query_text)
         bucket_best = {}
         for chunk_id in ranked_chunk_ids[:240]:
@@ -588,7 +594,6 @@ def build_knowledge_groups(
 
 def build_prompt_context(
     query_row,
-    query_contract,
     root_chunk_hits,
     top_root_nodes,
     top_root_edges,
@@ -608,18 +613,18 @@ def build_prompt_context(
     max_source_chunks,
     max_source_word_budget,
 ):
-    """Assemble the final evidence package shown to the answer-generation LLM."""
+    """Assemble the final evidence package shown to the answer-generation LLM.
+
+    组合知识组、来源列表和源 chunk，生成最终给 LLM 的上下文。
+    """
     root_chunk_ids = [item["chunk_id"] for item in root_chunk_hits]
     chunk_role_lookup = {item["chunk_id"]: item for item in (chunk_roles or [])}
     preferred_chunk_ids = []
-    per_chunk_word_cap = None
-    source_chunk_limit = max_source_chunks
-    if query_contract == "theme-grounded" and theme_selected_chunks:
+    per_chunk_word_cap = 220
+    source_chunk_limit = max(max_source_chunks, 12)
+    if theme_selected_chunks:
         for bucket in ("core", "bridge", "support", "context"):
             preferred_chunk_ids.extend(theme_selected_chunks.get(bucket, []))
-        # Theme QFS needs more independent evidence angles.
-        source_chunk_limit = max(max_source_chunks, 12)
-        per_chunk_word_cap = 220
     chunk_to_group_ids = {}
     for group in facet_groups:
         for chunk_id in group["supporting_chunk_ids"]:
@@ -639,7 +644,6 @@ def build_prompt_context(
         preferred_chunk_ids=preferred_chunk_ids,
         per_chunk_word_cap=per_chunk_word_cap,
         query_text=query_row["query"],
-        query_contract=query_contract,
         chunk_role_lookup=chunk_role_lookup,
         chunk_to_group_ids=chunk_to_group_ids,
         group_label_lookup=group_label_lookup,
@@ -647,81 +651,12 @@ def build_prompt_context(
     root_chunk_id_set = set(root_chunk_ids)
     source_id_map = {chunk_id: f"src-{index:02d}" for index, (chunk_id, _, _) in enumerate(selected_source_chunks, start=1)}
 
-    root_chunk_rows = [["id", "score", "role", "basin", "chunk_order", "content_preview"]]
-    for item in root_chunk_hits:
-        chunk = chunk_store[item["chunk_id"]]
-        role_text = " | ".join(chunk_role_lookup.get(item["chunk_id"], {}).get("roles", [])) or item.get("root_role", "root")
-        root_chunk_rows.append(
-            [
-                item["chunk_id"],
-                f"{item['score_norm']:.4f}",
-                role_text,
-                normalize_text(item.get("basin_signature", ""))[:80],
-                chunk.get("chunk_order_index", -1),
-                " ".join(chunk.get("content", "").split())[:220],
-            ]
-        )
-
     node_lookup = {item["id"]: item for item in top_root_nodes}
     node_lookup.update({item["id"]: item for item in semantic_nodes})
     root_edge_lookup = {item["edge"]: item for item in top_root_edges}
     semantic_edge_lookup = {item["edge"]: item for item in semantic_edges}
     role_priority = {"root": 3, "structural": 2, "semantic": 1, "other": 0}
-    entity_rows = [["id", "entity", "role", "source_chunk_count", "description"]]
-    ranked_nodes = sorted(
-        final_nodes,
-        key=lambda node_id: (
-            -lexical_overlap_score(query_row["query"], f"{node_id} {normalize_text(node_lookup.get(node_id, {}).get('description', ''))}"),
-            -role_priority.get(node_roles.get(node_id, "other"), 0),
-            -len(node_to_chunks.get(node_id, set())),
-            node_id,
-        ),
-    )[:30]
-    for node_id in ranked_nodes:
-        item = node_lookup.get(node_id, {"description": ""})
-        entity_rows.append(
-            [
-                len(entity_rows) - 1,
-                node_id,
-                node_roles.get(node_id, "other"),
-                len(node_to_chunks.get(node_id, set())),
-                normalize_text(item.get("description", ""))[:200],
-            ]
-        )
-
-    relation_rows = [["id", "source", "target", "role", "source_chunk_count", "keywords"]]
-    ranked_edges = sorted(
-        final_edges,
-        key=lambda edge_id: (
-            -lexical_overlap_score(
-                query_row["query"],
-                " ".join(
-                    [
-                        edge_id[0],
-                        edge_id[1],
-                        normalize_text((semantic_edge_lookup.get(edge_id) or root_edge_lookup.get(edge_id) or {}).get("keywords", "")),
-                    ]
-                ),
-            ),
-            -role_priority.get(edge_roles.get(edge_id, "other"), 0),
-            -len(edge_to_chunks.get(edge_id, set())),
-            edge_id,
-        ),
-    )[:30]
-    for edge_id in ranked_edges:
-        item = semantic_edge_lookup.get(edge_id) or root_edge_lookup.get(edge_id) or {}
-        relation_rows.append(
-            [
-                len(relation_rows) - 1,
-                edge_id[0],
-                edge_id[1],
-                edge_roles.get(edge_id, "other"),
-                len(edge_to_chunks.get(edge_id, set())),
-                normalize_text(item.get("keywords", ""))[:120],
-            ]
-        )
-
-    group_rows = [["id", "score", "node_count", "edge_count", "facet", "key_entities", "key_relations", "supporting_chunks"]]
+    group_index_lines = []
     group_sections = []
     for group in facet_groups:
         key_entities = sorted(
@@ -751,21 +686,6 @@ def build_prompt_context(
                 edge_id,
             ),
         )[:5]
-        group_rows.append(
-            [
-                group["group_id"],
-                f"{group['group_score']:.4f}",
-                group["node_count"],
-                group["edge_count"],
-                f"{group.get('facet_label', group.get('primary_theme', 'facet'))} :: {' / '.join(group.get('region_kinds', []))}",
-                " | ".join(key_entities),
-                " | ".join(
-                    f"{edge_id[0]} -> {edge_id[1]} ({normalize_text((semantic_edge_lookup.get(edge_id) or root_edge_lookup.get(edge_id) or {}).get('keywords',''))[:40]})"
-                    for edge_id in key_relations
-                ),
-                len(group["supporting_chunk_ids"]),
-            ]
-        )
         linked_source_rows = [["source_id", "role", "word_count", "content_preview"]]
         linked_chunk_ids = sorted(
             (chunk_id for chunk_id in group["supporting_chunk_ids"] if chunk_id in source_id_map),
@@ -782,37 +702,28 @@ def build_prompt_context(
                     " ".join(chunk_data.get("content", "").split())[:220],
                 ]
             )
-        group_section = [
-            f"[{group['group_id']}] score={group['group_score']:.4f} nodes={group['node_count']} edges={group['edge_count']}",
-            f"Facet: {group.get('facet_label', group.get('primary_theme', 'facet'))}",
-            f"Facet Prompt: {group.get('facet_prompt', '')}",
-            f"Summary: {group['group_summary']}",
-            f"Themes: {' | '.join(group['relation_themes']) or 'n/a'}",
-            f"Evidence Roles: {' | '.join(group.get('region_kinds', [])) or 'n/a'}",
-            f"Key Entities: {' | '.join(key_entities) or 'n/a'}",
-            "Structural Growth Trace:",
-        ]
-        if group.get("growth_traces"):
-            group_section.extend(f"- {trace}" for trace in group["growth_traces"][:4])
-        else:
-            group_section.append("- n/a")
-        group_section.extend(
-            [
-            "Anchor Evidence:",
-            ]
+        group_label = group.get("facet_label", group.get("primary_theme", "facet"))
+        group_index_lines.append(
+            f"- {group['group_id']}: {group_label} :: {group['group_summary']}"
         )
+        group_section = [
+            f"[{group['group_id']}] {group_label}",
+            f"Aspect gist: {group['group_summary']}",
+            f"Key entities: {' | '.join(key_entities) or 'n/a'}",
+            f"Key relations: {' | '.join(group['relation_themes']) or 'n/a'}",
+            f"Linked source ids: {' | '.join(source_id_map[chunk_id] for chunk_id in linked_chunk_ids) or 'n/a'}",
+        ]
+        group_section.append("Anchor evidence:")
         if group.get("anchor_chunk_ids"):
             for chunk_id in group["anchor_chunk_ids"][:2]:
                 chunk_data = chunk_store.get(chunk_id, {})
-                role = "root" if chunk_id in root_chunk_id_set else "support"
-                group_section.append(f"- {role} {chunk_id}: {' '.join(chunk_data.get('content', '').split())[:220]}")
+                role = "anchor" if chunk_id in root_chunk_id_set else "evidence"
+                source_id = source_id_map.get(chunk_id, chunk_id)
+                preview = " ".join(chunk_data.get("content", "").split())[:220]
+                group_section.append(f"- {source_id} [{role}]: {preview}")
         else:
             group_section.append("- n/a")
-        group_section.extend(
-            [
-            "Key Relations:",
-            ]
-        )
+        group_section.append("Key relation cues:")
         if key_relations:
             group_section.extend(
                 f"- {edge_id[0]} -> {edge_id[1]} ({normalize_text((semantic_edge_lookup.get(edge_id) or root_edge_lookup.get(edge_id) or {}).get('keywords',''))[:60]})"
@@ -820,7 +731,7 @@ def build_prompt_context(
             )
         else:
             group_section.append("- n/a")
-        group_section.append("Linked Sources:")
+        group_section.append("Linked source previews:")
         group_section.append("```csv")
         group_section.append(build_csv(linked_source_rows))
         group_section.append("```")
@@ -839,53 +750,10 @@ def build_prompt_context(
             ]
         )
 
-    coverage_checklist = _coverage_checklist_lines(facet_groups)
-    candidate_point_rows = _candidate_point_rows(candidate_points[:8])
-    candidate_point_lines = _candidate_point_lines(candidate_points[:8])
-    theme_chunk_lines = []
-    if query_contract == "theme-grounded" and theme_selected_chunks:
-        role_labels = {
-            "core": "Core Chunks",
-            "bridge": "Bridge Chunks",
-            "support": "Support Chunks",
-            "context": "Context Chunks",
-        }
-        for bucket in ("core", "bridge", "support", "context"):
-            chunk_ids = theme_selected_chunks.get(bucket, [])
-            if not chunk_ids:
-                continue
-            theme_chunk_lines.append(f"{role_labels[bucket]}:")
-            for chunk_id in chunk_ids[:4]:
-                chunk_data = chunk_store.get(chunk_id, {})
-                theme_chunk_lines.append(f"- {chunk_id}: {' '.join(chunk_data.get('content', '').split())[:160]}")
-
     context = f"""
------Root Chunks-----
-```csv
-{build_csv(root_chunk_rows)}
-```
------Focused Entities-----
-```csv
-{build_csv(entity_rows)}
-```
------Focused Relations-----
-```csv
-{build_csv(relation_rows)}
-```
------Facet Groups-----
-```csv
-{build_csv(group_rows)}
-```
------Candidate Points-----
-```csv
-{build_csv(candidate_point_rows)}
-```
-{chr(10).join(candidate_point_lines) if candidate_point_lines else '- n/a'}
------Theme Chunk Roles-----
-{chr(10).join(theme_chunk_lines) if theme_chunk_lines else '- n/a'}
------Coverage Checklist-----
-{chr(10).join(coverage_checklist) if coverage_checklist else '- n/a'}
------Facet Group Dossiers-----
+-----Group Index-----
+{chr(10).join(group_index_lines) if group_index_lines else '- n/a'}
+-----Knowledge Group Dossiers-----
 {chr(10).join(group_sections)}
 -----Sources-----
 ```csv

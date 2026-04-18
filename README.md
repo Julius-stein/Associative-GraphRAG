@@ -4,7 +4,7 @@
 
 ## Associative RAG for Query-Focused Summarization
 
-Query-focused summarization over chunk-entity-relation graphs with multi-round associative retrieval, contract-aware organization, and LLM-as-a-judge evaluation.
+Query-focused summarization over chunk-entity-relation graphs with chunk-centric multi-round association, PPR-based knowledge grouping, and LLM-as-a-judge evaluation.
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Status](https://img.shields.io/badge/status-research%20prototype-orange)
@@ -16,15 +16,15 @@ Query-focused summarization over chunk-entity-relation graphs with multi-round a
 
 This repository is a research workspace centered on [associative_rag_project](/Users/Admin/projects/Association/associative_rag_project), a query-focused summarization system built on top of document chunks and a chunk-entity-relation graph.
 
-The current system follows one unified retrieval-and-association backbone:
+The current system follows one unified retrieval-and-organization backbone:
 
 1. retrieve chunk candidates with `bm25`, `dense`, or `hybrid`
 2. inject graph-side recall through `graph_focus` and `graph_keyword`
 3. select diverse root chunks
-4. expand the evidence graph with multi-round chunk-level association
-5. organize the final subgraph into answer facets
+4. expand the evidence graph with multi-round chunk-centric association and root reseeding
+5. build root traces and compress the final graph into PPR-based knowledge groups
 6. pack grounded evidence for the answer LLM
-7. compare candidate answers against FG-RAG-style baselines with a contract-aware judge
+7. compare candidate answers against one or many baselines with a contract-aware judge
 
 The repository also includes:
 
@@ -35,9 +35,10 @@ The repository also includes:
 ## Highlights
 
 - Unified associative retrieval for all query contracts
-- Multi-round root reseeding instead of one-shot graph crawling
-- Chunk-level bridge/support/peripheral scheduling
-- Theme-style broad evidence expansion with section/mechanism/comparison-specific organization
+- Chunk-centric multi-round expansion with per-round root reseeding
+- Explicit `bridge / support / context` chunk roles
+- Root-trace-preserving organization followed by query-seeded PPR knowledge groups
+- Contract-aware final layout controller for `section / mechanism / comparison / theme`
 - Contract-aware LLM judge with `Comprehensiveness`, `Diversity`, `Focus Match`, `Evidence Anchoring`, `Scope Discipline`, and `Scenario Fidelity`
 
 ## Repository Layout
@@ -76,12 +77,12 @@ Queries are typically under `Datasets/<name>/query/<name>.json`.
 
 ### 4. Run the pipeline
 
-End-to-end run:
+End-to-end `retrieve -> answer -> judge`:
 
 ```bash
 python -m associative_rag_project.main run-all \
   --corpus-dir Datasets/art/index \
-  --output-dir associative_rag_project/runs_demo \
+  --output-dir associative_rag_project/runs_v3_ppr \
   --max-workers 4
 ```
 
@@ -90,19 +91,56 @@ Retrieval only:
 ```bash
 python -m associative_rag_project.main retrieve \
   --corpus-dir Datasets/art/index \
-  --output-dir associative_rag_project/runs_demo \
+  --output-dir associative_rag_project/runs_v3_ppr \
   --retrieval-mode dense
 ```
 
-Judge only:
+Retrieve + answer without judge:
+
+```bash
+python -m associative_rag_project.main run \
+  --corpus-dir Datasets/art/index \
+  --output-dir associative_rag_project/runs_v3_ppr \
+  --max-workers 4
+```
+
+Answer only:
+
+```bash
+python -m associative_rag_project.main answer \
+  --retrieval-file associative_rag_project/runs_v3_ppr/art_top5_hop4_assoc_project_retrieval.json \
+  --max-workers 4
+```
+
+Judge against a single baseline:
 
 ```bash
 python -m associative_rag_project.main judge \
   --questions-file Datasets/art/query/art.json \
-  --candidate-file associative_rag_project/runs_demo/art_top5_hop4_assoc_project_answers.json \
+  --candidate-file associative_rag_project/runs_v3_ppr/art_top5_hop4_assoc_project_answers.json \
   --baseline-file Datasets/art/output/FG-RAG-4o-mini.json \
-  --output-file associative_rag_project/runs_demo/art_top5_hop4_assoc_project_vs_FG-RAG-4o-mini_winrate.json
+  --output-file associative_rag_project/runs_v3_ppr/art_top5_hop4_assoc_project_vs_FG-RAG-4o-mini_winrate.json
 ```
+
+Judge against all baselines in one directory and write a combined Markdown summary:
+
+```bash
+python -m associative_rag_project.main judge \
+  --questions-file Datasets/agriculture/query/agriculture.json \
+  --candidate-file associative_rag_project/runs_v3_ppr/agriculture_top5_hop4_assoc_project_answers.json \
+  --baseline-dir Datasets/agriculture/output \
+  --candidate-label assoc-project \
+  --summary-file associative_rag_project/result/agriculture_baseline_winrate_tables.md \
+  --max-workers 12
+```
+
+Useful options:
+
+- `--organization-controller off|predicted|oracle`
+- `--retrieval-mode bm25|dense|hybrid`
+- `--limit-groups` or `--limit` on `retrieve/run/run-all`
+- `--baseline-dir` on `judge` for bulk baseline comparison
+- `--summary-file` on `judge` to render one Markdown file containing all win-rate tables
 
 ## Output Files
 
@@ -113,9 +151,14 @@ For a corpus named `art`, the pipeline typically writes:
 - `art_top5_hop4_assoc_project_vs_FG-RAG-4o-mini_winrate.json`
 - `art_top5_hop4_assoc_project_sample_context.txt`
 
+When `judge --baseline-dir` is used, the project also writes:
+
+- one `*_vs_<baseline>_winrate.json` per baseline file
+- one combined Markdown table file such as `agriculture_baseline_winrate_tables.md`
+- one JSON manifest beside that Markdown summary
+
 ## Documentation
 
-- Project guide: [associative_rag_project/README.md](/Users/Admin/projects/Association/associative_rag_project/README.md)
 - Detailed Chinese technical report: [associative_rag_project/TECHNICAL_REPORT_CN.md](/Users/Admin/projects/Association/associative_rag_project/TECHNICAL_REPORT_CN.md)
 - Chinese method draft: [associative_rag_project/METHOD_DRAFT_CN.md](/Users/Admin/projects/Association/associative_rag_project/METHOD_DRAFT_CN.md)
 
@@ -124,12 +167,14 @@ For a corpus named `art`, the pipeline typically writes:
 This codebase is a research prototype rather than a polished library package. The emphasis is:
 
 - inspecting retrieval traces
-- iterating on graph association logic
-- studying contract-aware answer organization
-- evaluating against FG-RAG-style baselines
+- iterating on chunk-centric association logic
+- studying graph-based knowledge grouping for QFS
+- comparing against multiple external baselines in a unified judge format
 
 If you want the shortest path to the current implementation, start with:
 
 - [associative_rag_project/main.py](/Users/Admin/projects/Association/associative_rag_project/main.py)
 - [associative_rag_project/pipeline.py](/Users/Admin/projects/Association/associative_rag_project/pipeline.py)
+- [associative_rag_project/association.py](/Users/Admin/projects/Association/associative_rag_project/association.py)
+- [associative_rag_project/organization.py](/Users/Admin/projects/Association/associative_rag_project/organization.py)
 - [associative_rag_project/TECHNICAL_REPORT_CN.md](/Users/Admin/projects/Association/associative_rag_project/TECHNICAL_REPORT_CN.md)

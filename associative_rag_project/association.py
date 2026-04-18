@@ -15,6 +15,8 @@ This yields a practical 2 x 2 scheme:
 - chunk-bridge association
 - graph-coverage association
 - chunk-coverage association
+
+关联阶段依据图结构与 provenance 关系扩展证据，兼顾桥接能力与覆盖新信息。
 """
 
 import math
@@ -34,7 +36,15 @@ from .retrieval import (
 
 
 def build_root_components(root_nodes, root_edges):
-    """Materialize connected components for the current root graph."""
+    """Materialize connected components for the current root graph.
+
+    参数:
+        root_nodes: 当前根节点列表。
+        root_edges: 当前根边列表。
+
+    返回:
+        三元组 (root_graph, components, node_to_component)，分别为根子图、连通组件列表和节点到组件索引映射。
+    """
     root_graph = nx.Graph()
     root_graph.add_nodes_from(root_nodes)
     root_graph.add_edges_from(root_edges)
@@ -89,10 +99,35 @@ def _chunk_provenance_overlap(chunk_id_a, chunk_id_b, chunk_to_nodes, chunk_to_e
     return len(left & right) / max(len(left | right), 1)
 
 
+def _inverse_sqrt_degree(size):
+    return 1.0 / math.sqrt(max(float(size), 1.0))
+
+
+def _weighted_node_mass(node_ids, node_to_chunks):
+    return sum(_inverse_sqrt_degree(len(node_to_chunks.get(node_id, set()))) for node_id in node_ids)
+
+
+def _weighted_edge_mass(edge_ids, edge_to_chunks):
+    return sum(_inverse_sqrt_degree(len(edge_to_chunks.get(edge_id, set()))) for edge_id in edge_ids)
+
+
+def _chunk_structure_penalty(chunk_id, chunk_to_nodes, chunk_to_edges, node_to_chunks, edge_to_chunks):
+    node_ids = set(chunk_to_nodes.get(chunk_id, set()))
+    edge_ids = set(chunk_to_edges.get(chunk_id, set()))
+    raw_mass = len(node_ids) + len(edge_ids)
+    if raw_mass <= 0:
+        return 1.0
+    weighted_mass = _weighted_node_mass(node_ids, node_to_chunks) + _weighted_edge_mass(edge_ids, edge_to_chunks)
+    degree_term = weighted_mass / max(raw_mass, 1)
+    size_term = 1.0 / math.sqrt(1.0 + (raw_mass / 6.0))
+    return max(0.18, min(1.0, degree_term * size_term))
+
+
 def _chunk_link_features(chunk_id, anchor_chunk_ids, chunk_store, chunk_to_nodes, chunk_to_edges, node_to_chunks, edge_to_chunks, chunk_neighbors):
     if not anchor_chunk_ids:
         return {
             "linked_chunk_count": 0,
+            "linked_strength": 0.0,
             "distinct_doc_touch": 0,
             "shared_node_count": 0,
             "shared_edge_count": 0,
@@ -101,6 +136,7 @@ def _chunk_link_features(chunk_id, anchor_chunk_ids, chunk_store, chunk_to_nodes
     chunk_nodes = set(chunk_to_nodes.get(chunk_id, set()))
     chunk_edges = set(chunk_to_edges.get(chunk_id, set()))
     linked_chunk_count = 0
+    linked_strength = 0.0
     touched_docs = set()
     shared_node_count = 0
     shared_edge_count = 0
@@ -116,6 +152,10 @@ def _chunk_link_features(chunk_id, anchor_chunk_ids, chunk_store, chunk_to_nodes
         )
         if shared_nodes > 0 or shared_edges > 0 or neighbor_touch:
             linked_chunk_count += 1
+            linked_strength += _weighted_node_mass(chunk_nodes & other_nodes, node_to_chunks)
+            linked_strength += _weighted_edge_mass(chunk_edges & other_edges, edge_to_chunks)
+            if neighbor_touch:
+                linked_strength += 0.35
             other_doc = chunk_store.get(other_chunk_id, {}).get("full_doc_id")
             if other_doc:
                 touched_docs.add(other_doc)
@@ -125,6 +165,7 @@ def _chunk_link_features(chunk_id, anchor_chunk_ids, chunk_store, chunk_to_nodes
             same_doc_band += 1
     return {
         "linked_chunk_count": linked_chunk_count,
+        "linked_strength": round(linked_strength, 6),
         "distinct_doc_touch": len(touched_docs),
         "shared_node_count": shared_node_count,
         "shared_edge_count": shared_edge_count,
@@ -151,6 +192,13 @@ def _rank_theme_bridge_chunks(
     for chunk_id in frontier_chunk_ids:
         if chunk_id in selected_chunk_ids:
             continue
+        structure_penalty = _chunk_structure_penalty(
+            chunk_id,
+            chunk_to_nodes,
+            chunk_to_edges,
+            node_to_chunks,
+            edge_to_chunks,
+        )
         features = _chunk_link_features(
             chunk_id,
             selected_chunk_ids,
@@ -168,7 +216,9 @@ def _rank_theme_bridge_chunks(
         introduced_nodes = candidate_nodes - covered_nodes
         introduced_edges = candidate_edges - covered_edges
         introduced_node_query_rel = sum(
-            lexical_overlap_score(query, normalize_text(str(node_id))) for node_id in introduced_nodes
+            lexical_overlap_score(query, normalize_text(str(node_id)))
+            * _inverse_sqrt_degree(len(node_to_chunks.get(node_id, set())))
+            for node_id in introduced_nodes
         )
         introduced_edge_query_rel = 0.0
         for edge_id in introduced_edges:
@@ -182,15 +232,20 @@ def _rank_theme_bridge_chunks(
                 ]
             ).strip()
             if edge_text:
-                introduced_edge_query_rel += lexical_overlap_score(query, edge_text)
-        introduced_query_rel = introduced_node_query_rel + introduced_edge_query_rel
+                introduced_edge_query_rel += (
+                    lexical_overlap_score(query, edge_text)
+                    * _inverse_sqrt_degree(len(edge_to_chunks.get(edge_id, set())))
+                )
+        introduced_query_rel = (introduced_node_query_rel + introduced_edge_query_rel) * structure_penalty
         if introduced_query_rel <= 0:
             continue
         query_alignment = float(query_chunk_score_lookup.get(chunk_id, 0.0))
         scored.append(
             {
                 "chunk_id": chunk_id,
-                "frontier_touch": features["linked_chunk_count"],
+                "frontier_touch": round(features["linked_strength"] * structure_penalty, 6),
+                "linked_chunk_count": features["linked_chunk_count"],
+                "structure_penalty": round(structure_penalty, 6),
                 "introduced_query_rel": round(introduced_query_rel, 6),
                 "introduced_node_query_rel": round(introduced_node_query_rel, 6),
                 "introduced_edge_query_rel": round(introduced_edge_query_rel, 6),
@@ -236,6 +291,13 @@ def _rank_theme_support_chunks(
     for chunk_id in candidate_chunk_ids:
         if chunk_id in selected_chunk_ids:
             continue
+        structure_penalty = _chunk_structure_penalty(
+            chunk_id,
+            chunk_to_nodes,
+            chunk_to_edges,
+            node_to_chunks,
+            edge_to_chunks,
+        )
         chunk_text = normalize_text(chunk_store.get(chunk_id, {}).get("content", ""))
         query_alignment = max(float(query_chunk_score_lookup.get(chunk_id, 0.0)), lexical_overlap_score(query, chunk_text))
         if query_alignment <= 0:
@@ -263,6 +325,10 @@ def _rank_theme_support_chunks(
             edge_data = graph.get_edge_data(edge_id[0], edge_id[1]) if graph is not None and graph.has_edge(*edge_id) else {}
             introduced_relation_types.add(normalize_relation_category(edge_data or {}))
         new_relation_count = len(introduced_relation_types - covered_relation_types)
+        introduced_mass = (
+            _weighted_node_mass(introduced_nodes, node_to_chunks)
+            + _weighted_edge_mass(introduced_edges, edge_to_chunks)
+        ) * structure_penalty
         scored.append(
             {
                 "chunk_id": chunk_id,
@@ -270,7 +336,10 @@ def _rank_theme_support_chunks(
                 "introduced_relation_count": new_relation_count,
                 "introduced_node_count": len(introduced_nodes),
                 "introduced_edge_count": len(introduced_edges),
-                "frontier_touch": features["linked_chunk_count"],
+                "introduced_mass": round(introduced_mass, 6),
+                "frontier_touch": round(features["linked_strength"] * structure_penalty, 6),
+                "linked_chunk_count": features["linked_chunk_count"],
+                "structure_penalty": round(structure_penalty, 6),
                 "node_ids": sorted(chunk_to_nodes.get(chunk_id, set())),
                 "edge_ids": sorted(chunk_to_edges.get(chunk_id, set())),
             }
@@ -278,7 +347,7 @@ def _rank_theme_support_chunks(
     scored.sort(
         key=lambda item: (
             -item["introduced_relation_count"],
-            -(item["introduced_node_count"] + item["introduced_edge_count"]),
+            -item["introduced_mass"],
             -item["query_alignment"],
             -item["frontier_touch"],
             item["chunk_id"],
@@ -335,6 +404,13 @@ def _rank_theme_peripheral_chunks(
     for chunk_id in candidates:
         if chunk_id in selected_chunk_ids:
             continue
+        structure_penalty = _chunk_structure_penalty(
+            chunk_id,
+            chunk_to_nodes,
+            chunk_to_edges,
+            node_to_chunks,
+            edge_to_chunks,
+        )
         features = _chunk_link_features(
             chunk_id,
             seed_chunk_ids,
@@ -352,7 +428,9 @@ def _rank_theme_peripheral_chunks(
             {
                 "chunk_id": chunk_id,
                 "query_alignment": round(query_alignment, 6),
-                "frontier_touch": features["linked_chunk_count"],
+                "frontier_touch": round(features["linked_strength"] * structure_penalty, 6),
+                "linked_chunk_count": features["linked_chunk_count"],
+                "structure_penalty": round(structure_penalty, 6),
                 "node_ids": sorted(chunk_to_nodes.get(chunk_id, set())),
                 "edge_ids": sorted(chunk_to_edges.get(chunk_id, set())),
             }
@@ -588,6 +666,13 @@ def _reseed_trace_root(
         )
         if link_features["linked_chunk_count"] <= 0 and link_features["same_doc_band"] <= 0:
             continue
+        structure_penalty = _chunk_structure_penalty(
+            chunk_id,
+            chunk_to_nodes,
+            chunk_to_edges,
+            node_to_chunks,
+            edge_to_chunks,
+        )
         query_alignment = float(query_chunk_score_lookup.get(chunk_id, 0.0))
         doc_novelty = int(
             bool(
@@ -598,7 +683,7 @@ def _reseed_trace_root(
         )
         sort_key = (
             len(uncovered_hits),
-            link_features["linked_chunk_count"],
+            link_features.get("linked_strength", 0.0) * structure_penalty,
             len(term_hits),
             doc_novelty,
             query_alignment,
@@ -612,6 +697,8 @@ def _reseed_trace_root(
                 "new_query_terms": sorted(uncovered_hits),
                 "all_query_terms": sorted(term_hits),
                 "linked_chunk_count": link_features["linked_chunk_count"],
+                "linked_strength": round(link_features.get("linked_strength", 0.0) * structure_penalty, 6),
+                "structure_penalty": round(structure_penalty, 6),
                 "doc_novelty": doc_novelty,
             }
     return best_item
@@ -798,7 +885,6 @@ def _build_theme_reseed_candidate_hits(
 def _reseed_theme_root_chunks(
     *,
     query,
-    query_contract,
     graph,
     selected_chunk_ids,
     round_chunk_ids,
@@ -838,8 +924,9 @@ def _reseed_theme_root_chunks(
         chunk_store=chunk_store,
         chunk_to_nodes=chunk_to_nodes,
         chunk_to_edges=chunk_to_edges,
+        node_to_chunks=node_to_chunks,
+        edge_to_chunks=edge_to_chunks,
         top_k=top_k,
-        query_contract=query_contract,
         graph=graph,
     )
     if not reseeded:
@@ -855,7 +942,6 @@ def _reseed_theme_root_chunks(
 def _expand_theme_chunk_graph(
     *,
     query,
-    query_contract,
     graph,
     root_chunk_ids,
     root_chunk_score_lookup,
@@ -1255,7 +1341,6 @@ def _path_bridge_signature(path, node_to_component):
 
 def _graph_bridge_association(
     graph,
-    query_contract,
     current_nodes,
     current_edges,
     top_nodes,
@@ -1338,27 +1423,17 @@ def _graph_bridge_association(
                 }
             )
 
-    if query_contract == "theme-grounded":
-        candidate_paths.sort(
-            key=lambda item: (
-                -item["bridge_gain"],
-                -item["path_doc_gain"],
-                -item["specificity_gain"],
-                item["hub_penalty"],
-                -item["new_source_count"],
-                item["path_length"],
-                item["path"],
-            )
+    candidate_paths.sort(
+        key=lambda item: (
+            -item["bridge_gain"],
+            -item["path_doc_gain"],
+            -item["specificity_gain"],
+            item["hub_penalty"],
+            -item["new_source_count"],
+            item["path_length"],
+            item["path"],
         )
-    else:
-        candidate_paths.sort(
-            key=lambda item: (
-                -item["bridge_gain"],
-                -item["new_source_count"],
-                item["path_length"],
-                item["path"],
-            )
-        )
+    )
     selected_paths = candidate_paths[:path_budget]
     selected_nodes = set()
     selected_edges = set()
@@ -1395,7 +1470,6 @@ def _chunk_bridge_touch(chunk_id, current_nodes, current_edges, chunk_to_nodes, 
 
 def _chunk_bridge_association(
     graph,
-    query_contract,
     current_nodes,
     current_edges,
     root_chunk_ids,
@@ -1491,32 +1565,19 @@ def _chunk_bridge_association(
             }
         )
 
-    if query_contract == "theme-grounded":
-        scored_chunks.sort(
-            key=lambda item: (
-                -item["bridge_gain"],
-                -item["doc_gain"],
-                -item["specificity_gain"],
-                -item["frontier_touch"],
-                -item["new_source_count"],
-                -(item["new_node_count"] + item["new_edge_count"]),
-                -item["root_overlap"],
-                -item["root_band_alignment"],
-                item["chunk_id"],
-            )
+    scored_chunks.sort(
+        key=lambda item: (
+            -item["bridge_gain"],
+            -item["doc_gain"],
+            -item["specificity_gain"],
+            -item["frontier_touch"],
+            -item["new_source_count"],
+            -(item["new_node_count"] + item["new_edge_count"]),
+            -item["root_overlap"],
+            -item["root_band_alignment"],
+            item["chunk_id"],
         )
-    else:
-        scored_chunks.sort(
-            key=lambda item: (
-                -item["bridge_gain"],
-                -item["frontier_touch"],
-                -item["new_source_count"],
-                -(item["new_node_count"] + item["new_edge_count"]),
-                -item["root_overlap"],
-                -item["root_band_alignment"],
-                item["chunk_id"],
-            )
-        )
+    )
     selected_chunks = scored_chunks[:chunk_budget]
     selected_nodes = set()
     selected_edges = set()
@@ -1532,7 +1593,6 @@ def _chunk_bridge_association(
 
 def bridge_association(
     graph,
-    query_contract,
     current_nodes,
     current_edges,
     root_chunk_ids,
@@ -1553,7 +1613,6 @@ def bridge_association(
     chunk_bridge_budget = max(1, path_budget - graph_bridge_budget)
     graph_output = _graph_bridge_association(
         graph=graph,
-        query_contract=query_contract,
         current_nodes=current_nodes,
         current_edges=current_edges,
         top_nodes=top_nodes,
@@ -1566,7 +1625,6 @@ def bridge_association(
     )
     chunk_output = _chunk_bridge_association(
         graph=graph,
-        query_contract=query_contract,
         current_nodes=current_nodes,
         current_edges=current_edges,
         root_chunk_ids=root_chunk_ids,
@@ -1812,7 +1870,6 @@ def _promote_theme_frontier_roots(
 def _chunk_coverage_association(
     graph,
     query,
-    query_contract,
     current_nodes,
     current_edges,
     current_categories,
@@ -1866,7 +1923,7 @@ def _chunk_coverage_association(
             default=0.0,
         )
         query_alignment = _query_band_alignment({chunk_id}, query_chunk_score_lookup, chunk_neighbors)
-        if query_contract == "theme-grounded" and query_alignment < 0.05 and root_band_alignment < 0.15:
+        if query_alignment < 0.05 and root_band_alignment < 0.15:
             continue
         scored_chunks.append(
             {
@@ -1883,31 +1940,18 @@ def _chunk_coverage_association(
             }
         )
 
-    if query_contract in {"theme-grounded", "comparison-grounded"}:
-        if query_priority:
-            scored_chunks.sort(
-                key=lambda item: (
-                    -item["query_alignment"],
-                    -(item["new_node_count"] + item["new_edge_count"]),
-                    -item["new_relation_count"],
-                    -item["new_source_count"],
-                    -item["root_overlap"],
-                    -item["root_band_alignment"],
-                    item["chunk_id"],
-                )
+    if query_priority:
+        scored_chunks.sort(
+            key=lambda item: (
+                -item["query_alignment"],
+                -(item["new_node_count"] + item["new_edge_count"]),
+                -item["new_relation_count"],
+                -item["new_source_count"],
+                -item["root_overlap"],
+                -item["root_band_alignment"],
+                item["chunk_id"],
             )
-        else:
-            scored_chunks.sort(
-                key=lambda item: (
-                    -(item["new_node_count"] + item["new_edge_count"]),
-                    -item["new_relation_count"],
-                    -item["new_source_count"],
-                    -item["root_overlap"],
-                    -item["root_band_alignment"],
-                    -item["query_alignment"],
-                    item["chunk_id"],
-                )
-            )
+        )
     else:
         scored_chunks.sort(
             key=lambda item: (
@@ -1916,6 +1960,7 @@ def _chunk_coverage_association(
                 -item["new_source_count"],
                 -item["root_overlap"],
                 -item["root_band_alignment"],
+                -item["query_alignment"],
                 item["chunk_id"],
             )
         )
@@ -1935,7 +1980,6 @@ def _chunk_coverage_association(
 def coverage_association(
     graph,
     query,
-    query_contract,
     current_nodes,
     current_edges,
     root_chunk_ids,
@@ -2004,7 +2048,7 @@ def coverage_association(
             _query_band_alignment(source_chunks, query_chunk_score_lookup, chunk_neighbors),
             _edge_query_alignment(edge_id, query, graph),
         )
-        if query_contract == "theme-grounded" and query_alignment < 0.05 and root_overlap <= 0 and chunk_alignment < 0.12:
+        if query_alignment < 0.05 and root_overlap <= 0 and chunk_alignment < 0.12:
             continue
         coverage_gain = new_source_count if new_source_count > 0 else new_relation
         if coverage_gain < semantic_edge_min_score:
@@ -2027,29 +2071,17 @@ def coverage_association(
                 "source_chunk_ids": sorted(source_chunks),
             }
         )
-    if query_contract in {"theme-grounded", "comparison-grounded", "section-grounded"}:
-        if query_priority:
-            scored_edges.sort(
-                key=lambda item: (
-                    -item["query_alignment"],
-                    -item["coverage_gain"],
-                    -item["new_relation"],
-                    -item["root_overlap"],
-                    -item["chunk_alignment"],
-                    item["edge"],
-                )
+    if query_priority:
+        scored_edges.sort(
+            key=lambda item: (
+                -item["query_alignment"],
+                -item["coverage_gain"],
+                -item["new_relation"],
+                -item["root_overlap"],
+                -item["chunk_alignment"],
+                item["edge"],
             )
-        else:
-            scored_edges.sort(
-                key=lambda item: (
-                    -item["coverage_gain"],
-                    -item["new_relation"],
-                    -item["root_overlap"],
-                    -item["chunk_alignment"],
-                    -item["query_alignment"],
-                    item["edge"],
-                )
-            )
+        )
     else:
         scored_edges.sort(
             key=lambda item: (
@@ -2057,6 +2089,7 @@ def coverage_association(
                 -item["new_relation"],
                 -item["root_overlap"],
                 -item["chunk_alignment"],
+                -item["query_alignment"],
                 item["edge"],
             )
         )
@@ -2089,7 +2122,7 @@ def coverage_association(
             _query_band_alignment(source_chunks, query_chunk_score_lookup, chunk_neighbors),
             _node_query_alignment(node_id, query, graph),
         )
-        if query_contract == "theme-grounded" and query_alignment < 0.05 and root_overlap <= 0 and chunk_alignment < 0.12:
+        if query_alignment < 0.05 and root_overlap <= 0 and chunk_alignment < 0.12:
             continue
         coverage_gain = new_source_count if new_source_count > 0 else new_relation_count
         if coverage_gain < semantic_node_min_score:
@@ -2112,29 +2145,17 @@ def coverage_association(
                 "source_chunk_ids": sorted(source_chunks),
             }
         )
-    if query_contract in {"theme-grounded", "comparison-grounded", "section-grounded"}:
-        if query_priority:
-            scored_nodes.sort(
-                key=lambda item: (
-                    -item["query_alignment"],
-                    -item["coverage_gain"],
-                    -item["bridge_strength"],
-                    -item["root_overlap"],
-                    -item["chunk_alignment"],
-                    item["id"],
-                )
+    if query_priority:
+        scored_nodes.sort(
+            key=lambda item: (
+                -item["query_alignment"],
+                -item["coverage_gain"],
+                -item["bridge_strength"],
+                -item["root_overlap"],
+                -item["chunk_alignment"],
+                item["id"],
             )
-        else:
-            scored_nodes.sort(
-                key=lambda item: (
-                    -item["coverage_gain"],
-                    -item["bridge_strength"],
-                    -item["root_overlap"],
-                    -item["chunk_alignment"],
-                    -item["query_alignment"],
-                    item["id"],
-                )
-            )
+        )
     else:
         scored_nodes.sort(
             key=lambda item: (
@@ -2142,6 +2163,7 @@ def coverage_association(
                 -item["bridge_strength"],
                 -item["root_overlap"],
                 -item["chunk_alignment"],
+                -item["query_alignment"],
                 item["id"],
             )
         )
@@ -2151,7 +2173,6 @@ def coverage_association(
     chunk_output = _chunk_coverage_association(
         graph=graph,
         query=query,
-        query_contract=query_contract,
         current_nodes=current_nodes,
         current_edges=current_edges,
         current_categories=current_categories,
@@ -2217,17 +2238,10 @@ def build_edge_role_sets(root_edges, structural_edges, semantic_edges):
     return roles
 
 
-def _support_candidate_sort_key(item, query_contract):
-    if query_contract in {"theme-grounded", "comparison-grounded", "section-grounded"}:
-        return (
-            -item["query_alignment"],
-            -item["chunk_alignment"],
-            -len(item["supporting_chunk_ids"]),
-            item["label"],
-        )
+def _support_candidate_sort_key(item):
     return (
-        -item["chunk_alignment"],
         -item["query_alignment"],
+        -item["chunk_alignment"],
         -len(item["supporting_chunk_ids"]),
         item["label"],
     )
@@ -2236,7 +2250,6 @@ def _support_candidate_sort_key(item, query_contract):
 def _collect_support_candidates(
     *,
     query,
-    query_contract,
     graph,
     final_nodes,
     final_edges,
@@ -2309,7 +2322,7 @@ def _collect_support_candidates(
             }
         )
 
-    point_candidates.sort(key=lambda item: _support_candidate_sort_key(item, query_contract))
+    point_candidates.sort(key=_support_candidate_sort_key)
     return point_candidates
 
 
@@ -2381,7 +2394,7 @@ def _aspect_label_from_cluster(cluster_items, query, chunk_store):
     return labels[0] if labels else "aspect"
 
 
-def _build_aspect_points(query, query_contract, support_candidates, chunk_store, top_k):
+def _build_aspect_points(query, support_candidates, chunk_store, top_k):
     shortlist = support_candidates[: max(top_k * 4, 16)]
     if not shortlist:
         return []
@@ -2430,7 +2443,6 @@ def _build_aspect_points(query, query_contract, support_candidates, chunk_store,
         aspect_points.append(
             {
                 "point_type": "aspect",
-                "aspect_contract": query_contract,
                 "label": _aspect_label_from_cluster(cluster_items, query, chunk_store),
                 "query_alignment": round(sum(item.get("query_alignment", 0.0) for item in cluster_items) / len(cluster_items), 6),
                 "chunk_alignment": round(max(item.get("chunk_alignment", 0.0) for item in cluster_items), 6),
@@ -2461,7 +2473,6 @@ def _build_aspect_points(query, query_contract, support_candidates, chunk_store,
 def extract_candidate_points(
     *,
     query,
-    query_contract,
     graph,
     final_nodes,
     final_edges,
@@ -2482,7 +2493,6 @@ def extract_candidate_points(
     """
     point_candidates = _collect_support_candidates(
         query=query,
-        query_contract=query_contract,
         graph=graph,
         final_nodes=final_nodes,
         final_edges=final_edges,
@@ -2495,31 +2505,16 @@ def extract_candidate_points(
         allowed_doc_ids=allowed_doc_ids,
     )
 
-    if query_contract in {"theme-grounded", "comparison-grounded"}:
-        return _build_aspect_points(
-            query=query,
-            query_contract=query_contract,
-            support_candidates=point_candidates,
-            chunk_store=chunk_store,
-            top_k=top_k,
-        )
-
-    selected = []
-    seen_labels = set()
-    for item in point_candidates:
-        dedupe_key = (item["point_type"], item["label"])
-        if dedupe_key in seen_labels:
-            continue
-        seen_labels.add(dedupe_key)
-        selected.append(item)
-        if len(selected) >= top_k:
-            break
-    return selected
+    return _build_aspect_points(
+        query=query,
+        support_candidates=point_candidates,
+        chunk_store=chunk_store,
+        top_k=top_k,
+    )
 
 
 def expand_associative_graph(
     query,
-    query_contract,
     graph,
     root_nodes,
     root_edges,
@@ -2546,7 +2541,6 @@ def expand_associative_graph(
     """Run alternating bridge-association and coverage-association rounds."""
     return _expand_theme_chunk_graph(
         query=query,
-        query_contract=query_contract,
         graph=graph,
         root_chunk_ids=root_chunk_ids,
         root_chunk_score_lookup=root_chunk_score_lookup,

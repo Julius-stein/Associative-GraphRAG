@@ -2,6 +2,8 @@
 
 Generation and embedding credentials are inherited from the existing LightRAG
 config so this project can reuse the same API setup.
+
+加载本项目的模型与嵌入配置，支持环境变量覆盖。
 """
 
 import os
@@ -21,7 +23,10 @@ def _env_int(name, default):
 
 
 def _load_scheme4_config():
-    """Load the shared OpenAI-compatible config from the original repo."""
+    """Load the shared OpenAI-compatible config from the original repo.
+
+    从上层 `llm_config.py` 中读取通用生成与嵌入配置。
+    """
     module_path = Path(__file__).resolve().parents[1] / "llm_config.py"
     spec = spec_from_file_location("assoc_llm_config", module_path)
     module = module_from_spec(spec)
@@ -31,7 +36,10 @@ def _load_scheme4_config():
 
 
 def load_llm_config():
-    """Load generation + embedding config, letting env vars override secrets."""
+    """Load generation + embedding config, letting env vars override secrets.
+
+    加载 LLM 配置，并允许环境变量覆盖关键参数。
+    """
     config = deepcopy(_load_scheme4_config())
     env_name = config.get("api_key_env")
     if env_name and os.getenv(env_name):
@@ -49,7 +57,10 @@ def load_llm_config():
 
 
 def load_judge_config():
-    """Use a separate judge model so generation and evaluation can diverge."""
+    """Use a separate judge model so generation and evaluation can diverge.
+
+    为评分过程加载独立模型配置，避免与生成阶段共用同一模型。
+    """
     config = load_llm_config()
     config["model"] = os.getenv("OPENAI_JUDGE_MODEL", "gpt-5.4-mini")
     config["max_concurrency"] = int(os.getenv("OPENAI_JUDGE_MAX_CONCURRENCY", str(config.get("max_concurrency", 4))))

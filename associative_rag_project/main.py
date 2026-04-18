@@ -1,4 +1,7 @@
-"""CLI entrypoint for retrieval, answer generation, judging, and full runs."""
+"""CLI entrypoint for retrieval, answer generation, judging, and full runs.
+
+提供一套命令行接口，用于检索、生成、评判和端到端实验运行。
+"""
 
 import argparse
 import json
@@ -13,10 +16,10 @@ from .data import (
     resolve_baseline_file,
     resolve_questions_file,
 )
-from .judge import render_winrate_markdown_table, run_winrate_judgement
+from .judge import load_judge_corpus_resources, render_winrate_markdown_table, run_winrate_judgement
 from .llm_client import OpenAICompatibleClient, generate_answers
 from .logging_utils import log
-from .pipeline import retrieve_corpus_queries
+from .pipeline import retrieve_corpus_queries, run_corpus_queries_online
 
 
 def build_parser():
@@ -30,7 +33,7 @@ def build_parser():
     common.add_argument("--rewrites-file")
     common.add_argument("--limit-groups", "--limit", dest="limit_groups", type=int)
     common.add_argument("--output-dir", default="associative_rag_project/runs")
-    common.add_argument("--top-chunks", type=int, default=5)
+    common.add_argument("--top-chunks", type=int, default=6)
     common.add_argument("--chunk-candidate-multiplier", type=int, default=3)
     common.add_argument("--candidate-pool-size", type=int, default=30)
     common.add_argument("--retrieval-mode", choices=["bm25", "dense", "hybrid"], default="dense")
@@ -62,14 +65,8 @@ def build_parser():
     common.add_argument("--semantic-node-min-score", type=float, default=0.03)
     common.add_argument("--association-rounds", type=int, default=2)
     common.add_argument("--group-limit", type=int, default=8)
-    common.add_argument("--max-source-chunks", type=int, default=14)
-    common.add_argument("--max-source-word-budget", type=int, default=4500)
-    common.add_argument(
-        "--organization-controller",
-        choices=["off", "predicted", "oracle"],
-        default="predicted",
-        help="Lightweight organization controller: off uses a fixed theme layout, predicted uses heuristics, oracle reads layout from query metadata.",
-    )
+    common.add_argument("--max-source-chunks", type=int, default=18)
+    common.add_argument("--max-source-word-budget", type=int, default=5600)
     common.add_argument("--max-workers", type=int, default=12)
 
     subparsers.add_parser("retrieve", parents=[common])
@@ -80,6 +77,7 @@ def build_parser():
     answer.add_argument("--max-workers", type=int)
 
     judge = subparsers.add_parser("judge")
+    judge.add_argument("--corpus-dir")
     judge.add_argument("--questions-file", required=True)
     judge.add_argument("--candidate-file", required=True)
     judge.add_argument("--baseline-file")
@@ -130,12 +128,14 @@ def retrieval_config_from_args(args):
         "group_limit": args.group_limit,
         "max_source_chunks": args.max_source_chunks,
         "max_source_word_budget": args.max_source_word_budget,
-        "organization_controller": args.organization_controller,
     }
 
 
 def command_retrieve(args):
-    """Run retrieval only and save the evidence package."""
+    """Run retrieval only and save the evidence package.
+
+    仅运行检索阶段，输出检索结果和性能摘要。
+    """
     corpus_name = infer_corpus_name(args.corpus_dir)
     questions_file = resolve_questions_file(corpus_name, args.questions_file)
     log(f"[main] retrieve corpus={args.corpus_dir} questions={questions_file}")
@@ -152,7 +152,10 @@ def command_retrieve(args):
 
 
 def command_answer(args):
-    """Turn a retrieval JSON into model answers."""
+    """Turn a retrieval JSON into model answers.
+
+    读取检索输出文件，调用生成模型并保存答案结果。
+    """
     retrieval_file = Path(args.retrieval_file)
     log(f"[main] answer retrieval_file={retrieval_file}")
     payload = json.loads(retrieval_file.read_text(encoding="utf-8"))
@@ -165,11 +168,16 @@ def command_answer(args):
 
 
 def command_judge(args):
-    """Compare candidate answers against a baseline with the FG-RAG-style judge."""
+    """Compare candidate answers against a baseline with the FG-RAG-style judge.
+
+    对候选答案与基线答案进行成对评判，并生成胜率报告。
+    """
     candidate_answers = json.loads(Path(args.candidate_file).read_text(encoding="utf-8"))
     questions = extract_questions(Path(args.questions_file))
     llm_client = OpenAICompatibleClient(load_judge_config())
     candidate_label = args.candidate_label or Path(args.candidate_file).stem
+    corpus_dir = Path(args.corpus_dir) if args.corpus_dir else Path("Datasets") / infer_corpus_name(args.questions_file) / "index"
+    corpus_resources = load_judge_corpus_resources(corpus_dir)
 
     if bool(args.baseline_file) == bool(args.baseline_dir):
         raise ValueError("Please provide exactly one of --baseline-file or --baseline-dir")
@@ -206,6 +214,7 @@ def command_judge(args):
             llm_client,
             output_path=output_path,
             max_workers=args.max_workers,
+            corpus_resources=corpus_resources,
         )
         print(output_path)
         print(json.dumps(payload["summary"], ensure_ascii=False, indent=2))
@@ -237,6 +246,7 @@ def command_judge(args):
             llm_client,
             output_path=output_path,
             max_workers=args.max_workers,
+            corpus_resources=corpus_resources,
         )
         per_baseline_payloads.append(
             {
@@ -269,6 +279,8 @@ def command_run(args):
 
     This is mainly useful for fast iteration and for measuring how retrieval
     settings affect the overall system runtime before running full evaluation.
+
+    快速执行检索加生成流程，适合调参与验证效果。
     """
     corpus_name = infer_corpus_name(args.corpus_dir)
     log(f"[main] run corpus={corpus_name}")
@@ -277,44 +289,30 @@ def command_run(args):
         raise ValueError(f"Could not resolve questions file for corpus: {corpus_name}")
     log(f"[main] questions={questions_file}")
 
-    retrieve_start = perf_counter()
-    payload, retrieval_path = retrieve_corpus_queries(
+    run_start = perf_counter()
+    llm_client = OpenAICompatibleClient(load_llm_config())
+    payload, retrieval_path, answers, answer_output = run_corpus_queries_online(
         corpus_dir=args.corpus_dir,
+        llm_client=llm_client,
         rewrites_file=args.rewrites_file,
         questions_file=str(questions_file),
         limit_groups=args.limit_groups,
         output_dir=args.output_dir,
+        answer_output_file=args.answer_output_file,
+        max_workers=args.max_workers,
         **retrieval_config_from_args(args),
     )
-    retrieve_elapsed = perf_counter() - retrieve_start
-    log(f"[main] retrieve finished in {retrieve_elapsed:.2f}s -> {retrieval_path}")
-
-    llm_client = OpenAICompatibleClient(load_llm_config())
-    output_dir = Path(args.output_dir)
-    stem = retrieval_path.stem.replace("_retrieval", "")
-    answer_output = Path(args.answer_output_file) if args.answer_output_file else output_dir / f"{stem}_answers.json"
-
-    answer_start = perf_counter()
-    answers = generate_answers(
-        payload["results"],
-        output_path=answer_output,
-        llm_client=llm_client,
-        max_workers=args.max_workers,
-    )
-    answer_elapsed = perf_counter() - answer_start
-    total_elapsed = retrieve_elapsed + answer_elapsed
+    total_elapsed = perf_counter() - run_start
     log(
-        f"[main] run done retrieve={retrieve_elapsed:.2f}s "
-        f"answer={answer_elapsed:.2f}s total={total_elapsed:.2f}s"
+        f"[main] run done online_total={total_elapsed:.2f}s "
+        f"queries={len(answers)}"
     )
     print(retrieval_path)
     print(answer_output)
     print(
         json.dumps(
             {
-                "retrieval_seconds": round(retrieve_elapsed, 3),
-                "answer_seconds": round(answer_elapsed, 3),
-                "total_seconds": round(total_elapsed, 3),
+                "online_total_seconds": round(total_elapsed, 3),
                 "generated_answers": len(answers),
             },
             ensure_ascii=False,
@@ -332,24 +330,21 @@ def command_run_all(args):
         raise ValueError(f"Could not resolve questions file for corpus: {corpus_name}")
     baseline_file = resolve_baseline_file(corpus_name, args.baseline_file)
     log(f"[main] questions={questions_file} baseline={baseline_file}")
-    payload, retrieval_path = retrieve_corpus_queries(
+    llm_client = OpenAICompatibleClient(load_llm_config())
+    payload, retrieval_path, answers, answer_output = run_corpus_queries_online(
         corpus_dir=args.corpus_dir,
+        llm_client=llm_client,
         rewrites_file=args.rewrites_file,
         questions_file=str(questions_file),
         limit_groups=args.limit_groups,
         output_dir=args.output_dir,
+        answer_output_file=args.answer_output_file,
+        max_workers=args.max_workers,
         **retrieval_config_from_args(args),
     )
-    llm_client = OpenAICompatibleClient(load_llm_config())
     output_dir = Path(args.output_dir)
     stem = retrieval_path.stem.replace("_retrieval", "")
-    answer_output = Path(args.answer_output_file) if args.answer_output_file else output_dir / f"{stem}_answers.json"
-    answers = generate_answers(
-        payload["results"],
-        output_path=answer_output,
-        llm_client=llm_client,
-        max_workers=args.max_workers,
-    )
+    print(retrieval_path)
     print(answer_output)
     if baseline_file is not None:
         questions = extract_questions(questions_file)
@@ -358,6 +353,7 @@ def command_run_all(args):
         baseline_answers = load_baseline_answers(baseline_file)[: len(answers)]
         judge_output = Path(args.judge_output_file) if args.judge_output_file else output_dir / f"{stem}_vs_{baseline_file.stem}_winrate.json"
         judge_client = OpenAICompatibleClient(load_judge_config())
+        corpus_resources = load_judge_corpus_resources(args.corpus_dir)
         judge_payload = run_winrate_judgement(
             questions[: len(answers)],
             answers,
@@ -365,6 +361,7 @@ def command_run_all(args):
             judge_client,
             output_path=judge_output,
             max_workers=args.max_workers,
+            corpus_resources=corpus_resources,
         )
         print(judge_output)
         print(json.dumps(judge_payload["summary"], ensure_ascii=False, indent=2))

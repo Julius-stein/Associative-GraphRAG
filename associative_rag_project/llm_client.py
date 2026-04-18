@@ -1,4 +1,7 @@
-"""Answer-generation client and prompt builder."""
+"""Answer-generation client and prompt builder.
+
+生成答案的 LLM 调用封装。
+"""
 
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -18,55 +21,35 @@ Synthesize across sources when it helps, but do not inflate the answer into a br
 State uncertainty briefly when evidence is thin or mixed.
 Do not mention that the input came from a graph or a retrieval system unless the user asks."""
 
-
-def _contract_template_hints(query_contract: str) -> str:
-    if query_contract == "section-grounded":
-        return """Default answer shape for this query:
-- Prefer following the relevant sections, periods, parts, or local evidence bands.
-- Keep the answer anchored to those units instead of drifting into a free-form overview."""
-    if query_contract == "mechanism-grounded":
-        return """Default answer shape for this query:
-- Prefer explaining what drove the change, how it operated, and what it affected.
-- Keep causal links explicit instead of replacing them with broad topical coverage."""
-    if query_contract == "comparison-grounded":
-        return """Default answer shape for this query:
-- Prefer an explicit side-by-side comparison or clear comparison dimensions.
-- Surface both commonalities and differences when the evidence supports them."""
+def _theme_qfs_hints() -> str:
     return """Default answer shape for this query:
 - Organize the answer into multiple query-relevant aspects/themes.
 - Use representative examples to keep each aspect concrete and query-focused.
 - Prefer broad but still evidence-grounded coverage over a narrow deep dive when the query asks about overall influence or emergence."""
 
 
-def _theme_qfs_output_template(query_contract: str) -> str:
-    if query_contract != "theme-grounded":
-        return ""
-    return """Theme QFS Response Template (use these exact section headers):
-P1. Titles
-- Provide 4-8 concise aspect titles that directly answer the query.
-
-P2. Answer Outline
-- Give a 2-4 sentence high-level synthesis across aspects.
-
-P3. Queries, Summaries, and Evidence
-- For each aspect, use one tuple with this structure:
-  ⟨Question⟩ aspect-specific sub-question
-  ⟨Summary⟩ 2-4 sentence focused summary
-  ⟨Evidence⟩ 2-4 concrete evidence points (named items, events, periods, institutions, works, or relations)
-
-P4. Document Sections
-- Map each aspect to the most relevant source sections/chunks/groups in the evidence package.
-- Keep this concise and concrete (avoid generic statements like “many sources mention this”).
-
-P5. Refinement
-- For each tuple, refine the summary and evidence by removing weak/duplicated points and keeping only query-relevant support.
-- Briefly note uncertainty where evidence is thin or mixed.
+def _theme_qfs_output_template() -> str:
+    return """Theme answer shape:
+- Output the answer using the following explicit structure:
+  P1. Titles
+  P2. Answer Outline
+  P3. Queries, Summaries, and Evidence
+  P4. Document Sections
+  P5. Refinement
+- In P1, list distinct aspect titles that jointly cover the strongest supported angles of the query.
+- In P2, write one compact synthesis paragraph that directly answers the query and previews the main aspects.
+- In P3, for each aspect, provide:
+  ⟨Question⟩ one focused sub-question,
+  ⟨Summary⟩ one compact evidence-grounded summary,
+  ⟨Evidence⟩ the key supporting sources or concrete named anchors.
+- In P4, briefly map the main supporting source regions or document bands when useful.
+- In P5, refine the answer by noting how the aspects fit together and what uncertainty or gaps remain.
+- Use the structure to force coverage: do not collapse several angles into one heading if the evidence supports distinct aspects.
+## The structure is a tool to help you cover the query well, not a formality to check off. Use it when it helps, but do not feel compelled to fill every part if it does not fit the evidence. Always prioritize a clear, direct answer to the query that is well-grounded in the evidence.
 """
 
 
-def _is_broad_theme_query(query: str, query_contract: str) -> bool:
-    if query_contract != "theme-grounded":
-        return False
+def _is_broad_qfs_query(query: str) -> bool:
     query_lower = " ".join(query.lower().split())
     broad_cues = (
         "what are the primary reasons",
@@ -89,15 +72,24 @@ def _is_broad_theme_query(query: str, query_contract: str) -> bool:
     return any(cue in query_lower for cue in broad_cues)
 
 
-def build_generation_prompt(query, prompt_context, query_contract="theme-grounded"):
-    """Build a QFS-oriented prompt from the evidence package."""
+def build_generation_prompt(query, prompt_context):
+    """Build a QFS-oriented prompt from the evidence package.
+
+    参数:
+        query: 用户查询文本。
+        prompt_context: 组织层构造的 evidence package 文本。
+    返回:
+        生成模型的完整 prompt 文本。
+
+    构造给生成模型的问答提示，包含上下文与 QFS 任务提示。
+    """
     query_lower = query.lower()
     extra_constraints = []
     if any(term in query_lower for term in ["character", "characters", "passage", "passages", "narrative", "narratives"]):
         extra_constraints.append("- This query is about passage content. Prioritize people, events, themes, and historical or social forces over dataset or method descriptions.")
     if any(term in query_lower for term in ["historical", "history", "socio-political", "conflict", "conflicts"]):
         extra_constraints.append("- Emphasize comparative historical interpretation, not metadata about how the evidence was collected or modeled.")
-    if _is_broad_theme_query(query, query_contract):
+    if _is_broad_qfs_query(query):
         extra_constraints.extend(
             [
                 "- This is a broad theme query: prioritize breadth of supported aspects, not just one tight storyline.",
@@ -108,8 +100,8 @@ def build_generation_prompt(query, prompt_context, query_contract="theme-grounde
             ]
         )
     extra_block = "\n".join(extra_constraints)
-    contract_hint_block = _contract_template_hints(query_contract)
-    theme_qfs_template_block = _theme_qfs_output_template(query_contract)
+    qfs_hint_block = _theme_qfs_hints()
+    theme_qfs_template_block = _theme_qfs_output_template()
     return f"""Answer the query using the evidence package below.
 
 Requirements:
@@ -122,15 +114,22 @@ Requirements:
 - Unless the query explicitly asks about datasets, models, benchmarks, or methods, do not center the answer on metadata, annotation schemes, or NLP systems.
 - If the evidence is partial or mixed, say so briefly.
 - Do not fabricate details outside the evidence.
-- Use the facet groups and linked sources as evidence aids, not as a script for the final prose.
+- Use the knowledge groups and linked sources as evidence aids, not as a script for the final prose.
 - Let strong anchor evidence determine the main points; do not let a broad facet summary dominate if its support is weak for this query.
-- You do not need to use every facet group. Select the evidence that best answers the question.
+- You do not need to use every knowledge group. Select the evidence that best answers the question.
 - Merge overlapping evidence when it supports the same point, but do not merge away distinctions the query cares about.
-- Read the facet summaries, linked-source previews, and sources together; avoid summarizing the Root Chunks table by itself.
-- Use Focused Entities and Focused Relations only when they help clarify the answer.
+- Read the Group Index, knowledge group dossiers, and sources together; do not summarize the evidence package structure itself.
+- Use listed entities and relation cues inside each knowledge group only when they help clarify the answer.
+- Write the final answer using the required P1-P5 structure.
+- Stay tightly grounded in the provided evidence. Do not drift into generic background knowledge just because the topic is familiar.
+- Prefer a small number of strong, query-facing aspects over broad but weakly supported historical narration.
+- Use the Group Index as a coverage map: your headings should collectively span the strongest distinct aspects available in the evidence.
+- Do not produce multiple headings that mainly restate the same market, institutional, or biographical angle unless the query itself specifically centers that angle.
+- Each heading should be justified by different evidence support; avoid writing several paragraphs that lean on the same small evidence cluster.
+- Do not reproduce the internal scaffold of the evidence package.
 
-Contract-Specific Hints:
-{contract_hint_block}
+QFS Hints:
+{qfs_hint_block}
 {extra_block}
 {theme_qfs_template_block}
 
@@ -178,7 +177,17 @@ class OpenAICompatibleClient:
         return any(token in name or token in text for token in retryable_tokens)
 
     def generate(self, prompt, system_prompt=GENERATION_SYSTEM_PROMPT, temperature=0.1, max_tokens=1500):
-        """Run one completion request with transient-error retries."""
+        """Run one completion request with transient-error retries.
+
+        参数:
+            prompt: 用户提示文本。
+            system_prompt: 系统角色提示内容。
+            temperature: 生成温度。
+            max_tokens: 最大生成长度。
+
+        返回:
+            LLM 生成的文本回复。
+        """
         last_error = None
         for attempt in range(1, self.generation_max_attempts + 1):
             try:
@@ -205,12 +214,42 @@ class OpenAICompatibleClient:
         raise last_error
 
 
+def generate_one_answer_record(record, llm_client):
+    """Generate one answer payload from one retrieval record.
+
+    对单条检索记录生成最终答案，并返回带统计信息的结果。
+    """
+    prompt = build_generation_prompt(
+        record["query"],
+        record["prompt_context"],
+    )
+    answer = llm_client.generate(prompt)
+    return {
+        "group_id": record["group_id"],
+        "query": record["query"],
+        "organization_mode": record.get("organization_mode", "qfs"),
+        "model_answer": answer,
+        "stats": record["stats"],
+    }
+
+
 def generate_answers(records, output_path, llm_client, max_workers=None):
     """Generate answers for a retrieval file in parallel and preserve order.
 
     If `output_path` already exists, completed records are reused and only the
     missing records are generated. Results are checkpointed after each finished
     record so a later retry can resume safely.
+
+    参数:
+        records: 检索结果记录列表，每条记录必须包含 group_id、query、prompt_context、stats 等字段。
+        output_path: 输出 JSON 文件路径，用于保存/恢复生成结果。
+        llm_client: LLM 客户端实例。
+        max_workers: 并行生成线程数，默认使用客户端最大并发数。
+
+    返回:
+        生成后的答案记录列表。
+
+    并行生成多个答案，支持断点重用与结果检查点保存。
     """
     max_workers = max_workers or llm_client.max_concurrency
     output_path = Path(output_path) if output_path is not None else None
@@ -237,19 +276,7 @@ def generate_answers(records, output_path, llm_client, max_workers=None):
             log(f"[answer] could not load existing answers from {output_path}: {exc}")
 
     def _one(record):
-        prompt = build_generation_prompt(
-            record["query"],
-            record["prompt_context"],
-            query_contract=record.get("query_contract", "theme-grounded"),
-        )
-        answer = llm_client.generate(prompt)
-        return {
-            "group_id": record["group_id"],
-            "query": record["query"],
-            "query_contract": record.get("query_contract", "theme-grounded"),
-            "model_answer": answer,
-            "stats": record["stats"],
-        }
+        return generate_one_answer_record(record, llm_client)
 
     pending = [(idx, record) for idx, record in enumerate(records) if results[idx] is None]
     if not pending:

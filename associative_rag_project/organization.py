@@ -1,21 +1,18 @@
 """Evidence organization over the final evidence subgraph.
 
-The current system uses a unified anchor/expand backbone and a lightweight
-organization controller:
+The current system uses a unified anchor/expand backbone and a single
+theme/QFS-oriented organization flow:
 
 - anchor/expand builds a high-recall final evidence graph
-- organization chooses a layout for packaging that graph into answer facets
+- organization compresses root traces into query-facing theme groups
 
-Supported layouts:
-- section-grounded
-- mechanism-grounded
-- comparison-grounded
-- theme-grounded
+将最终证据子图组织成自然语言可用的知识组，支持问答模型的主题型输出。
 """
 
 from __future__ import annotations
 
 import json
+import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 
@@ -25,54 +22,19 @@ from .common import STOPWORDS, edge_key, lexical_overlap_score, normalize_text, 
 from .retrieval import normalize_relation_category
 
 
-QUERY_CONTRACTS = [
-    "section-grounded",
-    "mechanism-grounded",
-    "comparison-grounded",
-    "theme-grounded",
-]
+ORGANIZATION_MODE = "qfs"
 
 
 def _normalize_layout_label(raw_value: str | None) -> str | None:
-    value = normalize_text(raw_value or "").strip()
-    if value in QUERY_CONTRACTS:
-        return value
-    if "section" in value:
-        return "section-grounded"
-    if "mechan" in value or "process" in value or "cause" in value:
-        return "mechanism-grounded"
-    if "compar" in value or "contrast" in value:
-        return "comparison-grounded"
-    if "theme" in value or "aspect" in value or "overview" in value:
-        return "theme-grounded"
-    return None
+    return ORGANIZATION_MODE
 
 
-def resolve_organization_layout(query_row, controller="predicted", default_layout="theme-grounded"):
-    """Resolve the organization layout with a lightweight controller.
+def resolve_organization_layout(query_row, controller="predicted", default_layout=ORGANIZATION_MODE):
+    """Resolve the organization layout.
 
-    Modes:
-    - `off`: always use `default_layout`
-    - `predicted`: use heuristic detection from the query text
-    - `oracle`: read layout metadata from the query row
+    The current system uses one unified QFS organization path.
     """
-    controller = (controller or "predicted").strip().lower()
-    if controller == "off":
-        layout = _normalize_layout_label(default_layout) or "theme-grounded"
-        return layout, {"mode": "off", "source": "default"}
-
-    if controller == "oracle":
-        for key in ("organization_contract", "query_contract", "contract", "layout"):
-            layout = _normalize_layout_label(query_row.get(key))
-            if layout:
-                return layout, {"mode": "oracle", "source": key}
-        raise ValueError(
-            "organization controller is set to oracle, but the query row has no valid "
-            "`organization_contract` / `query_contract` / `contract` / `layout` field"
-        )
-
-    layout = detect_query_contract(query_row["query"])
-    return layout, {"mode": "predicted", "source": "heuristic"}
+    return ORGANIZATION_MODE, {"mode": ORGANIZATION_MODE, "source": "fixed"}
 
 
 ASPECT_GROUPING_SYSTEM_PROMPT = """You plan query-facing evidence groups.
@@ -321,57 +283,6 @@ def _evidence_descriptor_text(label, relation_themes, focus_entities, anchor_chu
         if chunk_store.get(chunk_id, {}).get("content")
     )
     return " ".join(parts)
-
-
-def detect_query_contract(query: str) -> str:
-    """Pick exactly one organization contract for the query."""
-    query_lower = query.lower()
-    query_lower = " ".join(query_lower.split())
-    starts_how = query_lower.startswith(("how ", "how did", "how does", "how do", "how are", "how is", "how should", "how can", "how have"))
-    starts_in_what_ways = query_lower.startswith(("in what ways ", "in what way "))
-    starts_what = query_lower.startswith(("what ", "which "))
-    if any(phrase in query_lower for phrase in SECTION_EXPLICIT_PHRASES):
-        return "section-grounded"
-    if any(phrase in query_lower for phrase in COMPARISON_PHRASES):
-        return "comparison-grounded"
-    if query_lower.startswith(SECTION_LIST_HEADS) and any(noun in query_lower for noun in SECTION_LIST_NOUNS):
-        return "section-grounded"
-    if query_lower.startswith(("what seasonal", "what initial", "which seasonal", "which initial")):
-        return "section-grounded"
-    # Broad "how did ... influence ..." summaries (often theme-QFS) are easily
-    # over-classified as mechanism. Give them a theme override unless hard
-    # mechanism cues are explicitly present.
-    if (starts_how or starts_in_what_ways) and any(marker in query_lower for marker in BROAD_SCOPE_MARKERS) and any(
-        verb in query_lower for verb in MECHANISM_LINK_VERBS
-    ) and not any(cue in query_lower for cue in MECHANISM_HARD_CUES):
-        return "theme-grounded"
-    if query_lower.startswith(("what role did", "what role does", "what role do")) and not any(
-        cue in query_lower for cue in MECHANISM_HARD_CUES
-    ):
-        broad_role_hits = sum(1 for marker in THEME_ROLE_SCOPE_MARKERS if marker in query_lower)
-        if broad_role_hits >= 2 or any(marker in query_lower for marker in BROAD_SCOPE_MARKERS):
-            return "theme-grounded"
-    if query_lower.startswith("what role did") and any(
-        token in query_lower for token in ("play in", "shape", "influence", "affect", "evolution")
-    ):
-        return "mechanism-grounded"
-    if any(cue in query_lower for cue in MECHANISM_EXPLICIT_CUES) and any(
-        verb in query_lower for verb in MECHANISM_LINK_VERBS
-    ):
-        return "mechanism-grounded"
-    if (starts_how or starts_in_what_ways) and any(pattern in query_lower for pattern in MECHANISM_PROCESS_PATTERNS) and any(
-        verb in query_lower for verb in MECHANISM_LINK_VERBS
-    ):
-        return "mechanism-grounded"
-    if any(cue in query_lower for cue in THEME_REASON_CUES):
-        return "theme-grounded"
-    if starts_what and " and how " in query_lower:
-        return "theme-grounded"
-    if starts_how and any(marker in query_lower for marker in BROAD_SCOPE_MARKERS) and not any(
-        token in query_lower for token in ("process", "procedure", "preparation", "approach", "evaluate", "enhance", "convey", "transform")
-    ):
-        return "theme-grounded"
-    return "theme-grounded"
 
 
 def _chunk_local_index(final_nodes, final_edges, node_to_chunks, edge_to_chunks):
@@ -772,17 +683,11 @@ def _primary_theme(region: EvidenceRegion):
     return region.region_kind
 
 
-def _facet_prompt(query, contract, label):
-    if contract == "section-grounded":
-        return f"What section-like evidence block in the corpus best grounds the aspect '{label}' for: {query}"
-    if contract == "mechanism-grounded":
-        return f"What mechanism, cause, or process evidence in the corpus supports the aspect '{label}' for: {query}"
-    if contract == "comparison-grounded":
-        return f"What side, contrast, or comparison angle in the corpus supports the aspect '{label}' for: {query}"
+def _facet_prompt(query, label):
     return f"What major theme in the corpus supports the aspect '{label}' for: {query}"
 
 
-def _build_group(query, contract, group_id, label, regions, chunk_store):
+def _build_group(query, group_id, label, regions, chunk_store):
     root_chunk_ids = set()
     anchor_chunk_ids = []
     supporting_chunk_ids = set()
@@ -823,15 +728,14 @@ def _build_group(query, contract, group_id, label, regions, chunk_store):
         chunk_store,
     )
     summary = (
-        f"This {contract} facet centers on {label}. "
+        f"This QFS evidence group centers on {label}. "
         f"It is grounded in {len(anchor_chunk_ids)} anchor chunks and combines "
         f"{', '.join(sorted(set(region_kinds)))} evidence."
     )
     return {
         "group_id": group_id,
         "facet_label": label,
-        "organization_contract": contract,
-        "facet_prompt": _facet_prompt(query, contract, label),
+        "facet_prompt": _facet_prompt(query, label),
         "group_score": round(lexical_overlap_score(query, descriptor_text), 6),
         "query_rel": round(lexical_overlap_score(query, descriptor_text), 6),
         "anchor_support": len(anchor_chunk_ids),
@@ -944,7 +848,7 @@ def _retune_theme_group(group, query, representative_regions, chunk_store):
         ]
     representative_kinds = sorted({region.region_kind for region in representative_regions})
     group["group_summary"] = (
-        f"This theme-grounded facet centers on {group['facet_label']}. "
+        f"This QFS evidence group centers on {group['facet_label']}. "
         f"It uses representative root-connected evidence from {len(group.get('doc_ids', []))} documents "
         f"and synthesizes {', '.join(representative_kinds)} support."
     )
@@ -1103,7 +1007,7 @@ def _build_section_groups(
             label = f"section band {doc_ids[0][-6:]}:{start_order}-{end_order}"
         else:
             label = f"section band {doc_ids[0][-6:]}"
-        candidates.append(_build_group(query, "section-grounded", f"facet-{len(candidates)+1:02d}", label, [refined], chunk_store))
+        candidates.append(_build_group(query, f"facet-{len(candidates)+1:02d}", label, [refined], chunk_store))
     return _select_groups(
         candidates,
         group_limit,
@@ -1159,7 +1063,6 @@ def _build_mechanism_groups(query, root_regions, bridge_regions, theme_regions, 
         candidates.append(
             _build_group(
                 query,
-                "mechanism-grounded",
                 f"facet-{len(candidates)+1:02d}",
                 label,
                 deduped,
@@ -1179,7 +1082,6 @@ def _build_mechanism_groups(query, root_regions, bridge_regions, theme_regions, 
             candidates.append(
                 _build_group(
                     query,
-                    "mechanism-grounded",
                     f"facet-{len(candidates)+1:02d}",
                     f"pathway: {label}",
                     regions,
@@ -1212,7 +1114,6 @@ def _build_comparison_groups(query, root_regions, bridge_regions, chunk_store, g
         candidates.append(
             _build_group(
                 query,
-                "comparison-grounded",
                 f"facet-{len(candidates)+1:02d}",
                 f"comparison side {len(candidates)+1}: {label}",
                 [region],
@@ -1225,7 +1126,6 @@ def _build_comparison_groups(query, root_regions, bridge_regions, chunk_store, g
             candidates.append(
                 _build_group(
                     query,
-                    "comparison-grounded",
                     f"facet-x-{len(candidates)+1:02d}",
                     label,
                     [region],
@@ -1259,7 +1159,7 @@ def _build_theme_groups_legacy(query, root_regions, bridge_regions, theme_region
     groups = []
     for index, (label, regions) in enumerate(grouped.items(), start=1):
         representative_regions = _theme_representative_regions(query, regions)
-        group = _build_group(query, "theme-grounded", f"facet-{index:02d}", label, representative_regions, chunk_store)
+        group = _build_group(query, f"facet-{index:02d}", label, representative_regions, chunk_store)
         group["supporting_chunk_ids"] = sorted(
             {
                 chunk_id
@@ -1511,7 +1411,6 @@ def _build_theme_groups(query, root_regions, bridge_regions, theme_regions, chun
         label = _slot_group_label(query, slot, selected_regions)
         group = _build_group(
             query,
-            "theme-grounded",
             f"facet-{index:02d}",
             label,
             selected_regions,
@@ -1596,7 +1495,6 @@ def build_candidate_points_from_groups(facet_groups, top_k=8):
         candidate_points.append(
             {
                 "point_type": "aspect",
-                "aspect_contract": group.get("organization_contract"),
                 "label": normalize_text(group.get("facet_label", "")),
                 "query_alignment": round(float(group.get("query_rel", group.get("group_score", 0.0))), 6),
                 "chunk_alignment": round(
@@ -1655,12 +1553,8 @@ def _group_focus_pool(group, limit=8):
     return items[:limit]
 
 
-def _aspect_grouping_prompt(query, query_contract, facet_groups, group_limit):
-    contract_hint = (
-        "Build broad theme aspects that cover distinct major sides of the query."
-        if query_contract == "theme-grounded"
-        else "Build comparison aspects that act like comparison axes and keep both sides explicit."
-    )
+def _aspect_grouping_prompt(query, facet_groups, group_limit):
+    grouping_hint = "Build broad QFS aspects that cover distinct major sides of the query."
     unit_blocks = []
     for group in facet_groups:
         focus_pool = _group_focus_pool(group)
@@ -1682,7 +1576,7 @@ def _aspect_grouping_prompt(query, query_contract, facet_groups, group_limit):
     return f"""Plan query-facing evidence groups from the evidence units below.
 
 Requirements:
-- {contract_hint}
+- {grouping_hint}
 - Use only the given unit ids.
 - Use only focus items copied exactly from the provided focus_pool lines.
 - Select focus items first, then assign unit ids to each group.
@@ -1733,7 +1627,7 @@ def _priority_sort_texts(values, focus_items, limit):
     ]
 
 
-def _merge_groups_to_aspect(query, query_contract, aspect_index, aspect_label, focus_items, reason, member_groups, chunk_store):
+def _merge_groups_to_aspect(query, aspect_index, aspect_label, focus_items, reason, member_groups, chunk_store):
     root_chunk_ids = set()
     supporting_chunk_ids = set()
     anchor_candidates = []
@@ -1785,13 +1679,12 @@ def _merge_groups_to_aspect(query, query_contract, aspect_index, aspect_label, f
     )
     summary = (
         reason.strip()
-        or f"This {query_contract} aspect centers on {aspect_label} and merges related evidence units."
+        or f"This QFS aspect centers on {aspect_label} and merges related evidence units."
     )
     return {
         "group_id": f"llm-aspect-{aspect_index:02d}",
         "facet_label": normalize_text(aspect_label),
-        "organization_contract": query_contract,
-        "facet_prompt": _facet_prompt(query, query_contract, aspect_label),
+        "facet_prompt": _facet_prompt(query, aspect_label),
         "group_score": round(lexical_overlap_score(query, descriptor_text), 6),
         "query_rel": round(lexical_overlap_score(query, descriptor_text), 6),
         "anchor_support": len(anchor_chunk_ids),
@@ -1832,18 +1725,16 @@ def _merge_groups_to_aspect(query, query_contract, aspect_index, aspect_label, f
     }
 
 
-def regroup_facet_groups_with_llm(query, facet_groups, query_contract, llm_client, chunk_store, group_limit):
+def regroup_facet_groups_with_llm(query, facet_groups, llm_client, chunk_store, group_limit):
     """Use the LLM to regroup facet units into query-facing aspects.
 
     This only changes how existing support is grouped. It does not add facts or
     evidence outside the current facet groups.
     """
-    if query_contract not in {"theme-grounded", "comparison-grounded"}:
-        return facet_groups
     if llm_client is None or len(facet_groups) < 2:
         return facet_groups
     try:
-        prompt = _aspect_grouping_prompt(query, query_contract, facet_groups, group_limit)
+        prompt = _aspect_grouping_prompt(query, facet_groups, group_limit)
         raw = llm_client.generate(
             prompt,
             system_prompt=ASPECT_GROUPING_SYSTEM_PROMPT,
@@ -1878,7 +1769,6 @@ def regroup_facet_groups_with_llm(query, facet_groups, query_contract, llm_clien
             regrouped.append(
                 _merge_groups_to_aspect(
                     query=query,
-                    query_contract=query_contract,
                     aspect_index=index,
                     aspect_label=item.get("aspect_label", f"aspect {index}"),
                     focus_items=focus_items,
@@ -1950,12 +1840,36 @@ def _query_content_terms(query):
     ]
 
 
+def _clean_query_keywords(query, limit=8):
+    """Keep only high-signal content words for group labels and weighted PPR seeds."""
+    keywords = []
+    for token in _query_content_terms(query):
+        if token in _GROUP_LABEL_STOPWORDS:
+            continue
+        if token not in keywords:
+            keywords.append(token)
+        if len(keywords) >= limit:
+            break
+    return keywords
+
+
 def _clean_label_text(text):
     return normalize_text(str(text)).strip().strip("\"' ")
 
 
+def _is_label_term(token):
+    token = token.strip().lower()
+    if len(token) < 4:
+        return False
+    if not token.isalpha():
+        return False
+    if not any(vowel in token for vowel in "aeiou"):
+        return False
+    return True
+
+
 def _group_query_terms(query, focus_entities, relation_themes, supporting_chunk_ids, chunk_store, limit=3):
-    query_terms = _query_content_terms(query)
+    query_terms = _clean_query_keywords(query, limit=limit + 4)
     if not query_terms:
         return []
     support_text = " ".join(
@@ -1966,7 +1880,101 @@ def _group_query_terms(query, focus_entities, relation_themes, supporting_chunk_
             for chunk_id in supporting_chunk_ids[:3]
         ]
     )
-    return [term for term in query_terms if term in support_text][:limit]
+    return [term for term in query_terms if term in support_text and _is_label_term(term)][:limit]
+
+
+_GROUP_LABEL_STOPWORDS = set(STOPWORDS) | {
+    "art",
+    "arts",
+    "artist",
+    "artists",
+    "artwork",
+    "artworks",
+    "dataset",
+    "section",
+    "sections",
+    "described",
+    "different",
+    "various",
+    "period",
+    "periods",
+    "work",
+    "works",
+    "mentioned",
+    "covered",
+    "using",
+    "according",
+    "related",
+    "based",
+    "question",
+    "summary",
+    "evidence",
+    "did",
+    "does",
+    "role",
+    "ways",
+    "what",
+    "which",
+    "how",
+    "influence",
+    "influenced",
+    "emergence",
+    "unknown",
+    "relation",
+    "change",
+    "changes",
+    "shaped",
+    "shape",
+    "potential",
+    "might",
+    "would",
+    "could",
+    "should",
+    "have",
+    "has",
+    "had",
+    "like",
+    "than",
+    "just",
+    "still",
+    "through",
+    "elephant",
+    "elephants",
+}
+
+
+def _group_support_terms(query, focus_entities, relation_themes, supporting_chunk_ids, chunk_store, limit=4):
+    """Derive lightweight label terms from retrieved evidence."""
+    query_terms = set(_clean_query_keywords(query, limit=12))
+    focus_entity_tokens = {
+        token
+        for item in focus_entities
+        for token in tokenize(_clean_label_text(item))
+    }
+    counter = Counter()
+    for item in relation_themes:
+        for token in tokenize(_clean_label_text(item)):
+            if token in query_terms or token in _GROUP_LABEL_STOPWORDS or not _is_label_term(token):
+                continue
+            counter[token] += 2
+    for chunk_id in supporting_chunk_ids[:4]:
+        content = normalize_text(chunk_store.get(chunk_id, {}).get("content", ""))[:320]
+        for token in tokenize(content):
+            if (
+                token in query_terms
+                or token in _GROUP_LABEL_STOPWORDS
+                or token in focus_entity_tokens
+                or not _is_label_term(token)
+            ):
+                continue
+            counter[token] += 1
+    terms = []
+    for token, _ in counter.most_common(12):
+        if token not in terms:
+            terms.append(token)
+        if len(terms) >= limit:
+            break
+    return terms
 
 
 def _trace_seed_nodes(query, trace, final_node_set, chunk_to_nodes, graph):
@@ -1975,22 +1983,24 @@ def _trace_seed_nodes(query, trace, final_node_set, chunk_to_nodes, graph):
     for chunk_id in trace.get("bridge_chunk_ids", []):
         bridge_nodes.update(chunk_to_nodes.get(chunk_id, set()))
     bridge_nodes &= set(final_node_set)
-    seed_nodes = {
-        node_id
-        for node_id in (root_nodes | bridge_nodes)
-        if _node_query_rel(query, node_id, graph) > 0
-    }
-    return sorted(seed_nodes)
+    cleaned_query = " ".join(_clean_query_keywords(query, limit=10))
+    seed_weights = {}
+    for node_id in (root_nodes | bridge_nodes):
+        rel = _node_query_rel(cleaned_query or query, node_id, graph)
+        if rel > 0:
+            seed_weights[node_id] = rel
+    return seed_weights
 
 
-def _ppr_subgraph_nodes(local_graph, seed_nodes):
-    if not seed_nodes:
+def _ppr_subgraph_nodes(local_graph, seed_weights):
+    if not seed_weights:
         return set()
     if local_graph.number_of_edges() <= 0:
-        return set(seed_nodes)
+        return set(seed_weights)
     nodes = list(local_graph.nodes())
+    total_seed_weight = sum(seed_weights.values()) or 1.0
     personalization = {
-        node_id: (1.0 / len(seed_nodes) if node_id in seed_nodes else 0.0)
+        node_id: (seed_weights.get(node_id, 0.0) / total_seed_weight)
         for node_id in nodes
     }
     try:
@@ -2028,11 +2038,11 @@ def _ppr_subgraph_nodes(local_graph, seed_nodes):
         node_id
         for node_id, _ in sorted(scores.items(), key=lambda item: (-item[1], item[0]))
     ]
-    prefix_size = max(len(seed_nodes) * 4, 12)
+    prefix_size = max(len(seed_weights) * 4, 12)
     prefix_size = min(prefix_size, max(24, min(len(ranked_nodes), 48)))
     chosen_subgraph = local_graph.subgraph(ranked_nodes[:prefix_size]).copy()
     if chosen_subgraph.number_of_nodes() <= 0:
-        return set(seed_nodes)
+        return set(seed_weights)
     if chosen_subgraph.number_of_edges() <= 0:
         return set(chosen_subgraph.nodes())
     largest_component = max(nx.connected_components(chosen_subgraph), key=len)
@@ -2051,42 +2061,28 @@ def _group_chunks_for_trace_subgraph(trace, chosen_nodes, chosen_edges, chunk_to
     return supporting_chunk_ids
 
 
-def _trace_group_label(query_contract, group_index, label_terms, focus_entities, relation_themes, doc_ids, anchor_chunk_ids, chunk_store):
+def _trace_group_label(
+    group_index,
+    label_terms,
+    focus_entities,
+    relation_themes,
+    doc_ids,
+    anchor_chunk_ids,
+    chunk_store,
+):
     focus_entities = [_clean_label_text(item) for item in focus_entities if _clean_label_text(item)]
     relation_themes = [
         _clean_label_text(item)
         for item in relation_themes
         if _clean_label_text(item) and _clean_label_text(item) not in {"unknown relation", "unknown_relation"}
     ]
-    if query_contract == "section-grounded":
-        if doc_ids:
-            orders = [
-                chunk_store.get(chunk_id, {}).get("chunk_order_index")
-                for chunk_id in anchor_chunk_ids
-                if chunk_store.get(chunk_id, {}).get("chunk_order_index") is not None
-            ]
-            if orders:
-                return f"section band {doc_ids[0][-6:]}:{min(orders)}-{max(orders)}"
-            return f"section band {doc_ids[0][-6:]}"
-        return f"section band {group_index}"
-    if query_contract == "mechanism-grounded":
-        if label_terms:
-            return f"pathway: {' / '.join(label_terms[:2])}"
-        if relation_themes:
-            return f"pathway: {relation_themes[0]}"
-        if focus_entities:
-            return f"pathway: {focus_entities[0]}"
-        return f"pathway {group_index}"
-    if query_contract == "comparison-grounded":
-        if label_terms:
-            return f"comparison side {group_index}: {' / '.join(label_terms[:2])}"
-        if focus_entities:
-            return f"comparison side {group_index}: {focus_entities[0]}"
-        if relation_themes:
-            return f"comparison side {group_index}: {relation_themes[0]}"
-        return f"comparison side {group_index}"
+    label_terms = [term for term in label_terms if term]
+    if label_terms and relation_themes:
+        return f"{' '.join(label_terms[:3])}: {relation_themes[0]}"
+    if label_terms and focus_entities:
+        return f"{' '.join(label_terms[:3])}: {focus_entities[0]}"
     if label_terms:
-        return " / ".join(label_terms[:2])
+        return " ".join(label_terms[:4])
     if focus_entities and relation_themes:
         return f"{focus_entities[0]} via {relation_themes[0]}"
     if focus_entities:
@@ -2096,10 +2092,28 @@ def _trace_group_label(query_contract, group_index, label_terms, focus_entities,
     return f"aspect {group_index}"
 
 
+def _trace_group_gist(label, focus_entities, relation_themes, supporting_chunk_ids, chunk_store):
+    """Produce one short evidence gist for generation-time group indexing."""
+    focus_entities = [_clean_label_text(item) for item in focus_entities if _clean_label_text(item)]
+    relation_themes = [
+        _clean_label_text(item)
+        for item in relation_themes
+        if _clean_label_text(item) and _clean_label_text(item) not in {"unknown relation", "unknown_relation"}
+    ]
+    entity_part = ", ".join(focus_entities[:3])
+    relation_part = relation_themes[0] if relation_themes else ""
+    if relation_part and entity_part:
+        return f"This group supports the answer with {relation_part} evidence around {entity_part}."
+    if relation_part:
+        return f"This group supports the answer with {relation_part} evidence."
+    if entity_part:
+        return f"This group supports the answer with evidence centered on {entity_part}."
+    return f"This group supports the answer through {label}."
+
+
 def _build_trace_group(
     *,
     query,
-    query_contract,
     group_index,
     trace,
     graph,
@@ -2153,16 +2167,23 @@ def _build_trace_group(
     anchor_chunk_ids = [root_chunk_id]
     relation_themes = _relation_themes(sorted(chosen_edges), graph) if graph is not None else []
     focus_entities = _focus_entities(query, sorted(chosen_nodes), graph) if graph is not None else sorted(chosen_nodes)[:6]
-    label_terms = _group_query_terms(
+    query_label_terms = _group_query_terms(
         query,
         focus_entities,
         relation_themes,
         supporting_chunk_ids,
         chunk_store,
     )
+    support_label_terms = _group_support_terms(
+        query,
+        focus_entities,
+        relation_themes,
+        supporting_chunk_ids,
+        chunk_store,
+    )
+    label_terms = list(dict.fromkeys(query_label_terms + support_label_terms))
     doc_ids = _doc_ids(supporting_chunk_ids, chunk_store)
     label = _trace_group_label(
-        query_contract,
         group_index,
         label_terms,
         focus_entities,
@@ -2178,6 +2199,13 @@ def _build_trace_group(
         anchor_chunk_ids,
         chunk_store,
     )
+    group_summary = _trace_group_gist(
+        label,
+        focus_entities,
+        relation_themes,
+        supporting_chunk_ids,
+        chunk_store,
+    )
     growth_traces = [
         f"root={root_chunk_id}",
         f"bridge={len(bridge_chunk_ids)}",
@@ -2188,9 +2216,7 @@ def _build_trace_group(
         "group_id": f"kg-{group_index:02d}",
         "facet_label": label,
         "primary_theme": relation_themes[0] if relation_themes else (focus_entities[0] if focus_entities else label),
-        "organization_contract": query_contract,
-        "query_contract": query_contract,
-        "facet_prompt": _facet_prompt(query, query_contract, label),
+        "facet_prompt": _facet_prompt(query, label),
         "group_score": round(lexical_overlap_score(query, descriptor_text), 6),
         "query_rel": round(lexical_overlap_score(query, descriptor_text), 6),
         "anchor_support": len(anchor_chunk_ids),
@@ -2234,11 +2260,7 @@ def _build_trace_group(
             for chunk_id in supporting_chunk_ids[:3]
         ],
         "growth_traces": growth_traces,
-        "group_summary": (
-            f"This {query_contract} evidence group is anchored by {root_chunk_id} "
-            f"and keeps {len(bridge_chunk_ids)} bridge, {len(support_chunk_ids)} evidence, "
-            f"and {len(context_chunk_ids)} context chunks inside one PPR-local subgraph."
-        ),
+        "group_summary": group_summary,
         "nodes": sorted(chosen_nodes),
         "edges": sorted(chosen_edges),
         "focus_items": list(dict.fromkeys(focus_entities[:4] + relation_themes[:3]))[:6],
@@ -2248,7 +2270,6 @@ def _build_trace_group(
 def _build_trace_groups(
     *,
     query,
-    query_contract,
     root_traces,
     graph,
     final_nodes,
@@ -2262,7 +2283,6 @@ def _build_trace_groups(
     for group_index, trace in enumerate(root_traces, start=1):
         group = _build_trace_group(
             query=query,
-            query_contract=query_contract,
             group_index=group_index,
             trace=trace,
             graph=graph,
@@ -2274,37 +2294,35 @@ def _build_trace_groups(
         )
         if group is not None:
             candidates.append(group)
-    candidates.sort(
-        key=lambda group: (
-            -group["query_rel"],
-            -group["node_count"],
-            -group["edge_count"],
-            group["facet_label"],
-        )
-    )
     selected = []
-    for candidate in candidates:
-        redundant = False
-        for chosen in selected:
-            if _group_overlap_ratio(candidate["supporting_chunk_ids"], chosen["supporting_chunk_ids"]) >= 0.88:
-                redundant = True
-                break
-        if redundant:
-            continue
-        selected.append(candidate)
-        if len(selected) >= group_limit:
-            break
-    if query_contract == "comparison-grounded":
-        for index, group in enumerate(selected, start=1):
-            group["facet_label"] = _trace_group_label(
-                query_contract,
-                index,
-                group.get("focus_entities", []),
-                group.get("relation_themes", []),
-                group.get("doc_ids", []),
-                group.get("anchor_chunk_ids", []),
-                chunk_store,
+    remaining = list(candidates)
+    while remaining and len(selected) < group_limit:
+        best_index = None
+        best_key = None
+        for index, candidate in enumerate(remaining):
+            max_overlap = 0.0
+            for chosen in selected:
+                overlap = _group_overlap_ratio(candidate["supporting_chunk_ids"], chosen["supporting_chunk_ids"])
+                if overlap > max_overlap:
+                    max_overlap = overlap
+            if max_overlap >= 0.88:
+                continue
+            if max_overlap >= 0.72:
+                continue
+            rank_key = (
+                -max_overlap,
+                candidate["query_rel"],
+                candidate["node_count"],
+                candidate["edge_count"],
+                -len(candidate["supporting_chunk_ids"]),
             )
+            if best_key is None or rank_key > best_key:
+                best_key = rank_key
+                best_index = index
+        if best_index is None:
+            break
+        chosen = remaining.pop(best_index)
+        selected.append(chosen)
     return selected
 
 
@@ -2324,14 +2342,32 @@ def build_answer_facet_groups(
     edge_to_chunks,
     chunk_store,
     group_limit,
-    query_contract=None,
     allowed_doc_ids=None,
 ):
-    """Build one-contract-only knowledge groups from root traces and the final graph."""
-    contract = query_contract or detect_query_contract(query)
+    """Build QFS knowledge groups from root traces and the final graph.
+
+    参数:
+        query: 查询文本。
+        root_chunk_ids: 当前根证据 chunk id 列表。
+        graph: 实体关系图对象。
+        final_nodes: 选定的最终节点集合。
+        final_edges: 选定的最终边集合。
+        root_traces: 根 trace 结构列表。
+        last_structural_output: 最后一次结构关联输出。
+        chunk_neighbors: chunk 邻居映射。
+        chunk_to_nodes: chunk 到节点映射。
+        chunk_to_edges: chunk 到边映射。
+        node_to_chunks: 节点到 chunk 映射。
+        edge_to_chunks: 边到 chunk 映射。
+        chunk_store: chunk 存储字典。
+        group_limit: 要构造的 facet group 上限。
+        allowed_doc_ids: 可选的文档白名单，用于过滤支持 chunk。
+
+    返回:
+        (facet_groups, organization_mode) 二元组，facet_groups 为分组结果。
+    """
     groups = _build_trace_groups(
         query=query,
-        query_contract=contract,
         root_traces=root_traces,
         graph=graph,
         final_nodes=final_nodes,
@@ -2341,11 +2377,16 @@ def build_answer_facet_groups(
         chunk_store=chunk_store,
         group_limit=group_limit,
     )
-    for group in groups:
-        group["query_contract"] = contract
-    return groups, contract
+    return groups, ORGANIZATION_MODE
 
 
 def build_layout_groups(**kwargs):
-    """Thin wrapper that exposes the organization stage in layout terms."""
+    """Thin wrapper that exposes the organization stage in layout terms.
+
+    参数:
+        **kwargs: 传递给 build_answer_facet_groups 的组织阶段参数。
+
+    返回:
+        与 build_answer_facet_groups 相同的 (facet_groups, organization_mode) 结果。
+    """
     return build_answer_facet_groups(**kwargs)

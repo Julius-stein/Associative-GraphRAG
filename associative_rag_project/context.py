@@ -713,28 +713,21 @@ def build_prompt_context(
             f"Key relations: {' | '.join(group['relation_themes']) or 'n/a'}",
             f"Linked source ids: {' | '.join(source_id_map[chunk_id] for chunk_id in linked_chunk_ids) or 'n/a'}",
         ]
-        group_section.append("Anchor evidence:")
-        if group.get("anchor_chunk_ids"):
-            for chunk_id in group["anchor_chunk_ids"][:2]:
-                chunk_data = chunk_store.get(chunk_id, {})
-                role = "anchor" if chunk_id in root_chunk_id_set else "evidence"
-                source_id = source_id_map.get(chunk_id, chunk_id)
-                preview = " ".join(chunk_data.get("content", "").split())[:220]
-                group_section.append(f"- {source_id} [{role}]: {preview}")
+        group_section.append("Edge skeleton:")
+        if group.get("edge_skeleton"):
+            for unit in group["edge_skeleton"][:8]:
+                source_ids = [
+                    source_id_map.get(chunk_id, chunk_id)
+                    for chunk_id in unit.get("source_chunk_ids", [])[:3]
+                ]
+                edge_id = unit.get("edge", ["", ""])
+                group_section.append(
+                    f"- {edge_id[0]} -> {edge_id[1]} "
+                    f"({normalize_text(unit.get('relation_theme') or unit.get('keywords') or '')[:70]}; "
+                    f"{unit.get('kind', 'answer')}; sources={', '.join(source_ids) or 'n/a'})"
+                )
         else:
             group_section.append("- n/a")
-        group_section.append("Key relation cues:")
-        if key_relations:
-            group_section.extend(
-                f"- {edge_id[0]} -> {edge_id[1]} ({normalize_text((semantic_edge_lookup.get(edge_id) or root_edge_lookup.get(edge_id) or {}).get('keywords',''))[:60]})"
-                for edge_id in key_relations
-            )
-        else:
-            group_section.append("- n/a")
-        group_section.append("Linked source previews:")
-        group_section.append("```csv")
-        group_section.append(build_csv(linked_source_rows))
-        group_section.append("```")
         group_sections.append("\n".join(group_section))
 
     source_rows = [["id", "role", "linked_groups", "word_count", "content"]]
@@ -746,7 +739,7 @@ def build_prompt_context(
                 or ("root" if chunk_id in root_chunk_id_set else "support"),
                 " | ".join(chunk_to_group_ids.get(chunk_id, [])[:4]),
                 word_count,
-                chunk_data.get("content", "").replace("\n", " "),
+                _truncate_to_words(chunk_data.get("content", "").replace("\n", " "), per_chunk_word_cap),
             ]
         )
 

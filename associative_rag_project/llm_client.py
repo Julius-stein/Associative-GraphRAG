@@ -72,6 +72,54 @@ def _is_broad_qfs_query(query: str) -> bool:
     return any(cue in query_lower for cue in broad_cues)
 
 
+def _is_action_planning_qfs_query(query: str) -> bool:
+    query_lower = " ".join(query.lower().split())
+    action_cues = (
+        "how can",
+        "how could",
+        "how should",
+        "how might",
+        "what strategies",
+        "what criteria",
+        "what partnerships",
+        "what assignments",
+        "what methodologies",
+        "what rights",
+        "what prerequisites",
+        "how do you measure",
+        "how can you ensure",
+        "how are educators",
+    )
+    planning_terms = (
+        "education",
+        "educational",
+        "curriculum",
+        "curriculums",
+        "course",
+        "courses",
+        "student",
+        "students",
+        "workshop",
+        "workshops",
+        "module",
+        "modules",
+        "exhibition",
+        "museum",
+        "museums",
+        "gallery",
+        "galleries",
+        "digital",
+        "virtual",
+        "partnership",
+        "partnerships",
+        "collaboration",
+        "collaborations",
+        "acquisition",
+        "acquisitions",
+    )
+    return any(cue in query_lower for cue in action_cues) and any(term in query_lower for term in planning_terms)
+
+
 def build_generation_prompt(query, prompt_context):
     """Build a QFS-oriented prompt from the evidence package.
 
@@ -83,55 +131,29 @@ def build_generation_prompt(query, prompt_context):
 
     构造给生成模型的问答提示，包含上下文与 QFS 任务提示。
     """
-    query_lower = query.lower()
     extra_constraints = []
-    if any(term in query_lower for term in ["character", "characters", "passage", "passages", "narrative", "narratives"]):
-        extra_constraints.append("- This query is about passage content. Prioritize people, events, themes, and historical or social forces over dataset or method descriptions.")
-    if any(term in query_lower for term in ["historical", "history", "socio-political", "conflict", "conflicts"]):
-        extra_constraints.append("- Emphasize comparative historical interpretation, not metadata about how the evidence was collected or modeled.")
     if _is_broad_qfs_query(query):
-        extra_constraints.extend(
-            [
-                "- This is a broad theme query: prioritize breadth of supported aspects, not just one tight storyline.",
-                "- Cover at least 5 distinct, query-relevant aspects if evidence supports them.",
-                "- For each aspect, include at least one concrete named example (movement/artist/event/policy/institution/time period).",
-                "- Include cross-period or cross-context variety when evidence supports it.",
-                "- Use the coverage checklist proactively to avoid missing major supported angles.",
-            ]
-        )
-    extra_block = "\n".join(extra_constraints)
-    qfs_hint_block = _theme_qfs_hints()
-    theme_qfs_template_block = _theme_qfs_output_template()
-    return f"""Answer the query using the evidence package below.
+        extra_constraints.append("Cover the strongest distinct evidence-backed aspects; include concrete named examples when available.")
+    if _is_action_planning_qfs_query(query):
+        extra_constraints.append("For planning/application questions, turn evidence into practical criteria, steps, risks, and evaluation measures.")
+    extra_block = "\n".join(f"- {item}" for item in extra_constraints)
+    return f"""Answer the query using only the evidence package.
 
-Requirements:
-- Write a substantive query-focused summary.
-- Answer the question in the form it asks for.
-- Start from the most direct answer, then add supporting synthesis only where it helps.
-- Synthesize across sources instead of listing isolated facts, but keep concrete examples and named items when they are central to the query.
-- Ignore isolated low-support context items unless they clearly strengthen the answer.
-- Focus on the substantive content of passages, characters, events, and themes.
-- Unless the query explicitly asks about datasets, models, benchmarks, or methods, do not center the answer on metadata, annotation schemes, or NLP systems.
-- If the evidence is partial or mixed, say so briefly.
-- Do not fabricate details outside the evidence.
-- Use the knowledge groups and linked sources as evidence aids, not as a script for the final prose.
-- Let strong anchor evidence determine the main points; do not let a broad facet summary dominate if its support is weak for this query.
-- You do not need to use every knowledge group. Select the evidence that best answers the question.
-- Merge overlapping evidence when it supports the same point, but do not merge away distinctions the query cares about.
-- Read the Group Index, knowledge group dossiers, and sources together; do not summarize the evidence package structure itself.
-- Use listed entities and relation cues inside each knowledge group only when they help clarify the answer.
-- Write the final answer using the required P1-P5 structure.
-- Stay tightly grounded in the provided evidence. Do not drift into generic background knowledge just because the topic is familiar.
-- Prefer a small number of strong, query-facing aspects over broad but weakly supported historical narration.
-- Use the Group Index as a coverage map: your headings should collectively span the strongest distinct aspects available in the evidence.
-- Do not produce multiple headings that mainly restate the same market, institutional, or biographical angle unless the query itself specifically centers that angle.
-- Each heading should be justified by different evidence support; avoid writing several paragraphs that lean on the same small evidence cluster.
-- Do not reproduce the internal scaffold of the evidence package.
+Priorities, in order:
+1. Directly answer the query.
+2. Cover diverse evidence-backed aspects.
+3. Synthesize sources into useful explanations or guidance.
+4. Stay grounded; do not invent unsupported facts.
 
-QFS Hints:
-{qfs_hint_block}
+Use this compact structure:
+P1. Titles: 4-7 aspect titles.
+P2. Answer Outline: one direct synthesis paragraph.
+P3. Evidence-backed Answer: one short section per aspect, with concrete examples and source ids when useful.
+P4. Source Coverage: briefly name the main evidence clusters used.
+P5. Refinement: note uncertainty, gaps, or practical implications.
+
+Use knowledge groups as a coverage map, not as mandatory headings. Ignore weak or irrelevant groups.
 {extra_block}
-{theme_qfs_template_block}
 
 Query:
 {query}

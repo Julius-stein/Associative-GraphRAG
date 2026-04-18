@@ -731,7 +731,6 @@ def _build_query_record_from_states(query_row, controller_info, anchor_state, ex
         "theme_selected_chunks": organize_state["theme_selected_chunks"],
         "chunk_roles": organize_state["chunk_roles"],
         "organization_mode": organize_state["organization_layout"],
-        "feedback": feedback,
         "stats": {
             "initial_root_chunk_count": len(anchor_state["root_chunk_hits"]),
             "promoted_root_chunk_count": len(expand_state["promoted_root_chunks"]),
@@ -801,7 +800,7 @@ def run_query_online(
     query_index=None,
     total_queries=None,
 ):
-    """Run one query end-to-end: retrieve -> optional feedback supplement -> answer.
+    """Run one query end-to-end: retrieve -> answer.
 
     参数:
         query_row: 包含 query 和 group_id 的单条查询记录。
@@ -821,7 +820,7 @@ def run_query_online(
     返回:
         一个元组 (retrieval_record, answer_record)，分别为检索结果和生成答案结果。
 
-    对单条问题执行线上检索、可选反馈补充和答案生成全流程。
+    对单条问题执行线上检索和答案生成全流程。
     """
     query_wall_start = perf_counter()
     query_state = _run_query_states(
@@ -845,47 +844,6 @@ def run_query_online(
     timings = dict(query_state["timings"])
     prefix = query_state["prefix"]
 
-    feedback = None
-    if cfg.get("enable_feedback_supplement", False):
-        feedback = request_coverage_feedback(
-            query_row["query"],
-            organize_state["prompt_payload"]["context"],
-            llm_client,
-        )
-        if feedback.get("decision") == "need_more_evidence":
-            log(
-                f"{prefix}feedback missing={feedback.get('missing_aspects', [])[:3]} "
-                f"queries={feedback.get('supplement_queries', [])[:2]} "
-                f"keywords={feedback.get('supplement_keywords', [])[:4]}"
-            )
-            query_state, supplement_timings = _run_feedback_supplement(
-                query_row=query_row,
-                query_state=query_state,
-                feedback=feedback,
-                graph=graph,
-                chunk_store=chunk_store,
-                chunk_retriever=chunk_retriever,
-                chunk_to_nodes=chunk_to_nodes,
-                chunk_to_edges=chunk_to_edges,
-                node_to_chunks=node_to_chunks,
-                edge_to_chunks=edge_to_chunks,
-                keyword_index=keyword_index,
-                cfg=cfg,
-            )
-            timings["expand_seconds"] += supplement_timings["expand_seconds"]
-            timings["organize_seconds"] += supplement_timings["organize_seconds"]
-            timings["query_total_seconds"] += supplement_timings["total_seconds"]
-            controller_info = query_state["controller_info"]
-            anchor_state = query_state["anchor_state"]
-            expand_state = query_state["expand_state"]
-            organize_state = query_state["organize_state"]
-            feedback = query_state.get("feedback", feedback)
-            if feedback.get("applied"):
-                log(
-                    f"{prefix}supplement applied roots={len(feedback.get('supplement_root_chunk_ids', []))} "
-                    f"text={shorten(feedback.get('supplement_text', ''), 120)}"
-                )
-
     retrieval_record = _build_query_record_from_states(
         query_row,
         controller_info,
@@ -893,7 +851,6 @@ def run_query_online(
         expand_state,
         organize_state,
         timings,
-        feedback=feedback,
     )
     answer_start = perf_counter()
     answer_record = generate_one_answer_record(retrieval_record, llm_client)
@@ -1040,7 +997,7 @@ def run_corpus_queries_online(
     max_workers=4,
     **cfg,
 ):
-    """Run the online per-query path: retrieve -> feedback supplement -> answer.
+    """Run the online per-query path: retrieve -> answer.
 
     参数:
         corpus_dir: 语料库根目录。

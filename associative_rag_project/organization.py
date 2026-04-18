@@ -16,8 +16,6 @@ import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 
-import networkx as nx
-
 from .common import STOPWORDS, edge_key, lexical_overlap_score, normalize_text, tokenize
 from .retrieval import normalize_relation_category
 
@@ -1799,27 +1797,6 @@ def _group_overlap_ratio(left, right):
     return len(left & right) / max(len(left | right), 1)
 
 
-def _trace_local_graph(
-    trace,
-    graph,
-    final_nodes,
-    final_edges,
-    chunk_to_nodes,
-    chunk_to_edges,
-):
-    final_node_set = set(final_nodes)
-    final_edge_set = set(final_edges)
-    node_ids = set()
-    edge_ids = set()
-    for chunk_id in trace.get("selected_chunk_ids", []):
-        node_ids.update(chunk_to_nodes.get(chunk_id, set()) & final_node_set)
-        edge_ids.update(edge_id for edge_id in chunk_to_edges.get(chunk_id, set()) if edge_id in final_edge_set)
-    local_graph = nx.Graph()
-    local_graph.add_nodes_from(sorted(node_ids))
-    local_graph.add_edges_from(sorted(edge_ids))
-    return local_graph, node_ids, edge_ids
-
-
 def _node_query_rel(query, node_id, graph):
     node_data = graph.nodes.get(node_id) if graph is not None else {}
     node_text = " ".join(
@@ -1841,7 +1818,7 @@ def _query_content_terms(query):
 
 
 def _clean_query_keywords(query, limit=8):
-    """Keep only high-signal content words for group labels and weighted PPR seeds."""
+    """Keep only high-signal content words for group labels and edge evidence tests."""
     keywords = []
     for token in _query_content_terms(query):
         if token in _GROUP_LABEL_STOPWORDS:
@@ -1977,88 +1954,235 @@ def _group_support_terms(query, focus_entities, relation_themes, supporting_chun
     return terms
 
 
-def _trace_seed_nodes(query, trace, final_node_set, chunk_to_nodes, graph):
-    root_nodes = set(chunk_to_nodes.get(trace["root_chunk_id"], set())) & set(final_node_set)
-    bridge_nodes = set()
-    for chunk_id in trace.get("bridge_chunk_ids", []):
-        bridge_nodes.update(chunk_to_nodes.get(chunk_id, set()))
-    bridge_nodes &= set(final_node_set)
-    cleaned_query = " ".join(_clean_query_keywords(query, limit=10))
-    seed_weights = {}
-    for node_id in (root_nodes | bridge_nodes):
-        rel = _node_query_rel(cleaned_query or query, node_id, graph)
-        if rel > 0:
-            seed_weights[node_id] = rel
-    return seed_weights
+def _trace_chunk_role_lookup(trace):
+    roles = {}
+    root_chunk_id = trace.get("root_chunk_id")
+    if root_chunk_id:
+        roles[root_chunk_id] = "root"
+    for role_name in ("bridge", "support", "context"):
+        for chunk_id in trace.get(f"{role_name}_chunk_ids", []):
+            roles.setdefault(chunk_id, role_name)
+    return roles
 
 
-def _ppr_subgraph_nodes(local_graph, seed_weights):
-    if not seed_weights:
-        return set()
-    if local_graph.number_of_edges() <= 0:
-        return set(seed_weights)
-    nodes = list(local_graph.nodes())
-    total_seed_weight = sum(seed_weights.values()) or 1.0
-    personalization = {
-        node_id: (seed_weights.get(node_id, 0.0) / total_seed_weight)
-        for node_id in nodes
-    }
-    try:
-        scores = nx.pagerank(
-            local_graph,
-            alpha=0.85,
-            personalization=personalization,
-            dangling=personalization,
-            max_iter=100,
-            tol=1.0e-6,
-        )
-    except Exception:
-        # Fallback keeps the pipeline runnable if the fast backend is unavailable.
-        scores = dict(personalization)
-        alpha = 0.85
-        for _ in range(40):
-            next_scores = {node_id: (1.0 - alpha) * personalization[node_id] for node_id in nodes}
-            dangling_mass = 0.0
-            for node_id in nodes:
-                degree = local_graph.degree(node_id)
-                if degree <= 0:
-                    dangling_mass += alpha * scores[node_id]
-                    continue
-                share = alpha * scores[node_id] / degree
-                for neighbor_id in local_graph.neighbors(node_id):
-                    next_scores[neighbor_id] += share
-            if dangling_mass > 0:
-                for node_id in nodes:
-                    next_scores[node_id] += dangling_mass * personalization[node_id]
-            delta = sum(abs(next_scores[node_id] - scores[node_id]) for node_id in nodes)
-            scores = next_scores
-            if delta < 1e-8:
-                break
-    ranked_nodes = [
-        node_id
-        for node_id, _ in sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+def _edge_text(edge_id, graph):
+    edge_data = graph.get_edge_data(edge_id[0], edge_id[1]) if graph is not None else {}
+    edge_data = edge_data or {}
+    return " ".join(
+        [
+            normalize_text(edge_id[0]),
+            normalize_text(edge_id[1]),
+            normalize_text(edge_data.get("keywords", "")),
+            normalize_text(edge_data.get("description", "")),
+            normalize_relation_category(edge_data),
+        ]
+    ).strip()
+
+
+def _edge_source_chunks(edge_id, selected_chunk_ids, chunk_to_edges):
+    return [
+        chunk_id
+        for chunk_id in selected_chunk_ids
+        if edge_id in chunk_to_edges.get(chunk_id, set())
     ]
-    prefix_size = max(len(seed_weights) * 4, 12)
-    prefix_size = min(prefix_size, max(24, min(len(ranked_nodes), 48)))
-    chosen_subgraph = local_graph.subgraph(ranked_nodes[:prefix_size]).copy()
-    if chosen_subgraph.number_of_nodes() <= 0:
-        return set(seed_weights)
-    if chosen_subgraph.number_of_edges() <= 0:
-        return set(chosen_subgraph.nodes())
-    largest_component = max(nx.connected_components(chosen_subgraph), key=len)
-    return set(largest_component)
 
 
-def _group_chunks_for_trace_subgraph(trace, chosen_nodes, chosen_edges, chunk_to_nodes, chunk_to_edges):
-    chosen_nodes = set(chosen_nodes)
-    chosen_edges = set(chosen_edges)
-    supporting_chunk_ids = []
-    for chunk_id in trace.get("selected_chunk_ids", []):
-        chunk_nodes = set(chunk_to_nodes.get(chunk_id, set()))
-        chunk_edges = set(chunk_to_edges.get(chunk_id, set()))
-        if chunk_nodes & chosen_nodes or chunk_edges & chosen_edges:
-            supporting_chunk_ids.append(chunk_id)
-    return supporting_chunk_ids
+def _chunk_text_for_query(chunk_ids, chunk_store, max_chars=900):
+    parts = []
+    used = 0
+    for chunk_id in chunk_ids:
+        text = normalize_text(chunk_store.get(chunk_id, {}).get("content", ""))
+        if not text:
+            continue
+        remaining = max_chars - used
+        if remaining <= 0:
+            break
+        parts.append(text[:remaining])
+        used += min(len(text), remaining)
+    return " ".join(parts)
+
+
+def _make_edge_unit(query, edge_id, source_chunk_ids, chunk_roles, graph, chunk_store, unit_kind):
+    edge_data = graph.get_edge_data(edge_id[0], edge_id[1]) if graph is not None else {}
+    edge_data = edge_data or {}
+    edge_text = _edge_text(edge_id, graph)
+    source_text = _chunk_text_for_query(source_chunk_ids, chunk_store)
+    evidence_query = " ".join(_clean_query_keywords(query, limit=12)) or query
+    query_rel = lexical_overlap_score(evidence_query, f"{edge_text} {source_text}")
+    role_order = {"root": 0, "bridge": 1, "support": 2, "context": 3}
+    primary_role = min(
+        (chunk_roles.get(chunk_id, "context") for chunk_id in source_chunk_ids),
+        key=lambda role: role_order.get(role, 9),
+        default="context",
+    )
+    return {
+        "edge": edge_id,
+        "head": edge_id[0],
+        "tail": edge_id[1],
+        "keywords": normalize_text(edge_data.get("keywords", "")),
+        "description": normalize_text(edge_data.get("description", ""))[:240],
+        "relation_theme": normalize_relation_category(edge_data),
+        "source_chunk_ids": source_chunk_ids,
+        "primary_role": primary_role,
+        "unit_kind": unit_kind,
+        "query_rel": round(query_rel, 6),
+    }
+
+
+def _is_answerable_edge(query, edge_id, source_chunk_ids, chunk_roles, graph, chunk_store):
+    evidence_query = " ".join(_clean_query_keywords(query, limit=12)) or query
+    edge_rel = lexical_overlap_score(evidence_query, _edge_text(edge_id, graph))
+    source_rel = lexical_overlap_score(evidence_query, _chunk_text_for_query(source_chunk_ids, chunk_store))
+    has_non_context_source = any(chunk_roles.get(chunk_id) in {"root", "bridge", "support"} for chunk_id in source_chunk_ids)
+    return edge_rel > 0 or (source_rel > 0 and has_non_context_source)
+
+
+def _limited_edge_units(units, unit_kind, max_units, per_source_limit):
+    role_order = {"root": 0, "bridge": 1, "support": 2, "context": 3}
+    filtered = [unit for unit in units if unit["unit_kind"] == unit_kind]
+    filtered.sort(
+        key=lambda unit: (
+            -unit["query_rel"],
+            role_order.get(unit["primary_role"], 9),
+            unit["edge"],
+        )
+    )
+    selected = []
+    source_counts = Counter()
+    for unit in filtered:
+        source_key = unit["source_chunk_ids"][0] if unit["source_chunk_ids"] else ""
+        if source_counts[source_key] >= per_source_limit:
+            continue
+        selected.append(unit)
+        source_counts[source_key] += 1
+        if len(selected) >= max_units:
+            break
+    return selected
+
+
+def _trace_edge_units(query, trace, final_edges, chunk_to_edges, graph, chunk_store):
+    selected_chunk_ids = list(dict.fromkeys(trace.get("selected_chunk_ids", [])))
+    final_edge_set = set(final_edges)
+    chunk_roles = _trace_chunk_role_lookup(trace)
+    edge_ids = []
+    for chunk_id in selected_chunk_ids:
+        for edge_id in chunk_to_edges.get(chunk_id, set()):
+            if edge_id in final_edge_set and edge_id not in edge_ids:
+                edge_ids.append(edge_id)
+
+    answer_units = []
+    rejected = []
+    for edge_id in edge_ids:
+        source_chunk_ids = _edge_source_chunks(edge_id, selected_chunk_ids, chunk_to_edges)
+        if not source_chunk_ids:
+            continue
+        if _is_answerable_edge(query, edge_id, source_chunk_ids, chunk_roles, graph, chunk_store):
+            answer_units.append(_make_edge_unit(query, edge_id, source_chunk_ids, chunk_roles, graph, chunk_store, "answer"))
+        else:
+            rejected.append((edge_id, source_chunk_ids))
+
+    answer_endpoint_counts = Counter()
+    for unit in answer_units:
+        answer_endpoint_counts.update(unit["edge"])
+    connector_units = []
+    for edge_id, source_chunk_ids in rejected:
+        if not any(chunk_roles.get(chunk_id) in {"root", "bridge", "support"} for chunk_id in source_chunk_ids):
+            continue
+        if sum(1 for endpoint in edge_id if answer_endpoint_counts[endpoint] >= 2) <= 0:
+            continue
+        connector_units.append(_make_edge_unit(query, edge_id, source_chunk_ids, chunk_roles, graph, chunk_store, "connector"))
+
+    return _limited_edge_units(answer_units, "answer", max_units=40, per_source_limit=6) + _limited_edge_units(
+        connector_units,
+        "connector",
+        max_units=12,
+        per_source_limit=3,
+    )
+
+
+def _edge_unit_components(query, units, graph):
+    if not units:
+        return []
+    endpoint_counts = Counter()
+    query_relevant_endpoints = set()
+    for unit in units:
+        endpoint_counts.update(unit["edge"])
+        for endpoint in unit["edge"]:
+            if _node_query_rel(query, endpoint, graph) > 0:
+                query_relevant_endpoints.add(endpoint)
+
+    parent = list(range(len(units)))
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(left, right):
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    for left_index, left in enumerate(units):
+        left_sources = set(left["source_chunk_ids"])
+        left_endpoints = set(left["edge"])
+        for right_index in range(left_index + 1, len(units)):
+            right = units[right_index]
+            shared_sources = left_sources & set(right["source_chunk_ids"])
+            shared_endpoints = left_endpoints & set(right["edge"])
+            has_nonhub_endpoint = any(
+                endpoint_counts[endpoint] <= 3 or endpoint in query_relevant_endpoints
+                for endpoint in shared_endpoints
+            )
+            if shared_sources or has_nonhub_endpoint:
+                union(left_index, right_index)
+
+    components = defaultdict(list)
+    for index, unit in enumerate(units):
+        components[find(index)].append(unit)
+    return list(components.values())
+
+
+def _trim_component_units(units, limit=18):
+    role_order = {"root": 0, "bridge": 1, "support": 2, "context": 3}
+    return sorted(
+        units,
+        key=lambda unit: (
+            unit["unit_kind"] != "answer",
+            -unit["query_rel"],
+            role_order.get(unit["primary_role"], 9),
+            unit["edge"],
+        ),
+    )[:limit]
+
+
+def _ordered_chunk_ids_for_units(trace, units):
+    selected_order = {chunk_id: index for index, chunk_id in enumerate(trace.get("selected_chunk_ids", []))}
+    chunk_ids = []
+    root_chunk_id = trace.get("root_chunk_id")
+    if root_chunk_id:
+        chunk_ids.append(root_chunk_id)
+    for unit in units:
+        chunk_ids.extend(unit["source_chunk_ids"])
+    return sorted(dict.fromkeys(chunk_ids), key=lambda chunk_id: (selected_order.get(chunk_id, 10**9), chunk_id))
+
+
+def _local_detail_nodes(query, supporting_chunk_ids, skeleton_nodes, chunk_to_nodes, graph, limit=8):
+    candidates = set()
+    for chunk_id in supporting_chunk_ids:
+        candidates.update(chunk_to_nodes.get(chunk_id, set()))
+    candidates -= set(skeleton_nodes)
+    ranked = sorted(
+        candidates,
+        key=lambda node_id: (
+            -_node_query_rel(query, node_id, graph),
+            len(str(node_id)),
+            str(node_id),
+        ),
+    )
+    return ranked[:limit]
 
 
 def _trace_group_label(
@@ -2111,62 +2235,36 @@ def _trace_group_gist(label, focus_entities, relation_themes, supporting_chunk_i
     return f"This group supports the answer through {label}."
 
 
-def _build_trace_group(
+def _build_edge_skeleton_group(
     *,
     query,
     group_index,
+    component_index,
     trace,
+    units,
     graph,
-    final_nodes,
-    final_edges,
     chunk_to_nodes,
     chunk_to_edges,
     chunk_store,
 ):
-    local_graph, trace_nodes, trace_edges = _trace_local_graph(
-        trace,
-        graph,
-        final_nodes,
-        final_edges,
-        chunk_to_nodes,
-        chunk_to_edges,
-    )
-    if local_graph.number_of_nodes() <= 0:
-        return None
-    seed_nodes = _trace_seed_nodes(
-        query,
-        trace,
-        trace_nodes,
-        chunk_to_nodes,
-        graph,
-    )
-    if not seed_nodes:
-        return None
-    chosen_nodes = _ppr_subgraph_nodes(local_graph, seed_nodes)
-    if not chosen_nodes:
-        return None
-    chosen_edges = {
-        edge_key(left, right)
-        for left, right in local_graph.edges()
-        if left in chosen_nodes and right in chosen_nodes
-    }
-    supporting_chunk_ids = _group_chunks_for_trace_subgraph(
-        trace,
-        chosen_nodes,
-        chosen_edges,
-        chunk_to_nodes,
-        chunk_to_edges,
-    )
-    if not supporting_chunk_ids:
-        return None
-
     root_chunk_id = trace["root_chunk_id"]
+    chosen_edges = sorted({unit["edge"] for unit in units})
+    skeleton_nodes = sorted({node_id for edge_id in chosen_edges for node_id in edge_id})
+    supporting_chunk_ids = _ordered_chunk_ids_for_units(trace, units)
     bridge_chunk_ids = [chunk_id for chunk_id in trace.get("bridge_chunk_ids", []) if chunk_id in supporting_chunk_ids]
     support_chunk_ids = [chunk_id for chunk_id in trace.get("support_chunk_ids", []) if chunk_id in supporting_chunk_ids]
     context_chunk_ids = [chunk_id for chunk_id in trace.get("context_chunk_ids", []) if chunk_id in supporting_chunk_ids]
     anchor_chunk_ids = [root_chunk_id]
     relation_themes = _relation_themes(sorted(chosen_edges), graph) if graph is not None else []
-    focus_entities = _focus_entities(query, sorted(chosen_nodes), graph) if graph is not None else sorted(chosen_nodes)[:6]
+    focus_entities = _focus_entities(query, skeleton_nodes, graph) if graph is not None else skeleton_nodes[:6]
+    local_detail_nodes = _local_detail_nodes(
+        query,
+        supporting_chunk_ids,
+        skeleton_nodes,
+        chunk_to_nodes,
+        graph,
+    )
+    chosen_nodes = sorted(dict.fromkeys(skeleton_nodes + local_detail_nodes))
     query_label_terms = _group_query_terms(
         query,
         focus_entities,
@@ -2206,14 +2304,18 @@ def _build_trace_group(
         supporting_chunk_ids,
         chunk_store,
     )
+    answer_edge_count = sum(1 for unit in units if unit["unit_kind"] == "answer")
+    connector_edge_count = sum(1 for unit in units if unit["unit_kind"] == "connector")
     growth_traces = [
         f"root={root_chunk_id}",
         f"bridge={len(bridge_chunk_ids)}",
         f"support={len(support_chunk_ids)}",
         f"context={len(context_chunk_ids)}",
+        f"answer_edges={answer_edge_count}",
+        f"connector_edges={connector_edge_count}",
     ]
     return {
-        "group_id": f"kg-{group_index:02d}",
+        "group_id": f"kg-{group_index:02d}-{component_index:02d}",
         "facet_label": label,
         "primary_theme": relation_themes[0] if relation_themes else (focus_entities[0] if focus_entities else label),
         "facet_prompt": _facet_prompt(query, label),
@@ -2223,6 +2325,8 @@ def _build_trace_group(
         "root_anchor_count": 1,
         "node_count": len(chosen_nodes),
         "edge_count": len(chosen_edges),
+        "answer_edge_count": answer_edge_count,
+        "connector_edge_count": connector_edge_count,
         "region_count": 1,
         "unique_doc_count": len(doc_ids),
         "unique_root_count": 1,
@@ -2263,6 +2367,27 @@ def _build_trace_group(
         "group_summary": group_summary,
         "nodes": sorted(chosen_nodes),
         "edges": sorted(chosen_edges),
+        "edge_skeleton": [
+            {
+                "edge": unit["edge"],
+                "relation_theme": unit["relation_theme"],
+                "keywords": unit["keywords"],
+                "source_chunk_ids": unit["source_chunk_ids"],
+                "role": unit["primary_role"],
+                "kind": unit["unit_kind"],
+                "query_rel": unit["query_rel"],
+            }
+            for unit in sorted(
+                units,
+                key=lambda item: (
+                    item["unit_kind"] != "answer",
+                    -item["query_rel"],
+                    item["primary_role"],
+                    item["edge"],
+                ),
+            )
+        ],
+        "local_detail_nodes": local_detail_nodes,
         "focus_items": list(dict.fromkeys(focus_entities[:4] + relation_themes[:3]))[:6],
     }
 
@@ -2281,19 +2406,24 @@ def _build_trace_groups(
 ):
     candidates = []
     for group_index, trace in enumerate(root_traces, start=1):
-        group = _build_trace_group(
-            query=query,
-            group_index=group_index,
-            trace=trace,
-            graph=graph,
-            final_nodes=final_nodes,
-            final_edges=final_edges,
-            chunk_to_nodes=chunk_to_nodes,
-            chunk_to_edges=chunk_to_edges,
-            chunk_store=chunk_store,
-        )
-        if group is not None:
-            candidates.append(group)
+        units = _trace_edge_units(query, trace, final_edges, chunk_to_edges, graph, chunk_store)
+        for component_index, component_units in enumerate(_edge_unit_components(query, units, graph), start=1):
+            if not any(unit["unit_kind"] == "answer" for unit in component_units):
+                continue
+            component_units = _trim_component_units(component_units)
+            group = _build_edge_skeleton_group(
+                query=query,
+                group_index=group_index,
+                component_index=component_index,
+                trace=trace,
+                units=component_units,
+                graph=graph,
+                chunk_to_nodes=chunk_to_nodes,
+                chunk_to_edges=chunk_to_edges,
+                chunk_store=chunk_store,
+            )
+            if group is not None:
+                candidates.append(group)
     selected = []
     remaining = list(candidates)
     while remaining and len(selected) < group_limit:

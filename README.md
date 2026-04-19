@@ -4,7 +4,7 @@
 
 ## Associative RAG for Query-Focused Summarization
 
-Query-focused summarization over chunk-entity-relation graphs with chunk-centric multi-round association, PPR-based knowledge grouping, and LLM-as-a-judge evaluation.
+Query-focused summarization over chunk-entity-relation graphs with chunk-centric multi-round association, trace-grounded knowledge grouping, and LLM-as-a-judge evaluation.
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-blue)
 ![Status](https://img.shields.io/badge/status-research%20prototype-orange)
@@ -16,15 +16,15 @@ Query-focused summarization over chunk-entity-relation graphs with chunk-centric
 
 This repository is a research workspace centered on [associative_rag_project](/Users/Admin/projects/Association/associative_rag_project), a query-focused summarization system built on top of document chunks and a chunk-entity-relation graph.
 
-The current system follows one unified retrieval-and-organization backbone:
+The current system follows one unified QFS retrieval-and-organization backbone:
 
 1. retrieve chunk candidates with `bm25`, `dense`, or `hybrid`
 2. inject graph-side recall through `graph_focus` and `graph_keyword`
 3. select diverse root chunks
 4. expand the evidence graph with multi-round chunk-centric association and root reseeding
-5. build root traces and compress the final graph into PPR-based knowledge groups
+5. build root traces and compress the final graph into edge-skeleton plus evidence-dossier knowledge groups
 6. pack grounded evidence for the answer LLM
-7. compare candidate answers against one or many baselines with a contract-aware judge
+7. compare candidate answers against one or many baselines with QFS-oriented pairwise and groundedness judges
 
 The repository also includes:
 
@@ -34,12 +34,12 @@ The repository also includes:
 
 ## Highlights
 
-- Unified associative retrieval for all query contracts
+- Unified associative retrieval for QFS
 - Chunk-centric multi-round expansion with per-round root reseeding
-- Explicit `bridge / support / context` chunk roles
-- Root-trace-preserving organization followed by query-seeded PPR knowledge groups
-- Contract-aware final layout controller for `section / mechanism / comparison / theme`
-- Contract-aware LLM judge with `Comprehensiveness`, `Diversity`, `Focus Match`, `Evidence Anchoring`, `Scope Discipline`, and `Scenario Fidelity`
+- Explicit `root / bridge / support / context` chunk roles
+- Root-trace-preserving organization into edge skeletons and evidence dossiers
+- Degree-normalized graph features to reduce high-connectivity basin traps
+- QFS-oriented LLM judge with `Comprehensiveness`, `Diversity`, `Empowerment`, `Overall`, and claim groundedness support
 
 ## Repository Layout
 
@@ -59,7 +59,7 @@ pip install -r requirements.txt
 
 ### 2. Configure models
 
-Edit [llm_config.py](/Users/Admin/projects/Association/llm_config.py) so that:
+Create or edit the local, git-ignored [llm_config.py](/Users/Admin/projects/Association/llm_config.py) so that:
 
 - answer generation points to your preferred chat model
 - judge generation points to your preferred judge model
@@ -136,7 +136,6 @@ python -m associative_rag_project.main judge \
 
 Useful options:
 
-- `--organization-controller off|predicted|oracle`
 - `--retrieval-mode bm25|dense|hybrid`
 - `--limit-groups` or `--limit` on `retrieve/run/run-all`
 - `--baseline-dir` on `judge` for bulk baseline comparison
@@ -161,6 +160,7 @@ When `judge --baseline-dir` is used, the project also writes:
 
 - Detailed Chinese technical report: [associative_rag_project/TECHNICAL_REPORT_CN.md](/Users/Admin/projects/Association/associative_rag_project/TECHNICAL_REPORT_CN.md)
 - Chinese method draft: [associative_rag_project/METHOD_DRAFT_CN.md](/Users/Admin/projects/Association/associative_rag_project/METHOD_DRAFT_CN.md)
+- Chinese figure guide: [associative_rag_project/METHOD_FIGURE_GUIDE_CN.md](/Users/Admin/projects/Association/associative_rag_project/METHOD_FIGURE_GUIDE_CN.md)
 
 ## Current Positioning
 

@@ -1,15 +1,24 @@
-"""FG-RAG-compatible LLM-as-a-judge utilities."""
+"""LLM-as-a-judge utilities.
+
+用于对生成答案与基线答案进行对比评判的工具集。
+"""
 
 import json
+import re
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
+from .config import load_llm_config
+from .embedding_client import OpenAICompatibleEmbeddingClient
 from .logging_utils import log
+from .data import load_graph_corpus
+from .retrieval import BM25Index, DenseChunkIndex, HybridChunkRetriever
 
 
 JUDGE_SYSTEM_PROMPT = """---Role---
 You are an expert tasked with evaluating two answers to the same question.
-You must also identify what kind of organization the query requires and what kind of organization each answer actually uses.
+Evaluate them as query-focused summarization answers.
 """
 
 
@@ -20,16 +29,6 @@ You will evaluate two answers to the same question based on:
 - **Comprehensiveness**
 - **Diversity**
 - **Empowerment**
-- **Focus Match**
-- **Evidence Anchoring**
-
-First classify the query's required organization contract as exactly one of:
-- `section-grounded`
-- `mechanism-grounded`
-- `comparison-grounded`
-- `theme-grounded`
-
-Then classify each answer's dominant organization type using the same four labels.
 
 - **Comprehensiveness**: How much detail does the answer provide to cover all aspects and details of the question?
 
@@ -37,15 +36,8 @@ Then classify each answer's dominant organization type using the same four label
 
 - **Empowerment**: How well does the answer help the reader understand and make informed judgments about the topic?
 
-- **Focus Match**: How well does the answer's organization match what the query actually requires?
-  Examples:
-  - if the query needs section-grounded organization, a thematic overview is a mismatch
-  - if the query needs mechanism-grounded organization, generic advice is a mismatch
-  - if the query needs comparison-grounded organization, a broad summary without clear contrasts is a mismatch
-
-- **Evidence Anchoring**: How well is the answer's chosen organization stably anchored in corpus-specific evidence rather than only sounding plausible?
-
-For each criterion, choose the better answer (ether Answer 1 or Answer 2) and explain why. Then, select an overal winner based on these criteria as a whole.
+For each criterion, choose the better answer (either Answer 1 or Answer 2) and explain why.
+Then select an Overall Winner for the QFS task. The better QFS answer should be more comprehensive, more diverse in coverage, and more empowering/useful to the reader while staying faithful to the question.
 
 Here is the question:
 {input_query}
@@ -63,38 +55,236 @@ Evaluate both answers using the criteria listed above and provide detailed expla
 Output your evaluation in the following JSON format:
 
 {{
-    "Query Organization Need": {{ "Label": "[section-grounded | mechanism-grounded | comparison-grounded | theme-grounded]", "Explanation": "[Why this query needs that organization]" }},
-    "Answer 1 Organization": {{ "Label": "[section-grounded | mechanism-grounded | comparison-grounded | theme-grounded]", "Explanation": "[What organization Answer 1 actually uses]" }},
-    "Answer 2 Organization": {{ "Label": "[section-grounded | mechanism-grounded | comparison-grounded | theme-grounded]", "Explanation": "[What organization Answer 2 actually uses]" }},
     "Comprehensiveness": {{ "Winner": "[Answer 1 or Answer 2]", "Explanation": "[Provide explanation here]" }} ,
     "Diversity": {{ "Winner": "[Answer 1 or Answer 2]", "Explanation": "[Provide explanation here]" }} ,
     "Empowerment": {{ "Winner": "[Answer 1 or Answer 2]", "Explanation": "[Provide explanation here]" }} ,
-    "Focus Match": {{ "Winner": "[Answer 1 or Answer 2]", "Explanation": "[Which answer better matches the query's required organization and why]" }} ,
-    "Evidence Anchoring": {{ "Winner": "[Answer 1 or Answer 2]", "Explanation": "[Which answer is better anchored in evidence for its chosen organization and why]" }} ,
-    "Overall Winner": {{ "Winner": "[Answer 1 or Answer 2]", "Explanation": "[Summarize why ths answer is the overall winner based on the three criteria]" }}
+    "Overall Winner": {{ "Winner": "[Answer 1 or Answer 2]", "Explanation": "[Summarize why this answer is the better QFS answer]" }}
 }}
+"""
+
+CLAIM_SYSTEM_PROMPT = """You extract and verify corpus-checkable claims from QFS answers.
+Return strict JSON only."""
+
+CLAIM_EXTRACTION_PROMPT = """Goal:
+- Extract every core, corpus-checkable claim needed to cover the substantive answer.
+- Do not impose a maximum number of claims. Continue until the core factual content is covered.
+- Prefer high recall over brevity, but skip trivial restatements and purely rhetorical framing.
+
+Rules:
+- Keep claims atomic, specific, and corpus-checkable.
+- The answer may use a P1-P5 scaffold. Ignore P1/P2/P3/P4/P5 labels, Titles, Answer Outline, Queries/Summaries/Evidence headings, Document Sections, Refinement notes, source labels, and other formatting shell text.
+- Ignore claims about the retrieval system, graph, evidence package structure, prompt design, or answer formatting.
+- Prefer claims that materially affect whether the answer is trustworthy.
+- Split multi-part claims into separate claims when possible.
+- If a sentence is only framing or rhetorical, skip it.
+- Return strict JSON with exactly this schema:
+{{
+  "claims": [
+    {{
+      "text": "...",
+      "verifiable": true
+    }}
+  ]
+}}
+
+Question:
+{query}
+
+Answer:
+{answer}
+"""
+
+CLAIM_PAIR_EXTRACTION_PROMPT = """Goal:
+- Extract every core, corpus-checkable claim needed to cover each answer's substantive content.
+- Do not impose a maximum number of claims. Continue until each answer's core factual content is covered.
+- Prefer high recall over brevity, but skip trivial restatements and purely rhetorical framing.
+
+Rules:
+- Keep claims atomic, specific, and corpus-checkable.
+- The answers may use a P1-P5 scaffold. Ignore P1/P2/P3/P4/P5 labels, Titles, Answer Outline, Queries/Summaries/Evidence headings, Document Sections, Refinement notes, source labels, and other formatting shell text.
+- Ignore claims about the retrieval system, graph, evidence package structure, prompt design, or answer formatting.
+- Prefer claims that materially affect whether the answer is trustworthy.
+- Split multi-part claims into separate claims when possible.
+- If a sentence is only framing or rhetorical, skip it.
+- Return strict JSON with exactly this schema:
+{{
+  "answers": [
+    {{
+      "answer_id": "candidate",
+      "claims": [
+        {{
+          "text": "...",
+          "verifiable": true
+        }}
+      ]
+    }},
+    {{
+      "answer_id": "baseline",
+      "claims": [
+        {{
+          "text": "...",
+          "verifiable": true
+        }}
+      ]
+    }}
+  ]
+}}
+
+Question:
+{query}
+
+Candidate answer:
+{candidate_answer}
+
+Baseline answer:
+{baseline_answer}
+"""
+
+CLAIM_SUPPORT_PROMPT = """For each claim below, decide whether the retrieved corpus snippets support it.
+
+CLAIM_SCORE_BY_LABEL = {{
+    "supported": 1.0,
+    "partially_supported": 0.5,
+    "insufficient_evidence": 0.0,
+    "contradicted": 0.0,
+    "verification_error": 0.0,
+}}
+Rules:
+- Use only the provided snippets.
+- "supported" means the snippets directly support the claim.
+- "partially_supported" means the snippets support part of the claim but not the whole statement.
+- "insufficient_evidence" means there is not enough information in the snippets to determine the claim's truthfulness.
+- "contradicted" means the snippets explicitly contradict the claim.
+- "verification_error" means there was an error in verifying the claim.
+- Return strict JSON with exactly this schema:
+{{
+  "claim_assessments": [
+    {{
+      "answer_id": "candidate | baseline",
+      "claim_index": 1,
+      "claim": "...",
+      "label": "supported | partially_supported | insufficient_evidence | contradicted | verification_error",
+      "explanation": "..."
+    }}
+  ]
+}}
+
+Question:
+{query}
+
+Claims and retrieved snippets:
+{payload}
+"""
+
+JSON_REPAIR_SYSTEM_PROMPT = """You repair malformed JSON.
+Return only valid JSON. Do not add prose, Markdown, or code fences."""
+
+JSON_REPAIR_PROMPT = """The previous model response was intended to be JSON but could not be parsed.
+
+Parse error:
+{error}
+
+Invalid response:
+{raw}
+
+Return only the repaired JSON object that satisfies the requested schema.
 """
 
 
 def _extract_json(text):
-    """Recover JSON even if the model wraps it in prose or code fences."""
-    text = text.strip()
+    """Recover JSON even if the model wraps it in prose or code fences.
+
+    从模型回复中抽取 JSON 内容，忽略前后附加文本。
+    """
+    text = str(text or "").strip()
     try:
         return json.loads(text)
     except Exception:
-        start = text.find("{")
-        end = text.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            return json.loads(text[start : end + 1])
+        fenced = re.search(r"```(?:json)?\s*(.*?)```", text, flags=re.I | re.S)
+        if fenced:
+            try:
+                return json.loads(fenced.group(1).strip())
+            except Exception:
+                pass
+        decoder = json.JSONDecoder()
+        for start, char in enumerate(text):
+            if char not in "[{":
+                continue
+            try:
+                obj, _ = decoder.raw_decode(text[start:])
+                return obj
+            except Exception:
+                continue
         raise
 
 
 def build_judge_prompt(query, answer_a, answer_b):
-    """Build the exact FG-RAG evaluation prompt template."""
+    """Build the exact FG-RAG evaluation prompt template.
+
+    参数:
+        query: 评判的问题文本。
+        answer_a: 第一个候选答案文本。
+        answer_b: 第二个候选答案文本。
+
+    返回:
+        用于 LLM 判分的完整提示字符串。
+
+    构造完整的判分提示，要求模型比较两个答案并返回 JSON。
+    """
     return FG_RAG_EVALUATE_PROMPT.format(
         input_query=query,
         first_answer=answer_a,
         second_answer=answer_b,
+    )
+
+
+def _generate_json(prompt, llm_client, system_prompt, max_tokens=900, max_attempts=3):
+    """Run JSON-only generation with parse retries and JSON repair.
+
+    参数:
+        prompt: 传给模型的用户提示文本。
+        llm_client: 支持 generate() 的 LLM 客户端实例。
+        system_prompt: 系统角色提示内容。
+        max_tokens: 生成最大 token 数。
+        max_attempts: 解析失败时的最大重试次数。
+
+    返回:
+        解析后的 JSON 对象。
+
+    重复调用 LLM，直到成功解析出 JSON 或达到重试上限。
+    """
+    last_error = None
+    current_prompt = prompt
+    for attempt in range(1, max_attempts + 1):
+        raw = ""
+        try:
+            raw = llm_client.generate(current_prompt, system_prompt=system_prompt, temperature=0.0, max_tokens=max_tokens)
+            return _extract_json(raw)
+        except Exception as exc:
+            last_error = exc
+            log(f"[judge] json parse failure attempt={attempt}/{max_attempts}: {exc}")
+            if raw and attempt < max_attempts:
+                current_prompt = JSON_REPAIR_PROMPT.format(error=str(exc), raw=raw)
+                system_prompt = JSON_REPAIR_SYSTEM_PROMPT
+    raise last_error
+
+
+def build_claim_extraction_prompt(query, answer):
+    return CLAIM_EXTRACTION_PROMPT.format(query=query, answer=answer)
+
+
+def build_pair_claim_extraction_prompt(query, candidate_answer, baseline_answer):
+    return CLAIM_PAIR_EXTRACTION_PROMPT.format(
+        query=query,
+        candidate_answer=candidate_answer,
+        baseline_answer=baseline_answer,
+    )
+
+
+def build_claim_support_prompt(query, claim_packets):
+    return CLAIM_SUPPORT_PROMPT.format(
+        query=query,
+        payload=json.dumps(claim_packets, ensure_ascii=False, indent=2),
     )
 
 
@@ -125,16 +315,23 @@ CRITERIA_KEYS = [
     "Comprehensiveness",
     "Diversity",
     "Empowerment",
-    "Focus Match",
-    "Evidence Anchoring",
     "Overall Winner",
 ]
 
-ORGANIZATION_LABELS = {
-    "section-grounded",
-    "mechanism-grounded",
-    "comparison-grounded",
-    "theme-grounded",
+WINRATE_TABLE_METRICS = [
+    "Overall Winner",
+    "Comprehensiveness",
+    "Diversity",
+    "Empowerment",
+    "Corpus Groundedness",
+]
+
+CLAIM_SCORE_BY_LABEL = {
+    "supported": 1.0,
+    "partially_supported": 0.5,
+    "insufficient_evidence": 0.0,
+    "contradicted": 0.0,
+    "verification_error": 0.0,
 }
 
 
@@ -161,8 +358,8 @@ def _extract_dimension_votes(verdict_ab, verdict_ba_raw):
     return mapped
 
 
-def _fallback_verdict():
-    """Fail-safe verdict so one malformed model output does not kill the whole run."""
+def _parse_error_verdict():
+    """Tie verdict used only when pairwise evaluator JSON cannot be parsed."""
     return {
         key: {
             "Winner": "Tie",
@@ -172,58 +369,581 @@ def _fallback_verdict():
     }
 
 
-def _normalize_contract_label(raw_value):
-    value = (raw_value or "").strip().lower()
-    if value in ORGANIZATION_LABELS:
-        return value
-    if "section" in value:
-        return "section-grounded"
-    if "mechan" in value or "cause" in value or "process" in value:
-        return "mechanism-grounded"
-    if "compar" in value or "contrast" in value:
-        return "comparison-grounded"
-    return "theme-grounded"
-
-
-def _extract_organization_analysis(verdict_ab, verdict_ba_raw):
-    query_contract_ab = _normalize_contract_label(verdict_ab.get("Query Organization Need", {}).get("Label", ""))
-    query_contract_ba = _normalize_contract_label(verdict_ba_raw.get("Query Organization Need", {}).get("Label", ""))
-    query_contract = query_contract_ab if query_contract_ab == query_contract_ba else query_contract_ab
-    candidate_labels = [
-        _normalize_contract_label(verdict_ab.get("Answer 1 Organization", {}).get("Label", "")),
-        _normalize_contract_label(verdict_ba_raw.get("Answer 2 Organization", {}).get("Label", "")),
-    ]
-    baseline_labels = [
-        _normalize_contract_label(verdict_ab.get("Answer 2 Organization", {}).get("Label", "")),
-        _normalize_contract_label(verdict_ba_raw.get("Answer 1 Organization", {}).get("Label", "")),
-    ]
-    candidate_contract = Counter(candidate_labels).most_common(1)[0][0]
-    baseline_contract = Counter(baseline_labels).most_common(1)[0][0]
+def load_judge_corpus_resources(corpus_dir):
+    """Load dense chunk retrieval resources for claim-groundedness checks."""
+    if not corpus_dir:
+        return None
+    _graph, chunk_store, index_dir = load_graph_corpus(Path(corpus_dir))
+    dense_path = index_dir / "vdb_chunks.json"
+    dense_index = DenseChunkIndex.load(dense_path) if dense_path.exists() else None
+    bm25_index = BM25Index.build(chunk_store)
+    embedding_client = OpenAICompatibleEmbeddingClient(load_llm_config())
+    claim_retriever = HybridChunkRetriever(
+        bm25_index=bm25_index,
+        dense_index=dense_index,
+        embedding_client=embedding_client,
+        mode="dense",
+    )
     return {
-        "query_contract": query_contract,
-        "candidate_answer_contract": candidate_contract,
-        "baseline_answer_contract": baseline_contract,
-        "candidate_matches_query_contract": candidate_contract == query_contract,
-        "baseline_matches_query_contract": baseline_contract == query_contract,
+        "index_dir": str(index_dir),
+        "chunk_store": chunk_store,
+        "dense_index": dense_index,
+        "embedding_client": embedding_client,
+        "claim_retriever": claim_retriever,
+    }
+
+
+def _normalize_claim_label(raw_value):
+    value = (raw_value or "").strip().lower()
+    if value in CLAIM_SCORE_BY_LABEL:
+        return value
+    if ("support" in value and value.startswith("un")) or "not supported" in value:
+        return "insufficient_evidence"
+    if "partial" in value:
+        return "partially_supported"
+    if "insufficient" in value or "not enough" in value:
+        return "insufficient_evidence"
+    if "contradict" in value or "refute" in value:
+        return "contradicted"
+    if "support" in value:
+        return "supported"
+    if "error" in value:
+        return "verification_error"
+    return "verification_error"
+
+
+_SCAFFOLD_CLAIM_PATTERNS = (
+    r"^p[1-7]\s*[\.:]",
+    r"^titles?\s*[:\-]?$",
+    r"^answer outline\s*[:\-]?$",
+    r"^queries,\s*summaries,\s*and evidence\s*[:\-]?$",
+    r"^document sections?\s*[:\-]?$",
+    r"^refinement\s*[:\-]?$",
+    r"^source\s+chunks?\s*[:\-]?$",
+)
+
+
+def _normalize_extracted_claim_text(text: str) -> str:
+    text = str(text or "").strip()
+    text = re.sub(r"^\s*[-*]\s*", "", text)
+    text = re.sub(r"^⟨[^⟩]+⟩\s*", "", text)
+    text = re.sub(r"^\*\*Aspect\s*\d+[^*]*\*\*\s*:?\s*", "", text, flags=re.I)
+    text = re.sub(r"^\*\*[^*]+\*\*\s*:?\s*", "", text)
+    text = re.sub(r"\bkg-\d+\b", "", text, flags=re.I)
+    text = re.sub(r"\bsrc-\d+\b", "", text, flags=re.I)
+    text = re.sub(r"\s+", " ", text).strip(" -|:;,.")
+    return text
+
+
+def _is_scaffold_claim(text):
+    value = str(text or "").strip().lower()
+    if not value:
+        return True
+    return any(re.search(pattern, value, flags=re.I) for pattern in _SCAFFOLD_CLAIM_PATTERNS)
+
+
+def _claim_dedup_key(text):
+    return re.sub(r"\s+", " ", str(text or "").lower()).strip()
+
+
+def _coerce_claim_items(payload):
+    """Accept minor JSON shape drift without falling back to sentence splitting."""
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+    raw_claims = payload.get("claims")
+    if isinstance(raw_claims, list):
+        return raw_claims
+    if isinstance(raw_claims, dict):
+        nested = raw_claims.get("items") or raw_claims.get("claims")
+        if isinstance(nested, list):
+            return nested
+        return list(raw_claims.values())
+    if payload.get("text") or payload.get("claim"):
+        return [payload]
+    for value in payload.values():
+        if isinstance(value, list) and any(isinstance(item, (str, dict)) for item in value):
+            return value
+    return []
+
+
+def _clean_claim_items(raw_claims):
+    claims = []
+    seen = set()
+
+    for item in raw_claims:
+        if isinstance(item, str):
+            claim_text = item
+            verifiable = True
+        else:
+            claim_text = item.get("text") or item.get("claim") or item.get("statement") or ""
+            verifiable = bool(item.get("verifiable", True))
+        claim_text = _normalize_extracted_claim_text(claim_text)
+
+        if not claim_text or not verifiable or _is_scaffold_claim(claim_text):
+            continue
+
+        dedup_key = _claim_dedup_key(claim_text)
+        if dedup_key in seen:
+            continue
+        seen.add(dedup_key)
+
+        claims.append(
+            {
+                "text": claim_text,
+                "verifiable": True,
+            }
+        )
+    return claims
+
+
+def _extract_claims(query, answer, llm_client):
+    prompt = build_claim_extraction_prompt(query, answer)
+    try:
+        payload = _generate_json(
+            prompt,
+            llm_client,
+            CLAIM_SYSTEM_PROMPT,
+            max_tokens=12000,
+            max_attempts=4,
+        )
+    except Exception as exc:
+        log(f"[judge] claim extraction failed: {exc}")
+        return []
+
+    return _clean_claim_items(_coerce_claim_items(payload))
+
+
+def _coerce_pair_claim_items(payload):
+    if not isinstance(payload, dict):
+        return {"candidate": [], "baseline": []}
+    grouped = {"candidate": [], "baseline": []}
+    answers = payload.get("answers")
+    if isinstance(answers, list):
+        for answer_payload in answers:
+            if not isinstance(answer_payload, dict):
+                continue
+            answer_id = str(answer_payload.get("answer_id") or answer_payload.get("id") or "").strip().lower()
+            if answer_id not in grouped:
+                continue
+            grouped[answer_id].extend(_coerce_claim_items(answer_payload))
+    for answer_id in grouped:
+        raw_value = payload.get(answer_id)
+        if raw_value is not None:
+            grouped[answer_id].extend(_coerce_claim_items(raw_value if isinstance(raw_value, dict) else {"claims": raw_value}))
+    return grouped
+
+
+def _extract_pair_claims(query, candidate_answer, baseline_answer, llm_client):
+    prompt = build_pair_claim_extraction_prompt(query, candidate_answer, baseline_answer)
+    try:
+        payload = _generate_json(
+            prompt,
+            llm_client,
+            CLAIM_SYSTEM_PROMPT,
+            max_tokens=20000,
+            max_attempts=4,
+        )
+    except Exception as exc:
+        log(f"[judge] pair claim extraction failed: {exc}")
+        return {"candidate": [], "baseline": []}
+    grouped = _coerce_pair_claim_items(payload)
+    return {
+        "candidate": _clean_claim_items(grouped["candidate"]),
+        "baseline": _clean_claim_items(grouped["baseline"]),
+    }
+
+
+def _claim_retrieval_query(query, claim_text):
+    return f"Question: {query}\nClaim to verify: {claim_text}"
+
+
+def _dense_claim_hits(query, claim_texts, corpus_resources, top_k):
+    dense_index = corpus_resources.get("dense_index")
+    embedding_client = corpus_resources.get("embedding_client")
+    if dense_index is None or embedding_client is None:
+        raise ValueError("dense claim retriever is unavailable")
+    queries = [_claim_retrieval_query(query, claim_text) for claim_text in claim_texts]
+    if hasattr(embedding_client, "embed_texts"):
+        vectors = embedding_client.embed_texts(queries)
+    else:
+        vectors = [embedding_client.embed_text(query_text) for query_text in queries]
+    return [dense_index.search(vector, top_k=top_k) for vector in vectors]
+
+
+def _claim_evidence_packets(query, claims, corpus_resources, top_k=3, snippet_words=220, answer_id=None):
+    if not claims or not corpus_resources:
+        return []
+    chunk_store = corpus_resources["chunk_store"]
+    claim_texts = [claim["text"] if isinstance(claim, dict) else str(claim) for claim in claims]
+    retrieval_error = None
+    try:
+        hit_batches = _dense_claim_hits(query, claim_texts, corpus_resources, top_k=top_k)
+    except Exception as exc:
+        hit_batches = [[] for _ in claim_texts]
+        retrieval_error = f"{exc.__class__.__name__}: {exc}"
+        log(f"[judge] dense batch claim retrieval failed answer_id={answer_id or 'single'}: {exc}")
+    packets = []
+    for claim_index, (claim_text, hits) in enumerate(zip(claim_texts, hit_batches), start=1):
+        snippets = []
+        for rank, hit in enumerate(hits, start=1):
+            chunk = chunk_store.get(hit["chunk_id"], {})
+            content = " ".join(chunk.get("content", "").split())
+            snippet = " ".join(content.split()[:snippet_words])
+            snippets.append(
+                {
+                    "rank": rank,
+                    "chunk_id": hit["chunk_id"],
+                    "score_norm": round(float(hit.get("score_norm", 0.0)), 6),
+                    "dense_score": round(float(hit.get("dense_score", 0.0)), 6),
+                    "dense_score_norm": round(float(hit.get("dense_score_norm", 0.0)), 6),
+                    "snippet": snippet,
+                }
+            )
+        packet = {
+            "claim_index": claim_index,
+            "claim": claim_text,
+            "retrieved_chunks": snippets,
+            "retrieval_error": retrieval_error,
+        }
+        if answer_id:
+            packet["answer_id"] = answer_id
+        packets.append(packet)
+    return packets
+
+
+def _pair_claim_evidence_packets(query, pair_claims, corpus_resources, top_k=3, snippet_words=220):
+    all_claims = []
+    packet_keys = []
+    for answer_id in ("candidate", "baseline"):
+        for claim_index, claim in enumerate(pair_claims.get(answer_id, []), start=1):
+            all_claims.append(claim)
+            packet_keys.append((answer_id, claim_index))
+    if not all_claims:
+        return {"candidate": [], "baseline": []}
+    flat_packets = _claim_evidence_packets(
+        query=query,
+        claims=all_claims,
+        corpus_resources=corpus_resources,
+        top_k=top_k,
+        snippet_words=snippet_words,
+    )
+    grouped = {"candidate": [], "baseline": []}
+    for packet, (answer_id, claim_index) in zip(flat_packets, packet_keys):
+        packet["answer_id"] = answer_id
+        packet["claim_index"] = claim_index
+        grouped[answer_id].append(packet)
+    return grouped
+
+
+def _chunked(items, batch_size):
+    for start in range(0, len(items), batch_size):
+        yield items[start : start + batch_size]
+
+
+def _verification_error_assessment(packet, explanation):
+    assessment = {
+        "claim_index": packet.get("claim_index"),
+        "claim": packet["claim"],
+        "label": "verification_error",
+        "explanation": explanation,
+        "retrieved_chunks": packet.get("retrieved_chunks", []),
+    }
+    if packet.get("answer_id"):
+        assessment["answer_id"] = packet["answer_id"]
+    return assessment
+
+
+def _parse_support_assessments(payload, claim_packets):
+    raw_items = payload.get("claim_assessments", []) if isinstance(payload, dict) else []
+    by_index = {
+        (packet.get("answer_id", ""), int(packet["claim_index"])): packet
+        for packet in claim_packets
+    }
+    by_claim = {_claim_dedup_key(packet["claim"]): packet for packet in claim_packets}
+    seen = set()
+    assessments = []
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        raw_index = item.get("claim_index")
+        answer_id = str(item.get("answer_id") or "").strip().lower()
+        packet = None
+        try:
+            if raw_index is not None:
+                packet = by_index.get((answer_id, int(raw_index))) or by_index.get(("", int(raw_index)))
+        except Exception:
+            packet = None
+        if packet is None:
+            packet = by_claim.get(_claim_dedup_key(item.get("claim", "")))
+        if packet is None:
+            continue
+        packet_key = (packet.get("answer_id", ""), int(packet["claim_index"]))
+        if packet_key in seen:
+            continue
+        seen.add(packet_key)
+        assessment = {
+            "claim_index": int(packet["claim_index"]),
+            "claim": packet["claim"],
+            "label": _normalize_claim_label(item.get("label", "")),
+            "explanation": str(item.get("explanation", "")).strip(),
+            "retrieved_chunks": packet.get("retrieved_chunks", []),
+        }
+        if packet.get("answer_id"):
+            assessment["answer_id"] = packet["answer_id"]
+        assessments.append(assessment)
+    for packet in claim_packets:
+        packet_key = (packet.get("answer_id", ""), int(packet["claim_index"]))
+        if packet_key not in seen:
+            assessments.append(_verification_error_assessment(packet, "support_check_missing_assessment"))
+    assessments.sort(key=lambda item: (str(item.get("answer_id") or ""), int(item.get("claim_index") or 0)))
+    return assessments
+
+
+def _assess_claim_support(query, claim_packets, llm_client, batch_size=32):
+    if not claim_packets:
+        return []
+    assessments = []
+    for packet_batch in _chunked(claim_packets, batch_size):
+        retrieval_errors = [packet for packet in packet_batch if packet.get("retrieval_error")]
+        assessable = [packet for packet in packet_batch if not packet.get("retrieval_error")]
+        assessments.extend(
+            _verification_error_assessment(packet, f"claim_retrieval_error: {packet['retrieval_error']}")
+            for packet in retrieval_errors
+        )
+        if not assessable:
+            continue
+        prompt = build_claim_support_prompt(query, assessable)
+        max_tokens = min(20000, 700 + 450 * len(assessable))
+        try:
+            payload = _generate_json(
+                prompt,
+                llm_client,
+                CLAIM_SYSTEM_PROMPT,
+                max_tokens=max_tokens,
+                max_attempts=3,
+            )
+            assessments.extend(_parse_support_assessments(payload, assessable))
+        except Exception as exc:
+            log(f"[judge] claim support check failed: {exc}")
+            assessments.extend(
+                _verification_error_assessment(packet, f"support_check_error:{exc.__class__.__name__}")
+                for packet in assessable
+            )
+    assessments.sort(key=lambda item: (str(item.get("answer_id") or ""), int(item.get("claim_index") or 0)))
+    return assessments
+
+
+def _empty_answer_groundedness(claim_count=0, extraction_failed_or_empty=False):
+    return {
+        "claims": [],
+        "claim_count": claim_count,
+        "supported_claim_count": 0,
+        "supported_equivalent_claim_count": 0.0,
+        "supported_claim_ratio": 0.0,
+        "weighted_groundedness": 0.0,
+        "score": 0.0,
+        "weighted_score": 0.0,
+        "label_counts": {
+            "supported": 0,
+            "partially_supported": 0,
+            "insufficient_evidence": 0,
+            "contradicted": 0,
+            "verification_error": 0,
+        },
+        "extraction_failed_or_empty": extraction_failed_or_empty,
+    }
+
+
+def _summarize_groundedness_assessments(assessments, extracted_claim_count=0):
+    if not assessments:
+        if extracted_claim_count:
+            return _empty_answer_groundedness(claim_count=extracted_claim_count, extraction_failed_or_empty=False)
+        return _empty_answer_groundedness(claim_count=0, extraction_failed_or_empty=True)
+
+    counts = Counter()
+    supported_equivalent = 0.0
+
+    for item in assessments:
+        label = item["label"]
+        counts[label] += 1
+        supported_equivalent += CLAIM_SCORE_BY_LABEL.get(label, 0.0)
+
+    claim_count = len(assessments)
+    supported_claim_ratio = supported_equivalent / max(claim_count, 1)
+    weighted_groundedness = supported_equivalent * supported_claim_ratio
+    label_counts = {
+        "supported": counts["supported"],
+        "partially_supported": counts["partially_supported"],
+        "insufficient_evidence": counts["insufficient_evidence"],
+        "contradicted": counts["contradicted"],
+        "verification_error": counts["verification_error"],
+    }
+
+    return {
+        "claims": assessments,
+        "claim_count": claim_count,
+        "supported_claim_count": counts["supported"],
+        "supported_equivalent_claim_count": round(supported_equivalent, 4),
+        "supported_claim_ratio": round(supported_claim_ratio, 4),
+        "weighted_groundedness": round(weighted_groundedness, 4),
+        "score": round(supported_claim_ratio, 4),
+        "weighted_score": round(weighted_groundedness, 4),
+        "label_counts": label_counts,
+        "supported": counts["supported"],
+        "partially_supported": counts["partially_supported"],
+        "insufficient_evidence": counts["insufficient_evidence"],
+        "contradicted": counts["contradicted"],
+        "verification_error": counts["verification_error"],
+        "extraction_failed_or_empty": False,
+    }
+
+
+def assess_answer_groundedness(
+    query,
+    answer,
+    llm_client,
+    corpus_resources,
+):
+    claims = _extract_claims(query, answer, llm_client)
+
+    if not claims:
+        return _empty_answer_groundedness(claim_count=0, extraction_failed_or_empty=True)
+
+    claim_packets = _claim_evidence_packets(
+        query=query,
+        claims=claims,
+        corpus_resources=corpus_resources,
+        top_k=3,
+    )
+    assessments = _assess_claim_support(query, claim_packets, llm_client)
+    return _summarize_groundedness_assessments(assessments, extracted_claim_count=len(claims))
+
+
+def assess_pair_groundedness(query, candidate_answer, baseline_answer, llm_client, corpus_resources):
+    pair_claims = _extract_pair_claims(query, candidate_answer, baseline_answer, llm_client)
+    if not pair_claims["candidate"] and not pair_claims["baseline"]:
+        return {
+            "candidate": _empty_answer_groundedness(claim_count=0, extraction_failed_or_empty=True),
+            "baseline": _empty_answer_groundedness(claim_count=0, extraction_failed_or_empty=True),
+        }
+
+    grouped_packets = _pair_claim_evidence_packets(
+        query=query,
+        pair_claims=pair_claims,
+        corpus_resources=corpus_resources,
+        top_k=3,
+    )
+    combined_packets = grouped_packets["candidate"] + grouped_packets["baseline"]
+    combined_assessments = _assess_claim_support(query, combined_packets, llm_client, batch_size=32)
+    grouped_assessments = {"candidate": [], "baseline": []}
+    for assessment in combined_assessments:
+        answer_id = assessment.get("answer_id")
+        if answer_id in grouped_assessments:
+            clean_assessment = dict(assessment)
+            clean_assessment.pop("answer_id", None)
+            grouped_assessments[answer_id].append(clean_assessment)
+    return {
+        "candidate": _summarize_groundedness_assessments(
+            grouped_assessments["candidate"],
+            extracted_claim_count=len(pair_claims["candidate"]),
+        ),
+        "baseline": _summarize_groundedness_assessments(
+            grouped_assessments["baseline"],
+            extracted_claim_count=len(pair_claims["baseline"]),
+        ),
+    }
+
+
+def _groundedness_decision(candidate_groundedness, baseline_groundedness):
+    candidate_value = float(candidate_groundedness.get("weighted_groundedness", 0.0))
+    baseline_value = float(baseline_groundedness.get("weighted_groundedness", 0.0))
+    diff = candidate_value - baseline_value
+    if diff > 0.5:
+        winner = "candidate"
+    elif diff < -0.5:
+        winner = "baseline"
+    else:
+        winner = "tie"
+    return {
+        "winner": winner,
+        "candidate_weighted_groundedness": round(candidate_value, 4),
+        "baseline_weighted_groundedness": round(baseline_value, 4),
+        "difference": round(diff, 4),
+        "rule": "compare supported claim volume adjusted by supported-claim ratio; half-claim margin ties",
+    }
+
+
+def _empty_groundedness_accumulator():
+    return Counter(
+        {
+            "answer_count": 0,
+            "claim_count": 0,
+            "supported_claim_count": 0,
+            "supported_equivalent_claim_count": 0.0,
+            "weighted_groundedness": 0.0,
+            "supported_claim_ratio_sum": 0.0,
+        }
+    )
+
+
+def _accumulate_groundedness(accumulator, groundedness):
+    accumulator["answer_count"] += 1
+    accumulator["claim_count"] += int(groundedness.get("claim_count", 0) or 0)
+    accumulator["supported_claim_count"] += int(groundedness.get("supported_claim_count", 0) or 0)
+    accumulator["supported_equivalent_claim_count"] += float(
+        groundedness.get("supported_equivalent_claim_count", 0.0) or 0.0
+    )
+    accumulator["weighted_groundedness"] += float(groundedness.get("weighted_groundedness", 0.0) or 0.0)
+    accumulator["supported_claim_ratio_sum"] += float(groundedness.get("supported_claim_ratio", 0.0) or 0.0)
+
+
+def _summarize_groundedness_accumulator(accumulator):
+    answer_count = max(int(accumulator["answer_count"]), 1)
+    claim_count = int(accumulator["claim_count"])
+    supported_equivalent = float(accumulator["supported_equivalent_claim_count"])
+    return {
+        "answer_count": int(accumulator["answer_count"]),
+        "claim_count": claim_count,
+        "supported_claim_count": int(accumulator["supported_claim_count"]),
+        "supported_equivalent_claim_count": round(supported_equivalent, 4),
+        "supported_claim_ratio": round(supported_equivalent / max(claim_count, 1), 4),
+        "average_claim_count": round(claim_count / answer_count, 4),
+        "average_supported_claim_count": round(float(accumulator["supported_claim_count"]) / answer_count, 4),
+        "average_weighted_groundedness": round(float(accumulator["weighted_groundedness"]) / answer_count, 4),
+        "average_supported_claim_ratio": round(float(accumulator["supported_claim_ratio_sum"]) / answer_count, 4),
     }
 
 
 def _generate_verdict(prompt, llm_client, max_attempts=3):
-    """Retry parsing a judge response a few times before falling back to a tie."""
+    """Retry parsing a judge response a few times before returning a parse-error tie."""
     last_error = None
     for attempt in range(1, max_attempts + 1):
         try:
-            raw = llm_client.generate(prompt, system_prompt=JUDGE_SYSTEM_PROMPT, temperature=0.0, max_tokens=900)
-            return _extract_json(raw)
+            return _generate_json(prompt, llm_client, JUDGE_SYSTEM_PROMPT, max_tokens=900, max_attempts=1)
         except Exception as exc:
-            last_error = exc
             log(f"[judge] parse failure attempt={attempt}/{max_attempts}: {exc}")
-    log(f"[judge] falling back to tie verdict after repeated parse failures: {last_error}")
-    return _fallback_verdict()
+            last_error = exc
+    log(f"[judge] returning tie verdict after repeated parse failures: {last_error}")
+    return _parse_error_verdict()
 
 
-def judge_pair(query, candidate_answer, baseline_answer, llm_client):
-    """Judge one answer pair in both orders to reduce position bias."""
+def judge_pair(query, candidate_answer, baseline_answer, llm_client, corpus_resources=None):
+    """Judge one answer pair in both orders to reduce position bias.
+
+    参数:
+        query: 原始问题文本。
+        candidate_answer: 算法候选答案文本。
+        baseline_answer: 对照基线答案文本。
+        llm_client: 用于调用 LLM 的客户端实例。
+        corpus_resources: 可选的语料资源，用于额外的 groundedness 评估。
+
+    返回:
+        一个包含 AB/BA 判定、组织分析、维度投票和 groundedness 结果的判决字典。
+
+    对候选答案/基线答案进行 AB/BA 两次评判，降低位置偏差。
+    """
     prompt_ab = build_judge_prompt(query, candidate_answer, baseline_answer)
     verdict_ab = _generate_verdict(prompt_ab, llm_client)
     prompt_ba = build_judge_prompt(query, baseline_answer, candidate_answer)
@@ -233,44 +953,89 @@ def judge_pair(query, candidate_answer, baseline_answer, llm_client):
     overall_ba = _map_swapped_winner(_normalize_winner(verdict_ba_raw.get("Overall Winner", {}).get("Winner", "Tie")))
     votes = Counter([overall_ab, overall_ba])
     if votes["a"] > votes["b"] and votes["a"] > votes["tie"]:
-        final = "candidate"
+        llm_overall_winner = "candidate"
     elif votes["b"] > votes["a"] and votes["b"] > votes["tie"]:
-        final = "baseline"
+        llm_overall_winner = "baseline"
     else:
-        final = "tie"
+        llm_overall_winner = "tie"
 
     dimension_votes = _extract_dimension_votes(verdict_ab, verdict_ba_raw)
+    pair_groundedness = assess_pair_groundedness(query, candidate_answer, baseline_answer, llm_client, corpus_resources)
+    candidate_groundedness = pair_groundedness["candidate"]
+    baseline_groundedness = pair_groundedness["baseline"]
+    groundedness_decision = _groundedness_decision(candidate_groundedness, baseline_groundedness)
 
     return {
         "order_ab": verdict_ab,
         "order_ba": verdict_ba_raw,
-        "organization_analysis": _extract_organization_analysis(verdict_ab, verdict_ba_raw),
         "mapped_overall_votes": {
             "candidate": votes["a"],
             "baseline": votes["b"],
             "tie": votes["tie"],
         },
+        "llm_overall_winner": llm_overall_winner,
         "dimension_votes": dimension_votes,
-        "final_winner": final,
+        "corpus_groundedness": {
+            "winner": groundedness_decision["winner"],
+            "decision": groundedness_decision,
+            "candidate": candidate_groundedness,
+            "baseline": baseline_groundedness,
+        },
+        "final_winner": llm_overall_winner,
     }
 
 
-def run_winrate_judgement(questions, candidate_answers, baseline_answers, llm_client, output_path=None, max_workers=None):
-    """Run pairwise judging and aggregate both overall and per-dimension stats."""
+def run_winrate_judgement(
+    questions,
+    candidate_answers,
+    baseline_answers,
+    llm_client,
+    output_path=None,
+    max_workers=None,
+    corpus_resources=None,
+):
+    """Run pairwise judging and aggregate both overall and per-dimension stats.
+
+    参数:
+        questions: 问题文本列表。
+        candidate_answers: 候选答案记录列表，每条记录包含 model_answer。
+        baseline_answers: 基线答案记录列表，每条记录包含 model_answer。
+        llm_client: LLM 客户端实例。
+        output_path: 可选的判决结果输出文件路径。
+        max_workers: 并行评判的线程数，默认为 llm_client.max_concurrency。
+        corpus_resources: 可选的语料资源，用于 groundedness 评估。
+
+    返回:
+        包含总体胜率、各维度统计、合同条件汇总和每条判决详细信息的结果载荷。
+
+    对每个问题执行成对评判，并汇总最终胜率、维度统计与组织分析。
+    """
     if len(candidate_answers) != len(baseline_answers):
         raise ValueError("Candidate and baseline answer counts do not match")
     max_workers = max_workers or llm_client.max_concurrency
     log(f"[judge] start total={len(candidate_answers)} model={llm_client.model} workers={max_workers}")
     verdicts = [None] * len(candidate_answers)
     summary_counter = Counter()
+    llm_summary_counter = Counter()
     dimension_counter = {
         key: Counter({"candidate": 0, "baseline": 0, "tie": 0}) for key in CRITERIA_KEYS
+    }
+    corpus_groundedness_counter = Counter({"candidate": 0, "baseline": 0, "tie": 0})
+    groundedness_accumulators = {
+        "candidate": _empty_groundedness_accumulator(),
+        "baseline": _empty_groundedness_accumulator(),
     }
     pairs = list(zip(questions, candidate_answers, baseline_answers))
 
     def _one(item):
         idx, (query, cand, base) = item
-        verdict = judge_pair(query, cand["model_answer"], base["model_answer"], llm_client)
+        verdict = judge_pair(
+            query,
+            cand["model_answer"],
+            base["model_answer"],
+            llm_client,
+            corpus_resources=corpus_resources,
+        )
         return idx, {
             "index": idx,
             "query": query,
@@ -286,6 +1051,16 @@ def run_winrate_judgement(questions, candidate_answers, baseline_answers, llm_cl
             idx, verdict_payload = future.result()
             verdicts[idx - 1] = verdict_payload
             summary_counter[verdict_payload["final_winner"]] += 1
+            llm_summary_counter[verdict_payload["llm_overall_winner"]] += 1
+            corpus_groundedness_counter[verdict_payload["corpus_groundedness"]["winner"]] += 1
+            _accumulate_groundedness(
+                groundedness_accumulators["candidate"],
+                verdict_payload["corpus_groundedness"]["candidate"],
+            )
+            _accumulate_groundedness(
+                groundedness_accumulators["baseline"],
+                verdict_payload["corpus_groundedness"]["baseline"],
+            )
             for key, votes in verdict_payload["dimension_votes"].items():
                 for label, count in votes.items():
                     dimension_counter[key][label] += count
@@ -308,20 +1083,20 @@ def run_winrate_judgement(questions, candidate_answers, baseline_answers, llm_cl
             "tie_probability": round(counter["tie"] / max(total_votes, 1), 4),
             "total_votes": total_votes,
         }
-    organization_summary = {
-        "query_contracts": Counter(),
-        "candidate_answer_contracts": Counter(),
-        "baseline_answer_contracts": Counter(),
-        "candidate_contract_matches": 0,
-        "baseline_contract_matches": 0,
+    grounded_total = (
+        corpus_groundedness_counter["candidate"]
+        + corpus_groundedness_counter["baseline"]
+        + corpus_groundedness_counter["tie"]
+    )
+    dimension_summary["Corpus Groundedness"] = {
+        "candidate": corpus_groundedness_counter["candidate"],
+        "baseline": corpus_groundedness_counter["baseline"],
+        "tie": corpus_groundedness_counter["tie"],
+        "candidate_probability": round(corpus_groundedness_counter["candidate"] / max(grounded_total, 1), 4),
+        "baseline_probability": round(corpus_groundedness_counter["baseline"] / max(grounded_total, 1), 4),
+        "tie_probability": round(corpus_groundedness_counter["tie"] / max(grounded_total, 1), 4),
+        "total_votes": grounded_total,
     }
-    for verdict in verdicts:
-        analysis = verdict["organization_analysis"]
-        organization_summary["query_contracts"][analysis["query_contract"]] += 1
-        organization_summary["candidate_answer_contracts"][analysis["candidate_answer_contract"]] += 1
-        organization_summary["baseline_answer_contracts"][analysis["baseline_answer_contract"]] += 1
-        organization_summary["candidate_contract_matches"] += int(analysis["candidate_matches_query_contract"])
-        organization_summary["baseline_contract_matches"] += int(analysis["baseline_matches_query_contract"])
     payload = {
         "summary": {
             "total": total,
@@ -331,13 +1106,18 @@ def run_winrate_judgement(questions, candidate_answers, baseline_answers, llm_cl
             "candidate_win_rate": round(summary_counter["candidate"] / max(total, 1), 4),
             "baseline_win_rate": round(summary_counter["baseline"] / max(total, 1), 4),
         },
+        "llm_overall_summary": {
+            "total": total,
+            "candidate_wins": llm_summary_counter["candidate"],
+            "baseline_wins": llm_summary_counter["baseline"],
+            "ties": llm_summary_counter["tie"],
+            "candidate_win_rate": round(llm_summary_counter["candidate"] / max(total, 1), 4),
+            "baseline_win_rate": round(llm_summary_counter["baseline"] / max(total, 1), 4),
+        },
         "criteria_summary": dimension_summary,
-        "organization_summary": {
-            "query_contracts": dict(organization_summary["query_contracts"]),
-            "candidate_answer_contracts": dict(organization_summary["candidate_answer_contracts"]),
-            "baseline_answer_contracts": dict(organization_summary["baseline_answer_contracts"]),
-            "candidate_contract_match_rate": round(organization_summary["candidate_contract_matches"] / max(total, 1), 4),
-            "baseline_contract_match_rate": round(organization_summary["baseline_contract_matches"] / max(total, 1), 4),
+        "corpus_groundedness_claim_summary": {
+            "candidate": _summarize_groundedness_accumulator(groundedness_accumulators["candidate"]),
+            "baseline": _summarize_groundedness_accumulator(groundedness_accumulators["baseline"]),
         },
         "verdicts": verdicts,
     }
@@ -345,3 +1125,48 @@ def run_winrate_judgement(questions, candidate_answers, baseline_answers, llm_cl
         output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         log(f"[judge] wrote {output_path}")
     return payload
+
+
+def build_winrate_table_rows(payload):
+    """Normalize overall + per-criterion win rates into row objects for table rendering."""
+    rows = []
+    overall = payload.get("summary", {})
+    rows.append(
+        {
+            "metric": "Overall Winner",
+            "candidate_win_rate": overall.get("candidate_win_rate", 0.0),
+            "baseline_win_rate": overall.get("baseline_win_rate", 0.0),
+            "tie_rate": round(overall.get("ties", 0) / max(overall.get("total", 1), 1), 4),
+            "total_votes": overall.get("total", 0),
+        }
+    )
+    criteria_summary = payload.get("criteria_summary", {})
+    for metric_name in WINRATE_TABLE_METRICS[1:]:
+        metric = criteria_summary.get(metric_name, {})
+        rows.append(
+            {
+                "metric": metric_name,
+                "candidate_win_rate": metric.get("candidate_probability", 0.0),
+                "baseline_win_rate": metric.get("baseline_probability", 0.0),
+                "tie_rate": metric.get("tie_probability", 0.0),
+                "total_votes": metric.get("total_votes", 0),
+            }
+        )
+    return rows
+
+
+def render_winrate_markdown_table(payload, candidate_label, baseline_label, title=None):
+    """Render a compact Markdown win-rate table for one baseline comparison."""
+    rows = build_winrate_table_rows(payload)
+    lines = []
+    if title:
+        lines.append(f"## {title}")
+        lines.append("")
+    lines.append(f"| Metric | {candidate_label} | {baseline_label} | Tie | Total |")
+    lines.append("| --- | ---: | ---: | ---: | ---: |")
+    for row in rows:
+        lines.append(
+            f"| {row['metric']} | {row['candidate_win_rate']:.4f} | "
+            f"{row['baseline_win_rate']:.4f} | {row['tie_rate']:.4f} | {row['total_votes']} |"
+        )
+    return "\n".join(lines)

@@ -3,6 +3,8 @@
 This helper focuses on baseline-win cases and aggregates the judge's
 explanations by evaluation dimension. It is intentionally lightweight and
 heuristic-driven so it can run locally without another model call.
+
+分析评判结果文件中的基线胜出原因，按评价维度汇总解释信息。
 """
 
 from __future__ import annotations

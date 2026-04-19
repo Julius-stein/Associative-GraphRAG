@@ -3,6 +3,8 @@
 This utility is meant for clean organization-side ablations: it preserves the
 existing retrieval output and simply prepends a group-dossier view built from
 stored knowledge-group metadata.
+
+无需重跑检索，基于已存知识组元数据重建 prompt_context。
 """
 
 from __future__ import annotations
@@ -61,6 +63,10 @@ def _build_dossier_block(record):
 
 
 def repack_prompt_context(input_path: Path, output_path: Path) -> None:
+    """Repack an existing retrieval JSON with group dossier summaries.
+
+    读取检索文件并在 prompt_context 前追加知识组摘要块。
+    """
     payload = json.loads(input_path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or "results" not in payload:
         raise ValueError("Expected a retrieval JSON with top-level 'results'.")

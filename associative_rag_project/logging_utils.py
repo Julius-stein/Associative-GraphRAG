@@ -1,4 +1,7 @@
-"""Minimal logging helpers for long-running retrieval / generation jobs."""
+"""Minimal logging helpers for long-running retrieval / generation jobs.
+
+提供简单日志输出与文本截断工具，便于观测长时运行过程。
+"""
 
 from datetime import datetime
 

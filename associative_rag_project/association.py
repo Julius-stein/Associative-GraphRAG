@@ -35,107 +35,6 @@ from .retrieval import (
 )
 
 
-def _chunk_doc_ids(chunk_ids, chunk_store):
-    return {
-        chunk_store.get(chunk_id, {}).get("full_doc_id")
-        for chunk_id in chunk_ids
-        if chunk_store.get(chunk_id, {}).get("full_doc_id")
-    }
-
-
-def _chunk_preview_text(chunk_ids, chunk_store, limit=2):
-    parts = []
-    for chunk_id in list(chunk_ids)[:limit]:
-        content = normalize_text(chunk_store.get(chunk_id, {}).get("content", ""))
-        if content:
-            parts.append(content[:180])
-    return " ".join(parts)
-
-
-def _edge_preview_text(edge_id, graph):
-    edge_data = graph.get_edge_data(edge_id[0], edge_id[1]) or {}
-    return normalize_text(
-        " ".join(
-            [
-                edge_id[0],
-                edge_id[1],
-                edge_data.get("keywords", ""),
-                edge_data.get("description", ""),
-            ]
-        )
-    )
-
-
-def _node_preview_text(node_id, graph):
-    node_data = graph.nodes[node_id]
-    return normalize_text(
-        " ".join(
-            [
-                node_id,
-                node_data.get("entity_type", ""),
-                node_data.get("description", ""),
-            ]
-        )
-    )
-
-
-def _candidate_contract_features(query, query_contract, source_chunk_ids, preview_text, root_chunk_ids, root_chunk_score_lookup, chunk_store):
-    source_docs = _chunk_doc_ids(source_chunk_ids, chunk_store)
-    root_docs = _chunk_doc_ids(root_chunk_ids, chunk_store)
-    _, root_alignment = support_score(source_chunk_ids, root_chunk_score_lookup)
-    query_overlap = lexical_overlap_score(query, preview_text)
-    same_root_doc = 1 if source_docs and root_docs and source_docs & root_docs else 0
-    section_consistent = 1 if query_contract != "section-grounded" else int(bool(source_docs) and source_docs.issubset(root_docs))
-    if query_contract == "section-grounded":
-        allowed = bool(section_consistent)
-    elif query_contract == "mechanism-grounded":
-        allowed = bool(same_root_doc or root_alignment >= 0.08 or query_overlap >= 0.035)
-    elif query_contract == "comparison-grounded":
-        allowed = bool(same_root_doc or root_alignment >= 0.05 or query_overlap >= 0.025)
-    else:
-        allowed = bool(same_root_doc or root_alignment >= 0.03 or query_overlap >= 0.02)
-    return {
-        "allowed": allowed,
-        "source_docs": sorted(source_docs),
-        "root_docs": sorted(root_docs),
-        "query_overlap": round(query_overlap, 6),
-        "root_alignment": round(root_alignment, 6),
-        "same_root_doc": same_root_doc,
-        "section_consistent": section_consistent,
-    }
-
-
-def _contract_sort_key(query_contract, item, primary_fields):
-    if query_contract == "section-grounded":
-        return (
-            -item.get("section_consistent", 0),
-            -item.get("same_root_doc", 0),
-            -item.get("root_alignment", 0.0),
-            -item.get("query_overlap", 0.0),
-            *primary_fields,
-        )
-    if query_contract == "mechanism-grounded":
-        return (
-            *primary_fields,
-            -item.get("query_overlap", 0.0),
-            -item.get("same_root_doc", 0),
-            -item.get("root_alignment", 0.0),
-        )
-    if query_contract == "comparison-grounded":
-        return (
-            *primary_fields,
-            -item.get("same_root_doc", 0),
-            -item.get("query_overlap", 0.0),
-            -item.get("root_alignment", 0.0),
-        )
-    return (
-        *primary_fields,
-        -item.get("query_overlap", 0.0),
-        -item.get("same_root_doc", 0),
-        -item.get("root_alignment", 0.0),
-    )
-
-
 def build_root_components(root_nodes, root_edges):
     """Materialize connected components for the current root graph.
 
@@ -1441,13 +1340,9 @@ def _path_bridge_signature(path, node_to_component):
 
 
 def _graph_bridge_association(
-    query,
-    query_contract,
     graph,
     current_nodes,
     current_edges,
-    root_chunk_ids,
-    root_chunk_score_lookup,
     top_nodes,
     top_edges,
     node_to_chunks,
@@ -1512,23 +1407,6 @@ def _graph_bridge_association(
                 continue
             dedupe_paths.add(canonical)
             path_chunks = _path_chunk_ids(path, node_to_chunks, edge_to_chunks)
-            preview_text = " ".join(
-                [
-                    normalize_text(" ".join(path[:6])),
-                    _chunk_preview_text(path_chunks, chunk_store),
-                ]
-            )
-            contract_features = _candidate_contract_features(
-                query=query,
-                query_contract=query_contract,
-                source_chunk_ids=path_chunks,
-                preview_text=preview_text,
-                root_chunk_ids=root_chunk_ids,
-                root_chunk_score_lookup=root_chunk_score_lookup,
-                chunk_store=chunk_store,
-            )
-            if not contract_features["allowed"]:
-                continue
             new_source_count = _bounded_gain(len(path_chunks - covered_chunks))
             path_doc_gain = len(_chunk_doc_ids(path_chunks, chunk_store) - current_doc_ids)
             hub_penalty = _path_hub_penalty(path, graph)
@@ -1542,7 +1420,6 @@ def _graph_bridge_association(
                     "hub_penalty": round(hub_penalty, 6),
                     "specificity_gain": round(specificity_gain, 6),
                     "path_length": len(path) - 1,
-                    **contract_features,
                 }
             )
 
@@ -1685,7 +1562,6 @@ def _chunk_bridge_association(
                 "root_band_alignment": round(root_band_alignment, 6),
                 "node_ids": sorted(chunk_nodes),
                 "edge_ids": sorted(chunk_edges),
-                **contract_features,
             }
         )
 
@@ -1716,8 +1592,6 @@ def _chunk_bridge_association(
 
 
 def bridge_association(
-    query,
-    query_contract,
     graph,
     current_nodes,
     current_edges,
@@ -1738,13 +1612,9 @@ def bridge_association(
     graph_bridge_budget = max(1, path_budget // 2)
     chunk_bridge_budget = max(1, path_budget - graph_bridge_budget)
     graph_output = _graph_bridge_association(
-        query=query,
-        query_contract=query_contract,
         graph=graph,
         current_nodes=current_nodes,
         current_edges=current_edges,
-        root_chunk_ids=root_chunk_ids,
-        root_chunk_score_lookup=root_chunk_score_lookup,
         top_nodes=top_nodes,
         top_edges=top_edges,
         node_to_chunks=node_to_chunks,
@@ -1998,8 +1868,6 @@ def _promote_theme_frontier_roots(
 
 
 def _chunk_coverage_association(
-    query,
-    query_contract,
     graph,
     query,
     current_nodes,
@@ -2069,7 +1937,6 @@ def _chunk_coverage_association(
                 "query_alignment": round(query_alignment, 6),
                 "node_ids": sorted(chunk_nodes),
                 "edge_ids": sorted(chunk_edges),
-                **contract_features,
             }
         )
 
@@ -2111,8 +1978,6 @@ def _chunk_coverage_association(
 
 
 def coverage_association(
-    query,
-    query_contract,
     graph,
     query,
     current_nodes,
@@ -2186,17 +2051,6 @@ def coverage_association(
         if query_alignment < 0.05 and root_overlap <= 0 and chunk_alignment < 0.12:
             continue
         coverage_gain = new_source_count if new_source_count > 0 else new_relation
-        contract_features = _candidate_contract_features(
-            query=query,
-            query_contract=query_contract,
-            source_chunk_ids=source_chunks,
-            preview_text=_edge_preview_text(edge_id, graph),
-            root_chunk_ids=root_chunk_ids,
-            root_chunk_score_lookup=root_chunk_score_lookup,
-            chunk_store=chunk_store,
-        )
-        if not contract_features["allowed"]:
-            continue
         if coverage_gain < semantic_edge_min_score:
             continue
         if coverage_gain <= 0:
@@ -2215,7 +2069,6 @@ def coverage_association(
                 "keywords": edge_data.get("keywords", ""),
                 "description": edge_data.get("description", ""),
                 "source_chunk_ids": sorted(source_chunks),
-                **contract_features,
             }
         )
     if query_priority:
@@ -2272,17 +2125,6 @@ def coverage_association(
         if query_alignment < 0.05 and root_overlap <= 0 and chunk_alignment < 0.12:
             continue
         coverage_gain = new_source_count if new_source_count > 0 else new_relation_count
-        contract_features = _candidate_contract_features(
-            query=query,
-            query_contract=query_contract,
-            source_chunk_ids=source_chunks,
-            preview_text=_node_preview_text(node_id, graph),
-            root_chunk_ids=root_chunk_ids,
-            root_chunk_score_lookup=root_chunk_score_lookup,
-            chunk_store=chunk_store,
-        )
-        if not contract_features["allowed"]:
-            continue
         if coverage_gain < semantic_node_min_score:
             continue
         if coverage_gain <= 0 and bridge_strength <= 0:
@@ -2301,7 +2143,6 @@ def coverage_association(
                 "entity_type": node_data.get("entity_type", "UNKNOWN"),
                 "description": node_data.get("description", ""),
                 "source_chunk_ids": sorted(source_chunks),
-                **contract_features,
             }
         )
     if query_priority:
@@ -2330,8 +2171,6 @@ def coverage_association(
 
     semantic_chunk_budget = max(1, min(semantic_edge_budget, semantic_node_budget) // 2)
     chunk_output = _chunk_coverage_association(
-        query=query,
-        query_contract=query_contract,
         graph=graph,
         query=query,
         current_nodes=current_nodes,
@@ -2676,7 +2515,6 @@ def extract_candidate_points(
 
 def expand_associative_graph(
     query,
-    query_contract,
     graph,
     root_nodes,
     root_edges,

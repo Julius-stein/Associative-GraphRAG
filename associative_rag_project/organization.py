@@ -2928,7 +2928,6 @@ def _build_trace_groups(
 def build_answer_facet_groups(
     *,
     query,
-    query_contract=None,
     root_chunk_ids,
     graph,
     final_nodes,

@@ -491,7 +491,6 @@ def _run_expand_stage(
 ):
     expansion = expand_associative_graph(
         query=query_row["query"],
-        query_contract=query_contract,
         graph=graph,
         root_nodes=anchor_state["root_nodes"],
         root_edges=anchor_state["root_edges"],
@@ -553,7 +552,6 @@ def _run_organize_stage(
     )
     facet_groups, organization_layout = build_layout_groups(
         query=query_row["query"],
-        query_contract=query_contract,
         graph=graph,
         final_nodes=expansion["final_nodes"],
         final_edges=expansion["final_edges"],

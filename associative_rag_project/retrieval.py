@@ -951,14 +951,6 @@ def _provenance_overlap(nodes_a, edges_a, nodes_b, edges_b):
     return len(left & right) / max(len(left | right), 1)
 
 
-def _chunk_relation_categories(chunk_id, chunk_to_edges, graph):
-    categories = []
-    for edge_id in chunk_to_edges.get(chunk_id, set()):
-        edge_data = graph.get_edge_data(edge_id[0], edge_id[1]) or {}
-        categories.append(normalize_relation_category(edge_data))
-    return categories
-
-
 def _candidate_query_terms(candidate):
     terms = candidate.get("keyword_hit_terms") or []
     if not terms:
@@ -1080,11 +1072,6 @@ def _select_anchor_root_chunks(candidates, chunk_store, top_k, same_doc_window, 
             max_overlap = max(overlaps) if overlaps else 0.0
             if max_overlap > 0.72:
                 continue
-            entropy_gain = 0.0
-            if candidate["relation_categories"]:
-                before = relation_entropy(selected_relation_categories)
-                after = relation_entropy(selected_relation_categories + candidate["relation_categories"])
-                entropy_gain = round(max(after - before, 0.0), 6)
             selected.append(
                 {
                     **candidate,

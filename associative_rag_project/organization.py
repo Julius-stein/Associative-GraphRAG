@@ -16,7 +16,7 @@ import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 
-from .common import STOPWORDS, edge_key, lexical_overlap_score, normalize_text, tokenize
+from .common import STOPWORDS, approx_word_count, edge_key, lexical_overlap_score, normalize_text, tokenize
 from .retrieval import normalize_relation_category
 
 
@@ -2185,6 +2185,427 @@ def _local_detail_nodes(query, supporting_chunk_ids, skeleton_nodes, chunk_to_no
     return ranked[:limit]
 
 
+def _chunk_role(trace, chunk_id):
+    if chunk_id == trace.get("root_chunk_id"):
+        return "root"
+    for role_name in ("bridge", "support", "context"):
+        if chunk_id in trace.get(f"{role_name}_chunk_ids", []):
+            return role_name
+    return "context"
+
+
+def _atom_terms(values, limit=None):
+    terms = []
+    for value in values:
+        for token in tokenize(_clean_label_text(value)):
+            if token in _GROUP_LABEL_STOPWORDS or not _is_label_term(token):
+                continue
+            if token not in terms:
+                terms.append(token)
+            if limit is not None and len(terms) >= limit:
+                return terms
+    return terms
+
+
+def _edge_relation_terms(edge_ids, graph, limit=12):
+    values = []
+    for edge_id in edge_ids:
+        edge_data = graph.get_edge_data(edge_id[0], edge_id[1]) if graph is not None else {}
+        edge_data = edge_data or {}
+        values.extend(
+            [
+                normalize_relation_category(edge_data),
+                normalize_text(edge_data.get("keywords", "")),
+                normalize_text(edge_data.get("description", "")),
+            ]
+        )
+    return _atom_terms(values, limit=limit)
+
+
+def _dossier_atom_spec(query, focus_entities, relation_themes, chosen_edges, local_detail_nodes, graph):
+    """Define what a dossier should add beyond the edge skeleton.
+
+    The atoms are intentionally lexical and inspectable: a chunk is useful when it
+    covers still-uncovered query words, focus entities, relation cues, or local
+    detail nodes that the edge list alone cannot explain.
+    """
+    spec = {}
+    for term in _clean_query_keywords(query, limit=14):
+        spec[f"query:{term}"] = {"kind": "query", "term": term}
+    for term in _atom_terms(focus_entities, limit=14):
+        spec[f"focus:{term}"] = {"kind": "focus", "term": term}
+    relation_terms = _atom_terms(relation_themes, limit=10)
+    relation_terms.extend(term for term in _edge_relation_terms(chosen_edges, graph, limit=12) if term not in relation_terms)
+    for term in relation_terms[:16]:
+        spec[f"relation:{term}"] = {"kind": "relation", "term": term}
+    for term in _atom_terms(local_detail_nodes, limit=10):
+        spec[f"detail:{term}"] = {"kind": "detail", "term": term}
+    return spec
+
+
+_DOSSIER_GENERIC_TERMS = set(_GROUP_LABEL_STOPWORDS) | {
+    "art",
+    "arts",
+    "artist",
+    "artists",
+    "artistic",
+    "artwork",
+    "artworks",
+    "climate",
+    "described",
+    "different",
+    "emergence",
+    "form",
+    "forms",
+    "influence",
+    "influenced",
+    "new",
+    "political",
+    "section",
+    "sections",
+    "various",
+    "ways",
+}
+
+_DOSSIER_CONTEXT_CUES = {
+    "activism",
+    "activist",
+    "class",
+    "colonial",
+    "communism",
+    "communist",
+    "community",
+    "conflict",
+    "cultural",
+    "culture",
+    "economic",
+    "fascism",
+    "fascist",
+    "feminism",
+    "gender",
+    "government",
+    "ideological",
+    "ideology",
+    "industrial",
+    "institution",
+    "left",
+    "market",
+    "movement",
+    "national",
+    "policy",
+    "power",
+    "public",
+    "race",
+    "radical",
+    "repression",
+    "revolution",
+    "social",
+    "society",
+    "state",
+    "war",
+}
+
+_DOSSIER_FORM_CUES = {
+    "abstraction",
+    "anti art",
+    "avant",
+    "conceptual",
+    "dada",
+    "documentary",
+    "experimental",
+    "experimentation",
+    "expressionism",
+    "film",
+    "formal",
+    "medium",
+    "modernism",
+    "modernist",
+    "movement",
+    "performance",
+    "photography",
+    "pop art",
+    "postmodernism",
+    "representation",
+    "style",
+    "surrealism",
+    "technique",
+    "theater",
+    "theatre",
+    "visual",
+}
+
+_DOSSIER_MECHANISM_CUES = {
+    "adaptation",
+    "challenge",
+    "challenged",
+    "critique",
+    "emerged",
+    "enabled",
+    "forced",
+    "generated",
+    "inspired",
+    "opposed",
+    "opposition",
+    "reaction",
+    "rejected",
+    "resistance",
+    "response",
+    "shift",
+    "transformed",
+}
+
+
+def _specific_dossier_terms(atoms, atom_spec):
+    terms = []
+    for atom in sorted(atoms):
+        item = atom_spec.get(atom)
+        if not item:
+            continue
+        term = item["term"]
+        if term in _DOSSIER_GENERIC_TERMS:
+            continue
+        if term not in terms:
+            terms.append(term)
+    return terms
+
+
+def _term_in_text(term, text, text_tokens):
+    term_tokens = tokenize(term)
+    if not term_tokens:
+        return False
+    if len(term_tokens) == 1:
+        return term_tokens[0] in text_tokens
+    return " ".join(term_tokens) in text
+
+
+def _cue_hits(text, text_tokens, cues, limit=6):
+    return [term for term in sorted(cues) if _term_in_text(term, text, text_tokens)][:limit]
+
+
+def _chunk_answerability_profile(query, chunk_id, atoms, atom_spec, chunk_store):
+    text = normalize_text(chunk_store.get(chunk_id, {}).get("content", "")).lower()
+    text_tokens = set(tokenize(text))
+    query_terms = [
+        term
+        for term in _clean_query_keywords(query, limit=16)
+        if term not in _DOSSIER_GENERIC_TERMS
+    ]
+    query_hits = [term for term in query_terms if _term_in_text(term, text, text_tokens)]
+    specific_terms = _specific_dossier_terms(atoms, atom_spec)
+    context_hits = _cue_hits(text, text_tokens, _DOSSIER_CONTEXT_CUES)
+    form_hits = _cue_hits(text, text_tokens, _DOSSIER_FORM_CUES)
+    mechanism_hits = _cue_hits(text, text_tokens, _DOSSIER_MECHANISM_CUES)
+    signal_count = sum(
+        1
+        for value in (
+            query_hits,
+            specific_terms[:2],
+            context_hits,
+            form_hits,
+            mechanism_hits,
+        )
+        if value
+    )
+    answerable = (
+        (query_hits and specific_terms)
+        or (len(specific_terms) >= 2 and signal_count >= 3)
+        or (len(specific_terms) >= 4 and signal_count >= 2)
+    )
+    return {
+        "query_hits": query_hits[:6],
+        "specific_terms": specific_terms[:10],
+        "context_hits": context_hits,
+        "form_hits": form_hits,
+        "mechanism_hits": mechanism_hits,
+        "signal_count": signal_count,
+        "specific_count": len(specific_terms),
+        "answerable": bool(answerable),
+        "query_rel": lexical_overlap_score(query, text),
+    }
+
+
+def _chunk_dossier_atoms(chunk_id, atom_spec, chunk_to_nodes, chunk_to_edges, graph, chunk_store):
+    chunk = chunk_store.get(chunk_id, {})
+    node_text = " ".join(chunk_to_nodes.get(chunk_id, set()))
+    edge_texts = []
+    for edge_id in chunk_to_edges.get(chunk_id, set()):
+        edge_texts.append(_edge_text(edge_id, graph))
+    haystack = normalize_text(" ".join([chunk.get("content", ""), node_text] + edge_texts)).lower()
+    haystack_tokens = set(tokenize(haystack))
+    atoms = set()
+    for atom, item in atom_spec.items():
+        if _term_in_text(item["term"], haystack, haystack_tokens):
+            atoms.add(atom)
+    return atoms
+
+
+def _dossier_reason_lines(role, covered_atoms, atom_spec, answer_profile=None, rescue=False):
+    grouped = defaultdict(list)
+    for atom in sorted(covered_atoms):
+        item = atom_spec.get(atom)
+        if not item:
+            continue
+        grouped[item["kind"]].append(item["term"])
+    reasons = [f"trace role: {role}"]
+    labels = {
+        "query": "adds query terms",
+        "focus": "mentions focus terms",
+        "relation": "adds relation cues",
+        "detail": "adds local detail",
+    }
+    for kind in ("query", "focus", "relation", "detail"):
+        terms = grouped.get(kind, [])
+        if terms:
+            reasons.append(f"{labels[kind]}: {', '.join(terms[:6])}")
+    answer_profile = answer_profile or {}
+    if answer_profile.get("context_hits"):
+        reasons.append(f"context cues: {', '.join(answer_profile['context_hits'][:5])}")
+    if answer_profile.get("form_hits"):
+        reasons.append(f"form/example cues: {', '.join(answer_profile['form_hits'][:5])}")
+    if answer_profile.get("mechanism_hits"):
+        reasons.append(f"mechanism cues: {', '.join(answer_profile['mechanism_hits'][:5])}")
+    if rescue:
+        reasons.append("selected for chunk-level answerability beyond the edge spine")
+    return reasons
+
+
+def _build_evidence_dossier(
+    *,
+    query,
+    trace,
+    units,
+    focus_entities,
+    relation_themes,
+    chosen_edges,
+    local_detail_nodes,
+    chunk_to_nodes,
+    chunk_to_edges,
+    graph,
+    chunk_store,
+    limit=6,
+):
+    """Select branch chunks that add answerable text beyond the relational spine."""
+    atom_spec = _dossier_atom_spec(query, focus_entities, relation_themes, chosen_edges, local_detail_nodes, graph)
+    if not atom_spec:
+        return []
+
+    trace_order = {chunk_id: index for index, chunk_id in enumerate(trace.get("selected_chunk_ids", []))}
+    candidate_chunk_ids = []
+    root_chunk_id = trace.get("root_chunk_id")
+    if root_chunk_id:
+        candidate_chunk_ids.append(root_chunk_id)
+    for unit in units:
+        candidate_chunk_ids.extend(unit.get("source_chunk_ids", []))
+    for role_name in ("bridge", "support", "context"):
+        candidate_chunk_ids.extend(trace.get(f"{role_name}_chunk_ids", []))
+    candidate_chunk_ids.extend(trace.get("selected_chunk_ids", []))
+    candidate_chunk_ids = [
+        chunk_id
+        for chunk_id in dict.fromkeys(candidate_chunk_ids)
+        if chunk_id in chunk_store
+    ]
+
+    candidate_profiles = []
+    for chunk_id in candidate_chunk_ids:
+        atoms = _chunk_dossier_atoms(chunk_id, atom_spec, chunk_to_nodes, chunk_to_edges, graph, chunk_store)
+        if not atoms:
+            continue
+        answer_profile = _chunk_answerability_profile(query, chunk_id, atoms, atom_spec, chunk_store)
+        if not answer_profile["answerable"]:
+            continue
+        candidate_profiles.append(
+            {
+                "chunk_id": chunk_id,
+                "role": _chunk_role(trace, chunk_id),
+                "atoms": atoms,
+                "answer_profile": answer_profile,
+                "trace_order": trace_order.get(chunk_id, 10**9),
+                "word_count": approx_word_count(chunk_store.get(chunk_id, {}).get("content", "")),
+            }
+        )
+
+    selected = []
+    covered_atoms = set()
+    role_order = {"root": 0, "bridge": 1, "support": 2, "context": 3}
+    while len(selected) < limit:
+        best = None
+        best_key = None
+        for profile in candidate_profiles:
+            if profile["chunk_id"] in {item["chunk_id"] for item in selected}:
+                continue
+            new_atoms = profile["atoms"] - covered_atoms
+            if not new_atoms:
+                continue
+            key = (
+                profile["answer_profile"]["signal_count"],
+                len(new_atoms),
+                profile["answer_profile"]["specific_count"],
+                profile["answer_profile"]["query_rel"],
+                -role_order.get(profile["role"], 9),
+                -profile["word_count"],
+                -profile["trace_order"],
+                profile["chunk_id"],
+            )
+            if best_key is None or key > best_key:
+                best_key = key
+                best = profile
+        if best is None:
+            break
+        new_atoms = best["atoms"] - covered_atoms
+        covered_atoms.update(new_atoms)
+        selected.append(
+            {
+                "chunk_id": best["chunk_id"],
+                "role": best["role"],
+                "covered_atoms": sorted(new_atoms),
+                "coverage_reasons": _dossier_reason_lines(
+                    best["role"],
+                    new_atoms,
+                    atom_spec,
+                    answer_profile=best["answer_profile"],
+                ),
+                "answerability": best["answer_profile"],
+                "word_count": best["word_count"],
+            }
+        )
+    if len(selected) < limit:
+        selected_ids = {item["chunk_id"] for item in selected}
+        remaining = [profile for profile in candidate_profiles if profile["chunk_id"] not in selected_ids]
+        remaining.sort(
+            key=lambda profile: (
+                profile["answer_profile"]["signal_count"],
+                profile["answer_profile"]["specific_count"],
+                profile["answer_profile"]["query_rel"],
+                -role_order.get(profile["role"], 9),
+                -profile["trace_order"],
+                profile["chunk_id"],
+            ),
+            reverse=True,
+        )
+        for profile in remaining:
+            if len(selected) >= limit:
+                break
+            atoms = profile["atoms"] - covered_atoms
+            selected.append(
+                {
+                    "chunk_id": profile["chunk_id"],
+                    "role": profile["role"],
+                    "covered_atoms": sorted(atoms),
+                    "coverage_reasons": _dossier_reason_lines(
+                        profile["role"],
+                        atoms,
+                        atom_spec,
+                        answer_profile=profile["answer_profile"],
+                        rescue=True,
+                    ),
+                    "answerability": profile["answer_profile"],
+                    "word_count": profile["word_count"],
+                }
+            )
+            covered_atoms.update(atoms)
+    return selected
+
+
 def _trace_group_label(
     group_index,
     label_terms,
@@ -2304,6 +2725,46 @@ def _build_edge_skeleton_group(
         supporting_chunk_ids,
         chunk_store,
     )
+    evidence_dossier = _build_evidence_dossier(
+        query=query,
+        trace=trace,
+        units=units,
+        focus_entities=focus_entities,
+        relation_themes=relation_themes,
+        chosen_edges=chosen_edges,
+        local_detail_nodes=local_detail_nodes,
+        chunk_to_nodes=chunk_to_nodes,
+        chunk_to_edges=chunk_to_edges,
+        graph=graph,
+        chunk_store=chunk_store,
+    )
+    dossier_answerability = sum(
+        item.get("answerability", {}).get("signal_count", 0)
+        for item in evidence_dossier
+    )
+    dossier_specificity = sum(
+        item.get("answerability", {}).get("specific_count", 0)
+        for item in evidence_dossier
+    )
+    dossier_query_rel = max(
+        [item.get("answerability", {}).get("query_rel", 0.0) for item in evidence_dossier] or [0.0]
+    )
+    edge_query_rel = lexical_overlap_score(query, descriptor_text)
+    dossier_chunk_ids = [item["chunk_id"] for item in evidence_dossier]
+    supporting_chunk_ids = sorted(
+        dict.fromkeys(supporting_chunk_ids + dossier_chunk_ids),
+        key=lambda chunk_id: (
+            0 if chunk_id in dossier_chunk_ids else 1,
+            trace.get("selected_chunk_ids", []).index(chunk_id)
+            if chunk_id in trace.get("selected_chunk_ids", [])
+            else 10**9,
+            chunk_id,
+        ),
+    )
+    bridge_chunk_ids = [chunk_id for chunk_id in trace.get("bridge_chunk_ids", []) if chunk_id in supporting_chunk_ids]
+    support_chunk_ids = [chunk_id for chunk_id in trace.get("support_chunk_ids", []) if chunk_id in supporting_chunk_ids]
+    context_chunk_ids = [chunk_id for chunk_id in trace.get("context_chunk_ids", []) if chunk_id in supporting_chunk_ids]
+    doc_ids = _doc_ids(supporting_chunk_ids, chunk_store)
     answer_edge_count = sum(1 for unit in units if unit["unit_kind"] == "answer")
     connector_edge_count = sum(1 for unit in units if unit["unit_kind"] == "connector")
     growth_traces = [
@@ -2319,8 +2780,12 @@ def _build_edge_skeleton_group(
         "facet_label": label,
         "primary_theme": relation_themes[0] if relation_themes else (focus_entities[0] if focus_entities else label),
         "facet_prompt": _facet_prompt(query, label),
-        "group_score": round(lexical_overlap_score(query, descriptor_text), 6),
-        "query_rel": round(lexical_overlap_score(query, descriptor_text), 6),
+        "group_score": round(max(edge_query_rel, dossier_query_rel), 6),
+        "query_rel": round(max(edge_query_rel, dossier_query_rel), 6),
+        "edge_query_rel": round(edge_query_rel, 6),
+        "dossier_query_rel": round(dossier_query_rel, 6),
+        "dossier_answerability": dossier_answerability,
+        "dossier_specificity": dossier_specificity,
         "anchor_support": len(anchor_chunk_ids),
         "root_anchor_count": 1,
         "node_count": len(chosen_nodes),
@@ -2363,6 +2828,7 @@ def _build_edge_skeleton_group(
             }
             for chunk_id in supporting_chunk_ids[:3]
         ],
+        "evidence_dossier": evidence_dossier,
         "growth_traces": growth_traces,
         "group_summary": group_summary,
         "nodes": sorted(chosen_nodes),
@@ -2441,7 +2907,10 @@ def _build_trace_groups(
                 continue
             rank_key = (
                 -max_overlap,
-                candidate["query_rel"],
+                candidate.get("dossier_query_rel", 0.0),
+                candidate.get("dossier_answerability", 0),
+                candidate.get("dossier_specificity", 0),
+                candidate.get("edge_query_rel", 0.0),
                 candidate["node_count"],
                 candidate["edge_count"],
                 -len(candidate["supporting_chunk_ids"]),

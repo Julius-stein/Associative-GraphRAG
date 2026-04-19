@@ -148,7 +148,7 @@ Priorities, in order:
 Use this compact structure:
 P1. Titles: 4-7 aspect titles.
 P2. Answer Outline: one direct synthesis paragraph.
-P3. Evidence-backed Answer: one short section per aspect, with concrete examples and source ids when useful.
+P3. Evidence-backed Answer: one substantial section per aspect, with concrete examples, mechanisms, and source ids when useful.
 P4. Source Coverage: briefly name the main evidence clusters used.
 P5. Refinement: note uncertainty, gaps, or practical implications.
 
@@ -198,7 +198,7 @@ class OpenAICompatibleClient:
         )
         return any(token in name or token in text for token in retryable_tokens)
 
-    def generate(self, prompt, system_prompt=GENERATION_SYSTEM_PROMPT, temperature=0.1, max_tokens=1500):
+    def generate(self, prompt, system_prompt=GENERATION_SYSTEM_PROMPT, temperature=0.1, max_tokens=2200):
         """Run one completion request with transient-error retries.
 
         参数:

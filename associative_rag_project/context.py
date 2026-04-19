@@ -7,7 +7,7 @@ from collections import Counter, defaultdict
 
 import networkx as nx
 
-from .common import approx_word_count, build_csv, lexical_overlap_score, normalize_text
+from .common import approx_word_count, lexical_overlap_score, normalize_text
 from .retrieval import normalize_relation_category
 
 
@@ -81,6 +81,46 @@ def _truncate_to_words(text, max_words):
     if len(words) <= max_words:
         return text
     return " ".join(words[:max_words])
+
+
+def _group_source_priority(group):
+    """Lexicographic quality key for deciding which groups receive text budget."""
+    return (
+        group.get("dossier_query_rel", group.get("query_rel", 0.0)),
+        group.get("dossier_answerability", 0),
+        group.get("dossier_specificity", 0),
+        group.get("edge_query_rel", 0.0),
+        group.get("edge_count", 0),
+        -len(group.get("supporting_chunk_ids", [])),
+        group.get("group_id", ""),
+    )
+
+
+def _ordered_groups_for_source_budget(facet_groups):
+    return sorted(facet_groups, key=_group_source_priority, reverse=True)
+
+
+def _dossier_source_quota(group_rank):
+    if group_rank <= 4:
+        return 4
+    if group_rank <= 6:
+        return 1
+    return 0
+
+
+def _dossier_item_priority(item):
+    profile = item.get("answerability", {})
+    return (
+        profile.get("query_rel", 0.0),
+        profile.get("signal_count", 0),
+        profile.get("specific_count", 0),
+        item.get("word_count", 0),
+        item.get("chunk_id", ""),
+    )
+
+
+def _ordered_dossier_items(group):
+    return sorted(group.get("evidence_dossier", []), key=_dossier_item_priority, reverse=True)
 
 
 _THEME_SUMMARY_BUCKETS = {
@@ -202,10 +242,11 @@ def choose_diverse_source_chunks(
     chunk_to_group_ids = chunk_to_group_ids or {}
     group_label_lookup = group_label_lookup or {}
 
-    for group in facet_groups:
+    for group in _ordered_groups_for_source_budget(facet_groups):
+        dossier_chunk_ids = [item.get("chunk_id") for item in _ordered_dossier_items(group) if item.get("chunk_id")]
         roots, supports = _ranked_group_chunks(group["supporting_chunk_ids"], rank_index, root_chunk_id_set)
         ordered = []
-        for chunk_id in roots[:2] + supports[:6]:
+        for chunk_id in dossier_chunk_ids + roots[:2] + supports[:6]:
             if chunk_id not in ordered:
                 ordered.append(chunk_id)
         group_candidates.append(ordered)
@@ -253,27 +294,30 @@ def choose_diverse_source_chunks(
                 continue
             query_overlap = lexical_overlap_score(query_text, text)
             roles = set(chunk_role_lookup.get(chunk_id, {}).get("roles", []))
-            role_bonus = 0.0
-            if "support-chunk" in roles:
-                role_bonus += 0.2
-            if "bridge-chunk" in roles:
-                role_bonus += 0.12
+            role_rank = 0
             if "query-root" in roles:
-                role_bonus += 0.05
+                role_rank = max(role_rank, 1)
+            if "bridge-chunk" in roles:
+                role_rank = max(role_rank, 2)
+            if "support-chunk" in roles:
+                role_rank = max(role_rank, 3)
             for bucket, bucket_score in bucket_scores.items():
                 if bucket_score <= 0:
                     continue
                 final_score = (
-                    query_bucket_weights.get(bucket, 1.0) * bucket_score
-                    + 0.45 * query_overlap
-                    + role_bonus
+                    query_bucket_weights.get(bucket, 1.0) > 1.0,
+                    bucket_score,
+                    query_overlap,
+                    role_rank,
+                    -rank_index.get(chunk_id, 10**9),
                 )
                 current = bucket_best.get(bucket)
                 if current is None or final_score > current["score"]:
                     bucket_best[bucket] = {"chunk_id": chunk_id, "score": final_score}
         for bucket in sorted(
             bucket_best.keys(),
-            key=lambda name: -bucket_best[name]["score"],
+            key=lambda name: bucket_best[name]["score"],
+            reverse=True,
         ):
             try_add(bucket_best[bucket]["chunk_id"])
             if len(selected_ids) >= max_source_chunks:
@@ -620,15 +664,24 @@ def build_prompt_context(
     root_chunk_ids = [item["chunk_id"] for item in root_chunk_hits]
     chunk_role_lookup = {item["chunk_id"]: item for item in (chunk_roles or [])}
     preferred_chunk_ids = []
-    per_chunk_word_cap = 220
+    per_chunk_word_cap = 520
     source_chunk_limit = max(max_source_chunks, 12)
+    chunk_to_group_ids = {}
+    ranked_source_groups = _ordered_groups_for_source_budget(facet_groups)
+    for group_rank, group in enumerate(ranked_source_groups, start=1):
+        for dossier_item in _ordered_dossier_items(group)[: _dossier_source_quota(group_rank)]:
+            chunk_id = dossier_item.get("chunk_id")
+            if chunk_id:
+                preferred_chunk_ids.append(chunk_id)
+        for chunk_id in group["supporting_chunk_ids"]:
+            chunk_to_group_ids.setdefault(chunk_id, []).append(group["group_id"])
+        for dossier_item in group.get("evidence_dossier", []):
+            chunk_id = dossier_item.get("chunk_id")
+            if chunk_id:
+                chunk_to_group_ids.setdefault(chunk_id, []).append(group["group_id"])
     if theme_selected_chunks:
         for bucket in ("core", "bridge", "support", "context"):
             preferred_chunk_ids.extend(theme_selected_chunks.get(bucket, []))
-    chunk_to_group_ids = {}
-    for group in facet_groups:
-        for chunk_id in group["supporting_chunk_ids"]:
-            chunk_to_group_ids.setdefault(chunk_id, []).append(group["group_id"])
     group_label_lookup = {
         group["group_id"]: normalize_text(group.get("facet_label", ""))
         for group in facet_groups
@@ -686,21 +739,21 @@ def build_prompt_context(
                 edge_id,
             ),
         )[:5]
-        linked_source_rows = [["source_id", "role", "word_count", "content_preview"]]
         linked_chunk_ids = sorted(
             (chunk_id for chunk_id in group["supporting_chunk_ids"] if chunk_id in source_id_map),
             key=lambda chunk_id: source_id_map[chunk_id],
-        )[:3]
-        for chunk_id in linked_chunk_ids:
-            chunk_data = chunk_store.get(chunk_id, {})
-            linked_source_rows.append(
-                [
-                    source_id_map[chunk_id],
-                    " | ".join(chunk_role_lookup.get(chunk_id, {}).get("roles", []))
-                    or ("root" if chunk_id in root_chunk_id_set else "support"),
-                    approx_word_count(chunk_data.get("content", "")),
-                    " ".join(chunk_data.get("content", "").split())[:220],
-                ]
+        )[:8]
+        dossier_rows = []
+        for item in group.get("evidence_dossier", []):
+            chunk_id = item.get("chunk_id")
+            if not chunk_id:
+                continue
+            source_id = source_id_map.get(chunk_id)
+            if not source_id:
+                continue
+            reasons = "; ".join(item.get("coverage_reasons", [])[:4])
+            dossier_rows.append(
+                f"- {source_id} [{item.get('role', 'support')}; {item.get('word_count', 0)} words]: {reasons or 'adds branch evidence'}"
             )
         group_label = group.get("facet_label", group.get("primary_theme", "facet"))
         group_index_lines.append(
@@ -713,9 +766,9 @@ def build_prompt_context(
             f"Key relations: {' | '.join(group['relation_themes']) or 'n/a'}",
             f"Linked source ids: {' | '.join(source_id_map[chunk_id] for chunk_id in linked_chunk_ids) or 'n/a'}",
         ]
-        group_section.append("Edge skeleton:")
+        group_section.append("Relational spine:")
         if group.get("edge_skeleton"):
-            for unit in group["edge_skeleton"][:8]:
+            for unit in group["edge_skeleton"][:12]:
                 source_ids = [
                     source_id_map.get(chunk_id, chunk_id)
                     for chunk_id in unit.get("source_chunk_ids", [])[:3]
@@ -728,30 +781,37 @@ def build_prompt_context(
                 )
         else:
             group_section.append("- n/a")
+        group_section.append("Evidence dossier:")
+        if dossier_rows:
+            group_section.extend(dossier_rows[:6])
+        else:
+            group_section.append("- n/a")
         group_sections.append("\n".join(group_section))
 
-    source_rows = [["id", "role", "linked_groups", "word_count", "content"]]
+    source_sections = []
     for index, (chunk_id, chunk_data, word_count) in enumerate(selected_source_chunks):
-        source_rows.append(
-            [
-                source_id_map[chunk_id],
-                " | ".join(chunk_role_lookup.get(chunk_id, {}).get("roles", []))
-                or ("root" if chunk_id in root_chunk_id_set else "support"),
-                " | ".join(chunk_to_group_ids.get(chunk_id, [])[:4]),
-                word_count,
-                _truncate_to_words(chunk_data.get("content", "").replace("\n", " "), per_chunk_word_cap),
-            ]
+        role_text = " | ".join(chunk_role_lookup.get(chunk_id, {}).get("roles", [])) or (
+            "root" if chunk_id in root_chunk_id_set else "support"
         )
+        linked_groups = " | ".join(chunk_to_group_ids.get(chunk_id, [])[:4]) or "n/a"
+        content = chunk_data.get("content", "").strip()
+        source_sections.append(
+            "\n".join(
+                [
+                    f"[{source_id_map[chunk_id]}] role={role_text}; linked_groups={linked_groups}; words={word_count}",
+                    content,
+                ]
+            )
+        )
+    source_bank_text = "\n\n".join(source_sections)
 
     context = f"""
 -----Group Index-----
 {chr(10).join(group_index_lines) if group_index_lines else '- n/a'}
 -----Knowledge Group Dossiers-----
 {chr(10).join(group_sections)}
------Sources-----
-```csv
-{build_csv(source_rows)}
-```
+-----Source Excerpts-----
+{source_bank_text}
 """.strip()
 
     return {

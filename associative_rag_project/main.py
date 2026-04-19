@@ -66,7 +66,7 @@ def build_parser():
     common.add_argument("--association-rounds", type=int, default=2)
     common.add_argument("--group-limit", type=int, default=8)
     common.add_argument("--max-source-chunks", type=int, default=18)
-    common.add_argument("--max-source-word-budget", type=int, default=5600)
+    common.add_argument("--max-source-word-budget", type=int, default=10000)
     common.add_argument("--max-workers", type=int, default=12)
 
     subparsers.add_parser("retrieve", parents=[common])

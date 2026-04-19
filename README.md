@@ -128,6 +128,7 @@ Judge against all baselines in one directory and write a combined Markdown summa
 python -m associative_rag_project.main judge \
   --questions-file Datasets/agriculture/query/agriculture.json \
   --candidate-file associative_rag_project/runs_v3_ppr/agriculture_top5_hop4_assoc_project_answers.json \
+  --corpus-dir Datasets/agriculture/index/ \
   --baseline-dir Datasets/agriculture/output \
   --candidate-label assoc-project \
   --summary-file associative_rag_project/result/agriculture_baseline_winrate_tables.md \

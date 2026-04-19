@@ -36,6 +36,13 @@ You will evaluate two answers to the same question based on:
 
 - **Empowerment**: How well does the answer help the reader understand and make informed judgments about the topic?
 
+You are also given corpus-grounding labels for the factual claims extracted from each answer.
+Use these labels when judging all four criteria:
+- Supported and partially supported claims can contribute to comprehensiveness, diversity, empowerment, and the overall winner.
+- Claims labeled insufficient_evidence, contradicted, or verification_error should not improve an answer's score.
+- If an answer is more polished but its substantive claims are less supported by the corpus, do not reward style over grounded content.
+- The claim labels are evidence-discipline signals, not a replacement for reading the answers.
+
 For each criterion, choose the better answer (either Answer 1 or Answer 2) and explain why.
 Then select an Overall Winner for the QFS task. The better QFS answer should be more comprehensive, more diverse in coverage, and more empowering/useful to the reader while staying faithful to the question.
 
@@ -49,6 +56,12 @@ Here are the two answers:
 
 **Answer 2:**
 {second_answer}
+
+Corpus-grounding labels for Answer 1:
+{first_claim_support}
+
+Corpus-grounding labels for Answer 2:
+{second_claim_support}
 
 Evaluate both answers using the criteria listed above and provide detailed explanations for each criterion.
 
@@ -218,13 +231,47 @@ def _extract_json(text):
         raise
 
 
-def build_judge_prompt(query, answer_a, answer_b):
+def _claim_support_report(groundedness):
+    """Compact claim-label report for QFS judging, without evidence snippets."""
+    if not groundedness:
+        return json.dumps(
+            {
+                "claim_count": 0,
+                "supported_equivalent_claim_count": 0.0,
+                "supported_claim_ratio": 0.0,
+                "label_counts": {},
+                "claims": [],
+            },
+            ensure_ascii=False,
+        )
+    claims = []
+    for item in groundedness.get("claims", []):
+        claims.append(
+            {
+                "claim_index": item.get("claim_index"),
+                "label": item.get("label"),
+                "claim": item.get("claim"),
+            }
+        )
+    report = {
+        "claim_count": groundedness.get("claim_count", len(claims)),
+        "supported_equivalent_claim_count": groundedness.get("supported_equivalent_claim_count", 0.0),
+        "supported_claim_ratio": groundedness.get("supported_claim_ratio", 0.0),
+        "label_counts": groundedness.get("label_counts", {}),
+        "claims": claims,
+    }
+    return json.dumps(report, ensure_ascii=False, indent=2)
+
+
+def build_judge_prompt(query, answer_a, answer_b, claim_support_a=None, claim_support_b=None):
     """Build the exact FG-RAG evaluation prompt template.
 
     参数:
         query: 评判的问题文本。
         answer_a: 第一个候选答案文本。
         answer_b: 第二个候选答案文本。
+        claim_support_a: 第一个答案的 claim 支持标签摘要。
+        claim_support_b: 第二个答案的 claim 支持标签摘要。
 
     返回:
         用于 LLM 判分的完整提示字符串。
@@ -235,6 +282,8 @@ def build_judge_prompt(query, answer_a, answer_b):
         input_query=query,
         first_answer=answer_a,
         second_answer=answer_b,
+        first_claim_support=claim_support_a or "No claim-grounding labels available.",
+        second_claim_support=claim_support_b or "No claim-grounding labels available.",
     )
 
 
@@ -333,6 +382,8 @@ CLAIM_SCORE_BY_LABEL = {
     "contradicted": 0.0,
     "verification_error": 0.0,
 }
+
+DEFAULT_CLAIM_RETRIEVAL_TOP_K = 5
 
 
 def _map_letter_winner(winner):
@@ -572,7 +623,14 @@ def _dense_claim_hits(query, claim_texts, corpus_resources, top_k):
     return [dense_index.search(vector, top_k=top_k) for vector in vectors]
 
 
-def _claim_evidence_packets(query, claims, corpus_resources, top_k=3, snippet_words=220, answer_id=None):
+def _claim_evidence_packets(
+    query,
+    claims,
+    corpus_resources,
+    top_k=DEFAULT_CLAIM_RETRIEVAL_TOP_K,
+    snippet_words=220,
+    answer_id=None,
+):
     if not claims or not corpus_resources:
         return []
     chunk_store = corpus_resources["chunk_store"]
@@ -613,7 +671,13 @@ def _claim_evidence_packets(query, claims, corpus_resources, top_k=3, snippet_wo
     return packets
 
 
-def _pair_claim_evidence_packets(query, pair_claims, corpus_resources, top_k=3, snippet_words=220):
+def _pair_claim_evidence_packets(
+    query,
+    pair_claims,
+    corpus_resources,
+    top_k=DEFAULT_CLAIM_RETRIEVAL_TOP_K,
+    snippet_words=220,
+):
     all_claims = []
     packet_keys = []
     for answer_id in ("candidate", "baseline"):
@@ -701,7 +765,7 @@ def _parse_support_assessments(payload, claim_packets):
     return assessments
 
 
-def _assess_claim_support(query, claim_packets, llm_client, batch_size=32):
+def _assess_claim_support(query, claim_packets, llm_client, batch_size=16):
     if not claim_packets:
         return []
     assessments = []
@@ -815,7 +879,7 @@ def assess_answer_groundedness(
         query=query,
         claims=claims,
         corpus_resources=corpus_resources,
-        top_k=3,
+        top_k=DEFAULT_CLAIM_RETRIEVAL_TOP_K,
     )
     assessments = _assess_claim_support(query, claim_packets, llm_client)
     return _summarize_groundedness_assessments(assessments, extracted_claim_count=len(claims))
@@ -833,10 +897,10 @@ def assess_pair_groundedness(query, candidate_answer, baseline_answer, llm_clien
         query=query,
         pair_claims=pair_claims,
         corpus_resources=corpus_resources,
-        top_k=3,
+        top_k=DEFAULT_CLAIM_RETRIEVAL_TOP_K,
     )
     combined_packets = grouped_packets["candidate"] + grouped_packets["baseline"]
-    combined_assessments = _assess_claim_support(query, combined_packets, llm_client, batch_size=32)
+    combined_assessments = _assess_claim_support(query, combined_packets, llm_client, batch_size=16)
     grouped_assessments = {"candidate": [], "baseline": []}
     for assessment in combined_assessments:
         answer_id = assessment.get("answer_id")
@@ -944,9 +1008,28 @@ def judge_pair(query, candidate_answer, baseline_answer, llm_client, corpus_reso
 
     对候选答案/基线答案进行 AB/BA 两次评判，降低位置偏差。
     """
-    prompt_ab = build_judge_prompt(query, candidate_answer, baseline_answer)
+    pair_groundedness = assess_pair_groundedness(query, candidate_answer, baseline_answer, llm_client, corpus_resources)
+    candidate_groundedness = pair_groundedness["candidate"]
+    baseline_groundedness = pair_groundedness["baseline"]
+    groundedness_decision = _groundedness_decision(candidate_groundedness, baseline_groundedness)
+    candidate_claim_support = _claim_support_report(candidate_groundedness)
+    baseline_claim_support = _claim_support_report(baseline_groundedness)
+
+    prompt_ab = build_judge_prompt(
+        query,
+        candidate_answer,
+        baseline_answer,
+        claim_support_a=candidate_claim_support,
+        claim_support_b=baseline_claim_support,
+    )
     verdict_ab = _generate_verdict(prompt_ab, llm_client)
-    prompt_ba = build_judge_prompt(query, baseline_answer, candidate_answer)
+    prompt_ba = build_judge_prompt(
+        query,
+        baseline_answer,
+        candidate_answer,
+        claim_support_a=baseline_claim_support,
+        claim_support_b=candidate_claim_support,
+    )
     verdict_ba_raw = _generate_verdict(prompt_ba, llm_client)
 
     overall_ab = _normalize_winner(verdict_ab.get("Overall Winner", {}).get("Winner", "Tie"))
@@ -960,10 +1043,6 @@ def judge_pair(query, candidate_answer, baseline_answer, llm_client, corpus_reso
         llm_overall_winner = "tie"
 
     dimension_votes = _extract_dimension_votes(verdict_ab, verdict_ba_raw)
-    pair_groundedness = assess_pair_groundedness(query, candidate_answer, baseline_answer, llm_client, corpus_resources)
-    candidate_groundedness = pair_groundedness["candidate"]
-    baseline_groundedness = pair_groundedness["baseline"]
-    groundedness_decision = _groundedness_decision(candidate_groundedness, baseline_groundedness)
 
     return {
         "order_ab": verdict_ab,

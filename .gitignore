@@ -25,7 +25,7 @@ venv/
 .env.*
 
 # Generated experiment outputs / drafts
-result/
+result*/
 associative_rag_project/result/
 associative_rag_project/runs*/
 associative_rag_project/tmp*/

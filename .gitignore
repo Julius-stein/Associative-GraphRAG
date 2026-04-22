@@ -55,3 +55,5 @@ lightrag-dev/
 book.txt
 notes/
 llm_config.py
+*.xlsx
+tools/

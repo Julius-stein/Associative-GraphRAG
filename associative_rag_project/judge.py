@@ -36,13 +36,6 @@ You will evaluate two answers to the same question based on:
 
 - **Empowerment**: How well does the answer help the reader understand and make informed judgments about the topic?
 
-You are also given corpus-grounding labels for the factual claims extracted from each answer.
-Use these labels when judging all four criteria:
-- Supported and partially supported claims can contribute to comprehensiveness, diversity, empowerment, and the overall winner.
-- Claims labeled insufficient_evidence, contradicted, or verification_error should not improve an answer's score.
-- If an answer is more polished but its substantive claims are less supported by the corpus, do not reward style over grounded content.
-- The claim labels are evidence-discipline signals, not a replacement for reading the answers.
-
 For each criterion, choose the better answer (either Answer 1 or Answer 2) and explain why.
 Then select an Overall Winner for the QFS task. The better QFS answer should be more comprehensive, more diverse in coverage, and more empowering/useful to the reader while staying faithful to the question.
 
@@ -57,12 +50,6 @@ Here are the two answers:
 **Answer 2:**
 {second_answer}
 
-Corpus-grounding labels for Answer 1:
-{first_claim_support}
-
-Corpus-grounding labels for Answer 2:
-{second_claim_support}
-
 Evaluate both answers using the criteria listed above and provide detailed explanations for each criterion.
 
 Output your evaluation in the following JSON format:
@@ -72,6 +59,48 @@ Output your evaluation in the following JSON format:
     "Diversity": {{ "Winner": "[Answer 1 or Answer 2]", "Explanation": "[Provide explanation here]" }} ,
     "Empowerment": {{ "Winner": "[Answer 1 or Answer 2]", "Explanation": "[Provide explanation here]" }} ,
     "Overall Winner": {{ "Winner": "[Answer 1 or Answer 2]", "Explanation": "[Summarize why this answer is the better QFS answer]" }}
+}}
+"""
+
+SOURCE_COMPLIANCE_PROMPT = """---Goal---
+
+You will evaluate two answers to the same source-bounded QFS question.
+
+This is NOT the original QFS quality judge. Do not judge which answer is more polished or more comprehensive in general.
+Judge which answer better follows a source-bounded answer contract:
+- It should primarily answer from the provided corpus or document collection implied by the question.
+- It may use external background knowledge only if clearly marked as external context.
+- It should not present unsupported outside knowledge as if it came from the corpus.
+- It should not be penalized merely for high-level synthesis when multiple pieces of evidence could jointly support an abstraction.
+- It should acknowledge uncertainty or missing evidence when the corpus scope appears insufficient.
+
+Evaluate the answers on:
+
+- **Evidence Usefulness**: Which answer appears to make more meaningful use of source evidence rather than generic background knowledge?
+- **Source Grounding**: Which answer is more careful about tying major conclusions to the source-bounded task? Do not require extractive wording.
+- **Source Layering**: Which answer better separates corpus-supported conclusions, external background, and speculation/uncertainty?
+- **Gap Awareness**: Which answer better acknowledges limits, missing evidence, or uncertainty instead of overclaiming?
+
+For each criterion, choose the better answer (Answer 1, Answer 2, or Tie) and explain why.
+Then select a Source Compliance Winner.
+
+Question:
+{input_query}
+
+Answer 1:
+{first_answer}
+
+Answer 2:
+{second_answer}
+
+Output strict JSON in this format:
+
+{{
+    "Evidence Usefulness": {{ "Winner": "[Answer 1 or Answer 2 or Tie]", "Explanation": "[Provide explanation here]" }},
+    "Source Grounding": {{ "Winner": "[Answer 1 or Answer 2 or Tie]", "Explanation": "[Provide explanation here]" }},
+    "Source Layering": {{ "Winner": "[Answer 1 or Answer 2 or Tie]", "Explanation": "[Provide explanation here]" }},
+    "Gap Awareness": {{ "Winner": "[Answer 1 or Answer 2 or Tie]", "Explanation": "[Provide explanation here]" }},
+    "Source Compliance Winner": {{ "Winner": "[Answer 1 or Answer 2 or Tie]", "Explanation": "[Summarize which answer better follows the source-bounded QFS contract]" }}
 }}
 """
 
@@ -263,27 +292,31 @@ def _claim_support_report(groundedness):
     return json.dumps(report, ensure_ascii=False, indent=2)
 
 
-def build_judge_prompt(query, answer_a, answer_b, claim_support_a=None, claim_support_b=None):
+def build_judge_prompt(query, answer_a, answer_b):
     """Build the exact FG-RAG evaluation prompt template.
 
     参数:
         query: 评判的问题文本。
         answer_a: 第一个候选答案文本。
         answer_b: 第二个候选答案文本。
-        claim_support_a: 第一个答案的 claim 支持标签摘要。
-        claim_support_b: 第二个答案的 claim 支持标签摘要。
-
     返回:
         用于 LLM 判分的完整提示字符串。
 
-    构造完整的判分提示，要求模型比较两个答案并返回 JSON。
+    构造原始 QFS 质量判分提示，不注入 groundedness 标签。
     """
     return FG_RAG_EVALUATE_PROMPT.format(
         input_query=query,
         first_answer=answer_a,
         second_answer=answer_b,
-        first_claim_support=claim_support_a or "No claim-grounding labels available.",
-        second_claim_support=claim_support_b or "No claim-grounding labels available.",
+    )
+
+
+def build_source_compliance_prompt(query, answer_a, answer_b):
+    """Build the separate source-bounded contract compliance judge prompt."""
+    return SOURCE_COMPLIANCE_PROMPT.format(
+        input_query=query,
+        first_answer=answer_a,
+        second_answer=answer_b,
     )
 
 
@@ -372,7 +405,26 @@ WINRATE_TABLE_METRICS = [
     "Comprehensiveness",
     "Diversity",
     "Empowerment",
-    "Corpus Groundedness",
+]
+
+SOURCE_COMPLIANCE_KEYS = [
+    "Evidence Usefulness",
+    "Source Grounding",
+    "Source Layering",
+    "Gap Awareness",
+    "Source Compliance Winner",
+]
+
+SOURCE_COMPLIANCE_TABLE_METRICS = [
+    "Source Compliance Winner",
+    "Evidence Usefulness",
+    "Source Grounding",
+    "Source Layering",
+    "Gap Awareness",
+]
+
+CLAIM_DIAGNOSTIC_TABLE_METRICS = [
+    "Claim Corpus Support",
 ]
 
 CLAIM_SCORE_BY_LABEL = {
@@ -396,8 +448,13 @@ def _map_letter_winner(winner):
 
 def _extract_dimension_votes(verdict_ab, verdict_ba_raw):
     """Map both evaluation orders back into candidate/baseline vote counts."""
+    return _extract_dimension_votes_for_keys(verdict_ab, verdict_ba_raw, CRITERIA_KEYS)
+
+
+def _extract_dimension_votes_for_keys(verdict_ab, verdict_ba_raw, criteria_keys):
+    """Map both evaluation orders back into candidate/baseline vote counts for arbitrary criteria."""
     mapped = {}
-    for key in CRITERIA_KEYS:
+    for key in criteria_keys:
         winner_ab = _map_letter_winner(_normalize_winner(verdict_ab.get(key, {}).get("Winner", "")))
         winner_ba = _map_letter_winner(_map_swapped_winner(_normalize_winner(verdict_ba_raw.get(key, {}).get("Winner", ""))))
         votes = Counter([winner_ab, winner_ba])
@@ -409,14 +466,15 @@ def _extract_dimension_votes(verdict_ab, verdict_ba_raw):
     return mapped
 
 
-def _parse_error_verdict():
+def _parse_error_verdict(criteria_keys=None):
     """Tie verdict used only when pairwise evaluator JSON cannot be parsed."""
+    criteria_keys = criteria_keys or CRITERIA_KEYS
     return {
         key: {
             "Winner": "Tie",
             "Explanation": "Evaluator output could not be parsed reliably; treated as a tie for robustness.",
         }
-        for key in CRITERIA_KEYS
+        for key in criteria_keys
     }
 
 
@@ -980,8 +1038,9 @@ def _summarize_groundedness_accumulator(accumulator):
     }
 
 
-def _generate_verdict(prompt, llm_client, max_attempts=3):
+def _generate_verdict(prompt, llm_client, max_attempts=3, criteria_keys=None):
     """Retry parsing a judge response a few times before returning a parse-error tie."""
+    criteria_keys = criteria_keys or CRITERIA_KEYS
     last_error = None
     for attempt in range(1, max_attempts + 1):
         try:
@@ -990,61 +1049,31 @@ def _generate_verdict(prompt, llm_client, max_attempts=3):
             log(f"[judge] parse failure attempt={attempt}/{max_attempts}: {exc}")
             last_error = exc
     log(f"[judge] returning tie verdict after repeated parse failures: {last_error}")
-    return _parse_error_verdict()
+    return _parse_error_verdict(criteria_keys=criteria_keys)
 
 
-def judge_pair(query, candidate_answer, baseline_answer, llm_client, corpus_resources=None):
-    """Judge one answer pair in both orders to reduce position bias.
+def _winner_from_votes(votes):
+    if votes["a"] > votes["b"] and votes["a"] > votes["tie"]:
+        return "candidate"
+    if votes["b"] > votes["a"] and votes["b"] > votes["tie"]:
+        return "baseline"
+    return "tie"
 
-    参数:
-        query: 原始问题文本。
-        candidate_answer: 算法候选答案文本。
-        baseline_answer: 对照基线答案文本。
-        llm_client: 用于调用 LLM 的客户端实例。
-        corpus_resources: 可选的语料资源，用于额外的 groundedness 评估。
 
-    返回:
-        一个包含 AB/BA 判定、组织分析、维度投票和 groundedness 结果的判决字典。
-
-    对候选答案/基线答案进行 AB/BA 两次评判，降低位置偏差。
-    """
-    pair_groundedness = assess_pair_groundedness(query, candidate_answer, baseline_answer, llm_client, corpus_resources)
-    candidate_groundedness = pair_groundedness["candidate"]
-    baseline_groundedness = pair_groundedness["baseline"]
-    groundedness_decision = _groundedness_decision(candidate_groundedness, baseline_groundedness)
-    candidate_claim_support = _claim_support_report(candidate_groundedness)
-    baseline_claim_support = _claim_support_report(baseline_groundedness)
-
-    prompt_ab = build_judge_prompt(
-        query,
-        candidate_answer,
-        baseline_answer,
-        claim_support_a=candidate_claim_support,
-        claim_support_b=baseline_claim_support,
-    )
-    verdict_ab = _generate_verdict(prompt_ab, llm_client)
-    prompt_ba = build_judge_prompt(
-        query,
-        baseline_answer,
-        candidate_answer,
-        claim_support_a=baseline_claim_support,
-        claim_support_b=candidate_claim_support,
-    )
-    verdict_ba_raw = _generate_verdict(prompt_ba, llm_client)
+def _judge_quality_pair(query, candidate_answer, baseline_answer, llm_client):
+    prompt_ab = build_judge_prompt(query, candidate_answer, baseline_answer)
+    verdict_ab = _generate_verdict(prompt_ab, llm_client, criteria_keys=CRITERIA_KEYS)
+    prompt_ba = build_judge_prompt(query, baseline_answer, candidate_answer)
+    verdict_ba_raw = _generate_verdict(prompt_ba, llm_client, criteria_keys=CRITERIA_KEYS)
 
     overall_ab = _normalize_winner(verdict_ab.get("Overall Winner", {}).get("Winner", "Tie"))
     overall_ba = _map_swapped_winner(_normalize_winner(verdict_ba_raw.get("Overall Winner", {}).get("Winner", "Tie")))
     votes = Counter([overall_ab, overall_ba])
-    if votes["a"] > votes["b"] and votes["a"] > votes["tie"]:
-        llm_overall_winner = "candidate"
-    elif votes["b"] > votes["a"] and votes["b"] > votes["tie"]:
-        llm_overall_winner = "baseline"
-    else:
-        llm_overall_winner = "tie"
-
-    dimension_votes = _extract_dimension_votes(verdict_ab, verdict_ba_raw)
+    llm_overall_winner = _winner_from_votes(votes)
+    dimension_votes = _extract_dimension_votes_for_keys(verdict_ab, verdict_ba_raw, CRITERIA_KEYS)
 
     return {
+        "judge_mode": "quality",
         "order_ab": verdict_ab,
         "order_ba": verdict_ba_raw,
         "mapped_overall_votes": {
@@ -1054,14 +1083,93 @@ def judge_pair(query, candidate_answer, baseline_answer, llm_client, corpus_reso
         },
         "llm_overall_winner": llm_overall_winner,
         "dimension_votes": dimension_votes,
+        "final_winner": llm_overall_winner,
+    }
+
+
+def _judge_source_compliance_pair(query, candidate_answer, baseline_answer, llm_client):
+    prompt_ab = build_source_compliance_prompt(query, candidate_answer, baseline_answer)
+    verdict_ab = _generate_verdict(prompt_ab, llm_client, criteria_keys=SOURCE_COMPLIANCE_KEYS)
+    prompt_ba = build_source_compliance_prompt(query, baseline_answer, candidate_answer)
+    verdict_ba_raw = _generate_verdict(prompt_ba, llm_client, criteria_keys=SOURCE_COMPLIANCE_KEYS)
+
+    overall_ab = _normalize_winner(verdict_ab.get("Source Compliance Winner", {}).get("Winner", "Tie"))
+    overall_ba = _map_swapped_winner(_normalize_winner(verdict_ba_raw.get("Source Compliance Winner", {}).get("Winner", "Tie")))
+    votes = Counter([overall_ab, overall_ba])
+    source_compliance_winner = _winner_from_votes(votes)
+    dimension_votes = _extract_dimension_votes_for_keys(verdict_ab, verdict_ba_raw, SOURCE_COMPLIANCE_KEYS)
+
+    return {
+        "judge_mode": "source_compliance",
+        "order_ab": verdict_ab,
+        "order_ba": verdict_ba_raw,
+        "mapped_overall_votes": {
+            "candidate": votes["a"],
+            "baseline": votes["b"],
+            "tie": votes["tie"],
+        },
+        "llm_overall_winner": source_compliance_winner,
+        "dimension_votes": dimension_votes,
+        "final_winner": source_compliance_winner,
+    }
+
+
+def _judge_claim_diagnostics_pair(query, candidate_answer, baseline_answer, llm_client, corpus_resources=None):
+    pair_groundedness = assess_pair_groundedness(query, candidate_answer, baseline_answer, llm_client, corpus_resources)
+    candidate_groundedness = pair_groundedness["candidate"]
+    baseline_groundedness = pair_groundedness["baseline"]
+    groundedness_decision = _groundedness_decision(candidate_groundedness, baseline_groundedness)
+    winner = groundedness_decision["winner"]
+    return {
+        "judge_mode": "claim_diagnostics",
+        "order_ab": {},
+        "order_ba": {},
+        "mapped_overall_votes": {
+            "candidate": 1 if winner == "candidate" else 0,
+            "baseline": 1 if winner == "baseline" else 0,
+            "tie": 1 if winner == "tie" else 0,
+        },
+        "llm_overall_winner": winner,
+        "dimension_votes": {
+            "Claim Corpus Support": {
+                "candidate": 1 if winner == "candidate" else 0,
+                "baseline": 1 if winner == "baseline" else 0,
+                "tie": 1 if winner == "tie" else 0,
+            }
+        },
         "corpus_groundedness": {
-            "winner": groundedness_decision["winner"],
+            "winner": winner,
             "decision": groundedness_decision,
             "candidate": candidate_groundedness,
             "baseline": baseline_groundedness,
         },
-        "final_winner": llm_overall_winner,
+        "final_winner": winner,
     }
+
+
+def judge_pair(query, candidate_answer, baseline_answer, llm_client, corpus_resources=None, judge_mode="quality"):
+    """Judge one answer pair in both orders to reduce position bias.
+
+    参数:
+        query: 原始问题文本。
+        candidate_answer: 算法候选答案文本。
+        baseline_answer: 对照基线答案文本。
+        llm_client: 用于调用 LLM 的客户端实例。
+        corpus_resources: 可选的语料资源，仅用于 claim_diagnostics。
+        judge_mode: quality、source_compliance 或 claim_diagnostics。
+
+    返回:
+        一个包含 AB/BA 判定、组织分析、维度投票和 groundedness 结果的判决字典。
+
+    对候选答案/基线答案进行 AB/BA 两次评判，降低位置偏差。
+    """
+    if judge_mode == "quality":
+        return _judge_quality_pair(query, candidate_answer, baseline_answer, llm_client)
+    if judge_mode == "source_compliance":
+        return _judge_source_compliance_pair(query, candidate_answer, baseline_answer, llm_client)
+    if judge_mode == "claim_diagnostics":
+        return _judge_claim_diagnostics_pair(query, candidate_answer, baseline_answer, llm_client, corpus_resources)
+    raise ValueError(f"Unsupported judge_mode: {judge_mode}")
 
 
 def run_winrate_judgement(
@@ -1072,6 +1180,7 @@ def run_winrate_judgement(
     output_path=None,
     max_workers=None,
     corpus_resources=None,
+    judge_mode="quality",
 ):
     """Run pairwise judging and aggregate both overall and per-dimension stats.
 
@@ -1082,7 +1191,8 @@ def run_winrate_judgement(
         llm_client: LLM 客户端实例。
         output_path: 可选的判决结果输出文件路径。
         max_workers: 并行评判的线程数，默认为 llm_client.max_concurrency。
-        corpus_resources: 可选的语料资源，用于 groundedness 评估。
+        corpus_resources: 可选的语料资源，仅用于 claim_diagnostics。
+        judge_mode: quality、source_compliance 或 claim_diagnostics。
 
     返回:
         包含总体胜率、各维度统计、合同条件汇总和每条判决详细信息的结果载荷。
@@ -1091,13 +1201,20 @@ def run_winrate_judgement(
     """
     if len(candidate_answers) != len(baseline_answers):
         raise ValueError("Candidate and baseline answer counts do not match")
+    if judge_mode not in {"quality", "source_compliance", "claim_diagnostics"}:
+        raise ValueError(f"Unsupported judge_mode: {judge_mode}")
     max_workers = max_workers or llm_client.max_concurrency
-    log(f"[judge] start total={len(candidate_answers)} model={llm_client.model} workers={max_workers}")
+    log(f"[judge] start total={len(candidate_answers)} mode={judge_mode} model={llm_client.model} workers={max_workers}")
     verdicts = [None] * len(candidate_answers)
     summary_counter = Counter()
     llm_summary_counter = Counter()
+    criteria_keys = {
+        "quality": CRITERIA_KEYS,
+        "source_compliance": SOURCE_COMPLIANCE_KEYS,
+        "claim_diagnostics": ["Claim Corpus Support"],
+    }[judge_mode]
     dimension_counter = {
-        key: Counter({"candidate": 0, "baseline": 0, "tie": 0}) for key in CRITERIA_KEYS
+        key: Counter({"candidate": 0, "baseline": 0, "tie": 0}) for key in criteria_keys
     }
     corpus_groundedness_counter = Counter({"candidate": 0, "baseline": 0, "tie": 0})
     groundedness_accumulators = {
@@ -1114,6 +1231,7 @@ def run_winrate_judgement(
             base["model_answer"],
             llm_client,
             corpus_resources=corpus_resources,
+            judge_mode=judge_mode,
         )
         return idx, {
             "index": idx,
@@ -1131,15 +1249,16 @@ def run_winrate_judgement(
             verdicts[idx - 1] = verdict_payload
             summary_counter[verdict_payload["final_winner"]] += 1
             llm_summary_counter[verdict_payload["llm_overall_winner"]] += 1
-            corpus_groundedness_counter[verdict_payload["corpus_groundedness"]["winner"]] += 1
-            _accumulate_groundedness(
-                groundedness_accumulators["candidate"],
-                verdict_payload["corpus_groundedness"]["candidate"],
-            )
-            _accumulate_groundedness(
-                groundedness_accumulators["baseline"],
-                verdict_payload["corpus_groundedness"]["baseline"],
-            )
+            if "corpus_groundedness" in verdict_payload:
+                corpus_groundedness_counter[verdict_payload["corpus_groundedness"]["winner"]] += 1
+                _accumulate_groundedness(
+                    groundedness_accumulators["candidate"],
+                    verdict_payload["corpus_groundedness"]["candidate"],
+                )
+                _accumulate_groundedness(
+                    groundedness_accumulators["baseline"],
+                    verdict_payload["corpus_groundedness"]["baseline"],
+                )
             for key, votes in verdict_payload["dimension_votes"].items():
                 for label, count in votes.items():
                     dimension_counter[key][label] += count
@@ -1162,22 +1281,9 @@ def run_winrate_judgement(
             "tie_probability": round(counter["tie"] / max(total_votes, 1), 4),
             "total_votes": total_votes,
         }
-    grounded_total = (
-        corpus_groundedness_counter["candidate"]
-        + corpus_groundedness_counter["baseline"]
-        + corpus_groundedness_counter["tie"]
-    )
-    dimension_summary["Corpus Groundedness"] = {
-        "candidate": corpus_groundedness_counter["candidate"],
-        "baseline": corpus_groundedness_counter["baseline"],
-        "tie": corpus_groundedness_counter["tie"],
-        "candidate_probability": round(corpus_groundedness_counter["candidate"] / max(grounded_total, 1), 4),
-        "baseline_probability": round(corpus_groundedness_counter["baseline"] / max(grounded_total, 1), 4),
-        "tie_probability": round(corpus_groundedness_counter["tie"] / max(grounded_total, 1), 4),
-        "total_votes": grounded_total,
-    }
     payload = {
         "summary": {
+            "judge_mode": judge_mode,
             "total": total,
             "candidate_wins": summary_counter["candidate"],
             "baseline_wins": summary_counter["baseline"],
@@ -1194,12 +1300,13 @@ def run_winrate_judgement(
             "baseline_win_rate": round(llm_summary_counter["baseline"] / max(total, 1), 4),
         },
         "criteria_summary": dimension_summary,
-        "corpus_groundedness_claim_summary": {
-            "candidate": _summarize_groundedness_accumulator(groundedness_accumulators["candidate"]),
-            "baseline": _summarize_groundedness_accumulator(groundedness_accumulators["baseline"]),
-        },
         "verdicts": verdicts,
     }
+    if judge_mode == "claim_diagnostics":
+        payload["corpus_groundedness_claim_summary"] = {
+            "candidate": _summarize_groundedness_accumulator(groundedness_accumulators["candidate"]),
+            "baseline": _summarize_groundedness_accumulator(groundedness_accumulators["baseline"]),
+        }
     if output_path is not None:
         output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         log(f"[judge] wrote {output_path}")
@@ -1210,9 +1317,15 @@ def build_winrate_table_rows(payload):
     """Normalize overall + per-criterion win rates into row objects for table rendering."""
     rows = []
     overall = payload.get("summary", {})
+    judge_mode = overall.get("judge_mode", "quality")
+    overall_metric = {
+        "quality": "Overall Winner",
+        "source_compliance": "Source Compliance Winner",
+        "claim_diagnostics": "Claim Corpus Support",
+    }.get(judge_mode, "Overall Winner")
     rows.append(
         {
-            "metric": "Overall Winner",
+            "metric": overall_metric,
             "candidate_win_rate": overall.get("candidate_win_rate", 0.0),
             "baseline_win_rate": overall.get("baseline_win_rate", 0.0),
             "tie_rate": round(overall.get("ties", 0) / max(overall.get("total", 1), 1), 4),
@@ -1220,7 +1333,13 @@ def build_winrate_table_rows(payload):
         }
     )
     criteria_summary = payload.get("criteria_summary", {})
-    for metric_name in WINRATE_TABLE_METRICS[1:]:
+    if judge_mode == "source_compliance":
+        table_metrics = SOURCE_COMPLIANCE_TABLE_METRICS[1:]
+    elif judge_mode == "claim_diagnostics":
+        table_metrics = []
+    else:
+        table_metrics = WINRATE_TABLE_METRICS[1:]
+    for metric_name in table_metrics:
         metric = criteria_summary.get(metric_name, {})
         rows.append(
             {

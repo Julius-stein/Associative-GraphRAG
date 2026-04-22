@@ -132,8 +132,10 @@ def load_query_rows(
                     "query": query,
                     "base_query": item.get("base_query", query),
                 }
-                for key in ("query_contract", "organization_contract", "contract", "layout"):
-                    if item.get(key):
+                for key, value in item.items():
+                    if key in row:
+                        continue
+                    if value is not None:
                         row[key] = item[key]
                 rows.append(row)
             if rows:

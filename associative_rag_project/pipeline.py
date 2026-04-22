@@ -372,6 +372,26 @@ def _pick_section_doc_ids(root_chunk_hits, chunk_store):
     return {doc_ids[0]}
 
 
+def _allowed_doc_ids_for_query(query_row, cfg):
+    if cfg.get("context_constraint", "none") != "sample_context":
+        return None
+    doc_ids = query_row.get("context_lightrag_doc_ids") or []
+    if not doc_ids:
+        doc_ids = query_row.get("allowed_doc_ids") or []
+    return set(doc_ids) if doc_ids else set()
+
+
+def _filter_hits_by_allowed_doc_ids(hits, allowed_doc_ids, chunk_store):
+    if allowed_doc_ids is None:
+        return hits
+    allowed_doc_ids = set(allowed_doc_ids)
+    return [
+        item
+        for item in hits
+        if chunk_store.get(item.get("chunk_id"), {}).get("full_doc_id") in allowed_doc_ids
+    ]
+
+
 def _run_anchor_stage(
     *,
     query_row,
@@ -389,15 +409,23 @@ def _run_anchor_stage(
     candidate_top_k = _anchor_candidate_top_k(cfg)
     root_top_k = _anchor_root_top_k(cfg)
     max_hop = _expand_max_hop(cfg)
+    allowed_doc_ids = _allowed_doc_ids_for_query(query_row, cfg)
 
-    candidate_chunk_hits = chunk_retriever.search(query_row["query"], top_k=candidate_top_k)
+    candidate_chunk_hits = chunk_retriever.search(
+        query_row["query"],
+        top_k=candidate_top_k,
+        allowed_doc_ids=allowed_doc_ids,
+        chunk_store=chunk_store,
+    )
+    graph_top_chunk_k = len(chunk_store) if allowed_doc_ids is not None else max(candidate_top_k * 2, cfg["top_chunks"] * 10)
     graph_evidence_hits = search_graph_evidence_chunks(
         query=query_row["query"],
         graph=graph,
         node_to_chunks=node_to_chunks,
         edge_to_chunks=edge_to_chunks,
-        top_chunk_k=max(candidate_top_k * 2, cfg["top_chunks"] * 10),
+        top_chunk_k=graph_top_chunk_k,
     )
+    graph_evidence_hits = _filter_hits_by_allowed_doc_ids(graph_evidence_hits, allowed_doc_ids, chunk_store)
     candidate_chunk_hits = merge_candidate_hits_with_graph(
         primary_hits=candidate_chunk_hits,
         graph_hits=graph_evidence_hits,
@@ -431,8 +459,6 @@ def _run_anchor_stage(
         keyword_index=keyword_index,
     )
 
-    allowed_doc_ids = None
-
     root_chunk_hits = [_serialize_root_chunk_hit(item) for item in root_chunk_hits]
 
     root_chunk_score_lookup = {item["chunk_id"]: item["score_norm"] for item in root_chunk_hits}
@@ -460,6 +486,7 @@ def _run_anchor_stage(
 
     return {
         "retrieval_mode_label": "anchor:dense+graph_evidence",
+        "context_constraint": cfg.get("context_constraint", "none"),
         "candidate_top_k": candidate_top_k,
         "root_top_k": root_top_k,
         "max_hop": max_hop,
@@ -852,6 +879,8 @@ def run_query_online(
         organize_state,
         timings,
     )
+    retrieval_record["task_mode"] = cfg.get("task_mode", "qfs")
+    retrieval_record["context_constraint"] = cfg.get("context_constraint", "none")
     answer_start = perf_counter()
     answer_record = generate_one_answer_record(retrieval_record, llm_client)
     answer_elapsed = perf_counter() - answer_start
@@ -917,7 +946,7 @@ def run_query(
         query_index=query_index,
         total_queries=total_queries,
     )
-    return _build_query_record_from_states(
+    record = _build_query_record_from_states(
         query_row,
         query_state["controller_info"],
         query_state["anchor_state"],
@@ -925,6 +954,9 @@ def run_query(
         query_state["organize_state"],
         query_state["timings"],
     )
+    record["task_mode"] = cfg.get("task_mode", "qfs")
+    record["context_constraint"] = cfg.get("context_constraint", "none")
+    return record
 
 
 def retrieve_corpus_queries(

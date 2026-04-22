@@ -163,6 +163,29 @@ Evidence Package:
 """
 
 
+def build_multihop_qa_prompt(query, prompt_context):
+    """Build a benchmark-style multi-hop QA prompt.
+
+    Unlike the QFS prompt, this asks for a concise answer compatible with
+    EM/F1 evaluation while still allowing one short evidence-grounded rationale.
+    """
+    return f"""Answer the multi-hop question using only the provided evidence.
+
+Rules:
+- The evidence is restricted to the benchmark candidate context for this question.
+- Give the shortest correct answer possible on the first line.
+- Then provide one brief explanation sentence if needed.
+- Do not use the QFS P1-P5 structure.
+- If the evidence does not support an answer, write: insufficient evidence.
+
+Question:
+{query}
+
+Evidence:
+{prompt_context}
+"""
+
+
 class OpenAICompatibleClient:
     """Thin wrapper around an OpenAI-compatible chat endpoint."""
 
@@ -241,14 +264,20 @@ def generate_one_answer_record(record, llm_client):
 
     对单条检索记录生成最终答案，并返回带统计信息的结果。
     """
-    prompt = build_generation_prompt(
-        record["query"],
-        record["prompt_context"],
-    )
-    answer = llm_client.generate(prompt)
+    if record.get("task_mode") == "multihop_qa":
+        prompt = build_multihop_qa_prompt(record["query"], record["prompt_context"])
+        answer = llm_client.generate(prompt, max_tokens=600)
+    else:
+        prompt = build_generation_prompt(
+            record["query"],
+            record["prompt_context"],
+        )
+        answer = llm_client.generate(prompt)
     return {
         "group_id": record["group_id"],
         "query": record["query"],
+        "task_mode": record.get("task_mode", "qfs"),
+        "context_constraint": record.get("context_constraint", "none"),
         "organization_mode": record.get("organization_mode", "qfs"),
         "model_answer": answer,
         "stats": record["stats"],

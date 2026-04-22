@@ -52,11 +52,12 @@ class BM25Index:
             num_docs=len(doc_lengths),
         )
 
-    def search(self, query, top_k):
+    def search(self, query, top_k, allowed_chunk_ids=None):
         """Return the top-k lexical matches with normalized scores."""
         query_terms = tokenize(query)
         if not query_terms:
             return []
+        allowed_chunk_ids = set(allowed_chunk_ids or [])
         scores = defaultdict(float)
         query_tf = Counter(query_terms)
         for term, qtf in query_tf.items():
@@ -66,6 +67,8 @@ class BM25Index:
             df = len(postings)
             idf = math.log(1 + (self.num_docs - df + 0.5) / (df + 0.5))
             for chunk_id, tf in postings.items():
+                if allowed_chunk_ids and chunk_id not in allowed_chunk_ids:
+                    continue
                 dl = self.doc_lengths[chunk_id]
                 denom = tf + self.k1 * (1 - self.b + self.b * dl / max(self.avgdl, 1e-9))
                 scores[chunk_id] += qtf * idf * ((tf * (self.k1 + 1)) / max(denom, 1e-9))
@@ -107,14 +110,24 @@ class DenseChunkIndex:
         normalized_matrix = matrix / np.clip(norms, 1e-12, None)
         return cls(chunk_ids=chunk_ids, matrix=matrix, normalized_matrix=normalized_matrix)
 
-    def search(self, query_vector, top_k):
+    def search(self, query_vector, top_k, allowed_chunk_ids=None):
         """Cosine similarity search over the normalized chunk matrix."""
         if self.normalized_matrix.size == 0:
             return []
+        allowed_chunk_ids = set(allowed_chunk_ids or [])
         query_vector = np.asarray(query_vector, dtype=np.float32)
         query_vector = query_vector / max(np.linalg.norm(query_vector), 1e-12)
-        scores = self.normalized_matrix @ query_vector
-        top_indices = np.argsort(-scores)[:top_k]
+        if allowed_chunk_ids:
+            candidate_indices = [index for index, chunk_id in enumerate(self.chunk_ids) if chunk_id in allowed_chunk_ids]
+            if not candidate_indices:
+                return []
+            candidate_scores = self.normalized_matrix[candidate_indices] @ query_vector
+            local_top_indices = np.argsort(-candidate_scores)[:top_k]
+            top_indices = [candidate_indices[index] for index in local_top_indices]
+            scores = self.normalized_matrix @ query_vector
+        else:
+            scores = self.normalized_matrix @ query_vector
+            top_indices = np.argsort(-scores)[:top_k]
         top_score = float(scores[top_indices[0]]) if len(top_indices) else 1.0
         return [
             {
@@ -256,7 +269,7 @@ class HybridChunkRetriever:
     dense_weight: float = 0.75
     bm25_weight: float = 0.25
 
-    def search(self, query, top_k):
+    def search(self, query, top_k, allowed_doc_ids=None, chunk_store=None):
         """Fuse bm25 and dense signals into one ranked candidate list.
 
         参数:
@@ -268,7 +281,19 @@ class HybridChunkRetriever:
         """
         if self.mode not in {"bm25", "dense", "hybrid"}:
             raise ValueError(f"Unsupported retrieval mode: {self.mode}")
-        bm25_hits = self.bm25_index.search(query, top_k=top_k) if self.mode in {"bm25", "hybrid"} else []
+        allowed_chunk_ids = None
+        if allowed_doc_ids is not None:
+            if chunk_store is None:
+                raise ValueError("allowed_doc_ids requires chunk_store for constrained retrieval")
+            allowed_doc_ids = set(allowed_doc_ids)
+            allowed_chunk_ids = {
+                chunk_id
+                for chunk_id, chunk in chunk_store.items()
+                if chunk.get("full_doc_id") in allowed_doc_ids
+            }
+            if not allowed_chunk_ids:
+                return []
+        bm25_hits = self.bm25_index.search(query, top_k=top_k, allowed_chunk_ids=allowed_chunk_ids) if self.mode in {"bm25", "hybrid"} else []
         dense_hits = []
         if self.mode in {"dense", "hybrid"}:
             if self.dense_index is None or self.embedding_client is None:
@@ -280,7 +305,7 @@ class HybridChunkRetriever:
                     f"index_dim={self.dense_index.normalized_matrix.shape[1]} vs query_dim={len(query_vector)}. "
                     "Please rebuild vdb_chunks.json with the same embedding model used at retrieval time."
                 )
-            dense_hits = self.dense_index.search(query_vector, top_k=top_k)
+            dense_hits = self.dense_index.search(query_vector, top_k=top_k, allowed_chunk_ids=allowed_chunk_ids)
         merged = {}
         for item in bm25_hits:
             merged.setdefault(item["chunk_id"], {}).update(item)

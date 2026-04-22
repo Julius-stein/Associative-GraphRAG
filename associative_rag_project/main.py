@@ -68,6 +68,18 @@ def build_parser():
     common.add_argument("--max-source-chunks", type=int, default=18)
     common.add_argument("--max-source-word-budget", type=int, default=10000)
     common.add_argument("--max-workers", type=int, default=12)
+    common.add_argument(
+        "--task-mode",
+        choices=["qfs", "multihop_qa"],
+        default="qfs",
+        help="Answer task style. Use multihop_qa for short benchmark QA instead of QFS P1-P5.",
+    )
+    common.add_argument(
+        "--context-constraint",
+        choices=["none", "sample_context"],
+        default="none",
+        help="Use sample_context to restrict each query to its original benchmark contexts.",
+    )
 
     subparsers.add_parser("retrieve", parents=[common])
 
@@ -87,6 +99,15 @@ def build_parser():
     judge.add_argument("--candidate-label")
     judge.add_argument("--limit", type=int)
     judge.add_argument("--max-workers", type=int, default=12)
+    judge.add_argument(
+        "--judge-mode",
+        choices=["quality", "source_compliance", "claim_diagnostics"],
+        default="quality",
+        help=(
+            "quality restores the original QFS judge; source_compliance judges source-bounded contract adherence; "
+            "claim_diagnostics runs the older claim-level corpus support analysis."
+        ),
+    )
 
     run = subparsers.add_parser("run", parents=[common])
     run.add_argument("--answer-output-file")
@@ -95,6 +116,12 @@ def build_parser():
     run_all.add_argument("--baseline-file")
     run_all.add_argument("--answer-output-file")
     run_all.add_argument("--judge-output-file")
+    run_all.add_argument(
+        "--judge-mode",
+        choices=["quality", "source_compliance", "claim_diagnostics"],
+        default="quality",
+        help="Judge mode used after run-all answer generation.",
+    )
     return parser
 
 
@@ -128,6 +155,8 @@ def retrieval_config_from_args(args):
         "group_limit": args.group_limit,
         "max_source_chunks": args.max_source_chunks,
         "max_source_word_budget": args.max_source_word_budget,
+        "task_mode": args.task_mode,
+        "context_constraint": args.context_constraint,
     }
 
 
@@ -177,7 +206,7 @@ def command_judge(args):
     llm_client = OpenAICompatibleClient(load_judge_config())
     candidate_label = args.candidate_label or Path(args.candidate_file).stem
     corpus_dir = Path(args.corpus_dir) if args.corpus_dir else Path("Datasets") / infer_corpus_name(args.questions_file) / "index"
-    corpus_resources = load_judge_corpus_resources(corpus_dir)
+    corpus_resources = load_judge_corpus_resources(corpus_dir) if args.judge_mode == "claim_diagnostics" else None
 
     if bool(args.baseline_file) == bool(args.baseline_dir):
         raise ValueError("Please provide exactly one of --baseline-file or --baseline-dir")
@@ -215,6 +244,7 @@ def command_judge(args):
             output_path=output_path,
             max_workers=args.max_workers,
             corpus_resources=corpus_resources,
+            judge_mode=args.judge_mode,
         )
         print(output_path)
         print(json.dumps(payload["summary"], ensure_ascii=False, indent=2))
@@ -247,6 +277,7 @@ def command_judge(args):
             output_path=output_path,
             max_workers=args.max_workers,
             corpus_resources=corpus_resources,
+            judge_mode=args.judge_mode,
         )
         per_baseline_payloads.append(
             {
@@ -353,7 +384,7 @@ def command_run_all(args):
         baseline_answers = load_baseline_answers(baseline_file)[: len(answers)]
         judge_output = Path(args.judge_output_file) if args.judge_output_file else output_dir / f"{stem}_vs_{baseline_file.stem}_winrate.json"
         judge_client = OpenAICompatibleClient(load_judge_config())
-        corpus_resources = load_judge_corpus_resources(args.corpus_dir)
+        corpus_resources = load_judge_corpus_resources(args.corpus_dir) if args.judge_mode == "claim_diagnostics" else None
         judge_payload = run_winrate_judgement(
             questions[: len(answers)],
             answers,
@@ -362,6 +393,7 @@ def command_run_all(args):
             output_path=judge_output,
             max_workers=args.max_workers,
             corpus_resources=corpus_resources,
+            judge_mode=args.judge_mode,
         )
         print(judge_output)
         print(json.dumps(judge_payload["summary"], ensure_ascii=False, indent=2))

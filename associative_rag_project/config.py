@@ -44,20 +44,38 @@ def load_llm_config():
     env_name = config.get("api_key_env")
     if env_name and os.getenv(env_name):
         config["api_key"] = os.getenv(env_name)
-    config.setdefault("embedding_provider", "openai_compatible")
-    config.setdefault("embedding_model", os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"))
-    config.setdefault("embedding_base_url", os.getenv("OPENAI_EMBEDDING_BASE_URL", config.get("base_url")))
-    config.setdefault("embedding_api_key", os.getenv("OPENAI_EMBEDDING_API_KEY", config.get("api_key")))
+    config["embedding_provider"] = (
+        os.getenv("LIGHTRAG_EMBED_PROVIDER")
+        or os.getenv("OPENAI_EMBEDDING_PROVIDER")
+        or config.get("embedding_provider")
+        or "openai_compatible"
+    )
+    config["embedding_model"] = (
+        os.getenv("LIGHTRAG_EMBED_MODEL")
+        or os.getenv("OPENAI_EMBEDDING_MODEL")
+        or config.get("embedding_model")
+        or "text-embedding-3-small"
+    )
+    config["embedding_base_url"] = (
+        os.getenv("LIGHTRAG_EMBED_BASE_URL")
+        or os.getenv("OPENAI_EMBEDDING_BASE_URL")
+        or config.get("embedding_base_url")
+        or config.get("base_url")
+    )
+    config["embedding_api_key"] = (
+        os.getenv("LIGHTRAG_EMBED_API_KEY")
+        or os.getenv("OPENAI_EMBEDDING_API_KEY")
+        or config.get("embedding_api_key")
+        or config.get("api_key")
+        or "EMPTY"
+    )
     if "embedding_dim" not in config:
-        raw_dim = os.getenv("OPENAI_EMBEDDING_DIM") or os.getenv("EMBEDDING_DIM")
+        raw_dim = os.getenv("LIGHTRAG_EMBED_DIM") or os.getenv("OPENAI_EMBEDDING_DIM") or os.getenv("EMBEDDING_DIM")
         config["embedding_dim"] = int(raw_dim) if raw_dim else 1536
     else:
-        config["embedding_dim"] = int(config["embedding_dim"])
-    config.setdefault("local_embedding_model", os.getenv("LOCAL_EMBEDDING_MODEL", "BAAI/bge-m3"))
-    config.setdefault("local_embedding_device", os.getenv("LOCAL_EMBEDDING_DEVICE", "auto"))
-    config.setdefault("local_embedding_batch_size", _env_int("LOCAL_EMBEDDING_BATCH_SIZE", 16))
-    config.setdefault("local_embedding_max_length", _env_int("LOCAL_EMBEDDING_MAX_LENGTH", 8192))
-    config.setdefault("local_embedding_query_instruction", os.getenv("LOCAL_EMBEDDING_QUERY_INSTRUCTION", ""))
+        raw_dim = os.getenv("LIGHTRAG_EMBED_DIM") or os.getenv("OPENAI_EMBEDDING_DIM") or os.getenv("EMBEDDING_DIM")
+        config["embedding_dim"] = int(raw_dim) if raw_dim else int(config["embedding_dim"])
+    config["embedding_batch_size"] = _env_int("LIGHTRAG_EMBED_BATCH_SIZE", int(config.get("embedding_batch_size", 16)))
     return config
 
 

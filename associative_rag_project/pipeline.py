@@ -260,11 +260,6 @@ def _load_runtime_resources(corpus_dir, cfg):
             "embedding_model",
             "embedding_base_url",
             "embedding_api_key",
-            "local_embedding_model",
-            "local_embedding_device",
-            "local_embedding_batch_size",
-            "local_embedding_max_length",
-            "local_embedding_query_instruction",
         ):
             if cfg.get(key) is not None:
                 llm_cfg[key] = cfg[key]

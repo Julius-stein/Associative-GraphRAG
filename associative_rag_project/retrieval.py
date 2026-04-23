@@ -8,7 +8,6 @@ Current refactor direction:
 检索与根 chunk 打分模块，负责多通道候选采集与多样性锚点选择。
 """
 
-import base64
 import json
 import math
 import re
@@ -99,13 +98,24 @@ class DenseChunkIndex:
         从向量数据库文件加载预先计算的 chunk 嵌入矩阵。
         """
         payload = json.loads(Path(vdb_file).read_text(encoding="utf-8"))
-        chunk_ids = [item["__id__"] for item in payload.get("data", [])]
+        rows = payload.get("data", [])
+        chunk_ids = [item["__id__"] for item in rows]
         dim = int(payload["embedding_dim"])
-        raw = base64.b64decode(payload.get("matrix", ""))
-        if not chunk_ids or not raw:
+        if not chunk_ids:
             matrix = np.zeros((0, dim), dtype=np.float32)
             return cls(chunk_ids=chunk_ids, matrix=matrix, normalized_matrix=matrix)
-        matrix = np.frombuffer(raw, dtype=np.float32).reshape(len(chunk_ids), dim)
+        if not all("__vector__" in item for item in rows):
+            raise ValueError(
+                "Unsupported vdb_chunks.json format. Rebuild the index with "
+                "`python -m associative_rag_project.index_builder` so chunk embeddings "
+                "are stored as OpenAI-compatible float vectors under data[*].__vector__."
+            )
+        matrix = np.asarray([item["__vector__"] for item in rows], dtype=np.float32)
+        if matrix.ndim != 2 or matrix.shape[1] != dim:
+            raise ValueError(
+                "Dense chunk vector shape does not match vdb_chunks.json embedding_dim: "
+                f"matrix_shape={matrix.shape}, embedding_dim={dim}"
+            )
         norms = np.linalg.norm(matrix, axis=1, keepdims=True)
         normalized_matrix = matrix / np.clip(norms, 1e-12, None)
         return cls(chunk_ids=chunk_ids, matrix=matrix, normalized_matrix=normalized_matrix)

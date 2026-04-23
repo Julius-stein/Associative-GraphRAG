@@ -17,7 +17,6 @@ record format as LightRAG, but the implementation lives in this project.
 from __future__ import annotations
 
 import argparse
-import base64
 import json
 import os
 import re
@@ -374,7 +373,7 @@ def _write_chunk_vectors(text_chunks: dict, index_dir: Path, config: dict):
     embedding_client = build_embedding_client(config)
     chunk_ids = list(text_chunks)
     contents = [text_chunks[chunk_id]["content"] for chunk_id in chunk_ids]
-    batch_size = int(config.get("index_embedding_batch_size", config.get("local_embedding_batch_size", 16)))
+    batch_size = int(config.get("index_embedding_batch_size", config.get("embedding_batch_size", 16)))
     vectors = []
     for start in range(0, len(contents), batch_size):
         batch = contents[start : start + batch_size]
@@ -389,8 +388,13 @@ def _write_chunk_vectors(text_chunks: dict, index_dir: Path, config: dict):
         )
     payload = {
         "embedding_dim": expected_dim,
-        "data": [{"__id__": chunk_id} for chunk_id in chunk_ids],
-        "matrix": base64.b64encode(matrix.tobytes()).decode("ascii"),
+        "data": [
+            {
+                "__id__": chunk_id,
+                "__vector__": matrix[index].tolist(),
+            }
+            for index, chunk_id in enumerate(chunk_ids)
+        ],
     }
     (index_dir / "vdb_chunks.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 

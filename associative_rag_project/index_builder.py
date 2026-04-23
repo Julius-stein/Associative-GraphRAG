@@ -22,7 +22,7 @@ import os
 import re
 import time
 from collections import Counter, defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from hashlib import md5
 from pathlib import Path
 
@@ -166,6 +166,24 @@ def _chat_completion(config: dict, messages: list[dict], *, max_tokens: int | No
     return response.choices[0].message.content or ""
 
 
+def _format_endpoint(config: dict) -> str:
+    return f"model={config.get('model')} base_url={config.get('base_url')}"
+
+
+def _preflight_chat_completion(config: dict):
+    log(f"[index] chat preflight start {_format_endpoint(config)} timeout={config.get('timeout', 120)}")
+    started = time.perf_counter()
+    reply = _chat_completion(
+        config,
+        [{"role": "user", "content": "Reply with exactly: OK"}],
+        max_tokens=8,
+    ).strip()
+    elapsed = time.perf_counter() - started
+    if "ok" not in reply.lower():
+        raise RuntimeError(f"Chat preflight returned an unexpected response: {reply!r}")
+    log(f"[index] chat preflight ok seconds={elapsed:.2f}")
+
+
 def _clean_str(value) -> str:
     text = str(value or "").strip()
     text = text.replace("\u200b", "")
@@ -239,6 +257,7 @@ def _extract_chunk_entities(
     config: dict,
     max_gleaning: int,
 ) -> dict:
+    started = time.perf_counter()
     prompt = ENTITY_EXTRACTION_PROMPT.format(
         tuple_delimiter=TUPLE_DELIMITER,
         record_delimiter=RECORD_DELIMITER,
@@ -269,6 +288,7 @@ def _extract_chunk_entities(
         "raw": final_result,
         "nodes": nodes,
         "edges": {f"{key[0]}{GRAPH_FIELD_SEP}{key[1]}": value for key, value in edges.items()},
+        "seconds": round(time.perf_counter() - started, 3),
     }
 
 
@@ -299,30 +319,63 @@ def extract_graph_records(
     log(f"[index] entity extraction chunks={len(text_chunks)} cached={len(cache)} missing={len(missing)}")
 
     if missing:
+        log(
+            f"[index] entity extraction run {_format_endpoint(config)} "
+            f"workers={max(max_workers, 1)} max_gleaning={max_gleaning} "
+            f"timeout={config.get('timeout', 120)}"
+        )
         with cache_file.open("a", encoding="utf-8") as handle:
             with ThreadPoolExecutor(max_workers=max(max_workers, 1)) as executor:
-                futures = {
-                    executor.submit(
+                missing_iter = iter(missing)
+                futures = {}
+                submitted = 0
+
+                def submit_next():
+                    nonlocal submitted
+                    try:
+                        chunk_id, chunk = next(missing_iter)
+                    except StopIteration:
+                        return False
+                    future = executor.submit(
                         _extract_chunk_entities,
                         chunk_id,
                         chunk,
                         config=config,
                         max_gleaning=max_gleaning,
-                    ): chunk_id
-                    for chunk_id, chunk in missing
-                }
-                completed = 0
-                for future in as_completed(futures):
-                    chunk_id = futures[future]
-                    item = future.result()
-                    cache[chunk_id] = item
-                    handle.write(json.dumps(item, ensure_ascii=False) + "\n")
-                    handle.flush()
-                    completed += 1
-                    log(
-                        f"[index] extracted {completed}/{len(missing)} chunk={chunk_id} "
-                        f"nodes={len(item['nodes'])} edges={len(item['edges'])}"
                     )
+                    submitted += 1
+                    futures[future] = chunk_id
+                    if submitted <= max(max_workers, 1):
+                        log(f"[index] extraction submitted {submitted}/{len(missing)} chunk={chunk_id}")
+                    return True
+
+                for _ in range(max(max_workers, 1)):
+                    if not submit_next():
+                        break
+
+                completed = 0
+                while futures:
+                    done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                    for future in done:
+                        chunk_id = futures.pop(future)
+                        try:
+                            item = future.result()
+                        except Exception as exc:
+                            log(
+                                f"[index] extraction failed chunk={chunk_id} "
+                                f"{_format_endpoint(config)} error={exc.__class__.__name__}: {exc}"
+                            )
+                            raise RuntimeError(f"Entity extraction failed for chunk {chunk_id}") from exc
+                        cache[chunk_id] = item
+                        handle.write(json.dumps(item, ensure_ascii=False) + "\n")
+                        handle.flush()
+                        completed += 1
+                        log(
+                            f"[index] extracted {completed}/{len(missing)} chunk={chunk_id} "
+                            f"nodes={len(item['nodes'])} edges={len(item['edges'])} "
+                            f"seconds={item.get('seconds')}"
+                        )
+                        submit_next()
     return [cache[chunk_id] for chunk_id in text_chunks if chunk_id in cache]
 
 
@@ -369,7 +422,12 @@ def _merge_graph(extraction_records: list[dict]) -> nx.Graph:
     return graph
 
 
-def _write_chunk_vectors(text_chunks: dict, index_dir: Path, config: dict):
+def _write_chunk_vectors(text_chunks: dict, index_dir: Path, config: dict, *, force_reembed: bool = False):
+    output_file = index_dir / "vdb_chunks.json"
+    if output_file.exists() and not force_reembed:
+        log(f"[index] reuse existing chunk embeddings file={output_file}")
+        return
+
     embedding_client = build_embedding_client(config)
     chunk_ids = list(text_chunks)
     contents = [text_chunks[chunk_id]["content"] for chunk_id in chunk_ids]
@@ -396,7 +454,7 @@ def _write_chunk_vectors(text_chunks: dict, index_dir: Path, config: dict):
             for index, chunk_id in enumerate(chunk_ids)
         ],
     }
-    (index_dir / "vdb_chunks.json").write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    output_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
 
 def build_index(args) -> dict:
@@ -410,6 +468,10 @@ def build_index(args) -> dict:
         config["base_url"] = args.llm_base_url
     if args.llm_api_key:
         config["api_key"] = args.llm_api_key
+    if args.llm_timeout:
+        config["timeout"] = args.llm_timeout
+    if args.llm_max_retries is not None:
+        config["max_retries"] = args.llm_max_retries
     if args.embedding_model:
         config["embedding_model"] = args.embedding_model
     if args.embedding_base_url:
@@ -431,7 +493,8 @@ def build_index(args) -> dict:
     (index_dir / "kv_store_full_docs.json").write_text(json.dumps(full_docs, ensure_ascii=False, indent=2), encoding="utf-8")
     (index_dir / "kv_store_text_chunks.json").write_text(json.dumps(text_chunks, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    _write_chunk_vectors(text_chunks, index_dir, config)
+    _preflight_chat_completion(config)
+    _write_chunk_vectors(text_chunks, index_dir, config, force_reembed=args.force_reembed)
     extraction_records = extract_graph_records(
         text_chunks,
         config=config,
@@ -470,6 +533,8 @@ def build_parser():
     parser.add_argument("--llm-model")
     parser.add_argument("--llm-base-url")
     parser.add_argument("--llm-api-key")
+    parser.add_argument("--llm-timeout", type=float)
+    parser.add_argument("--llm-max-retries", type=int)
     parser.add_argument("--embedding-model")
     parser.add_argument("--embedding-base-url")
     parser.add_argument("--embedding-api-key")
@@ -479,6 +544,7 @@ def build_parser():
     parser.add_argument("--tiktoken-model-name", default="gpt-4o-mini")
     parser.add_argument("--entity-extract-max-gleaning", type=int, default=1)
     parser.add_argument("--max-workers", type=int, default=4)
+    parser.add_argument("--force-reembed", action="store_true")
     parser.add_argument("--force-reextract", action="store_true")
     return parser
 

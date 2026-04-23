@@ -17,7 +17,7 @@ from time import perf_counter
 
 import numpy as np
 
-from .common import approx_word_count, lexical_overlap_score, normalize_text, tokenize
+from .common import approx_word_count, lexical_overlap_score, normalize_text, parse_source_ids, tokenize
 
 
 _QUERY_TASK_WORDS = {
@@ -577,6 +577,78 @@ def _emergent_goal_items(
     return [node_id for node_id, _ in scores.most_common(top_k)]
 
 
+def _goal_key(goal_item):
+    return normalize_text(goal_item).lower()
+
+
+def _new_goal_items(goal_items, searched_goal_keys):
+    return [
+        item
+        for item in goal_items
+        if _goal_key(item) and _goal_key(item) not in searched_goal_keys
+    ]
+
+
+def _top_anchor_ids_for_goal_items(
+    *,
+    goal_items,
+    chunk_retriever,
+    chunk_store,
+    chunk_graph,
+    candidate_pool_size,
+    allowed_doc_ids=None,
+):
+    """Probe where a new goal would reseed without committing a new round."""
+    top_anchor_ids = []
+    for goal_item in goal_items:
+        hits = chunk_retriever.search(
+            goal_item,
+            top_k=max(candidate_pool_size, 1),
+            allowed_doc_ids=allowed_doc_ids,
+            chunk_store=chunk_store,
+        )
+        best = None
+        best_key = None
+        for hit in hits:
+            chunk_id = hit["chunk_id"]
+            score = float(hit.get("score_norm", hit.get("dense_score_norm", hit.get("score", 0.0))))
+            score *= _degree_penalty(chunk_id, chunk_graph)
+            key = (score, -_chunk_degree(chunk_id, chunk_graph), chunk_id)
+            if best_key is None or key > best_key:
+                best_key = key
+                best = chunk_id
+        if best:
+            top_anchor_ids.append(best)
+    return list(dict.fromkeys(top_anchor_ids))
+
+
+def _emergent_connectivity_report(emergent_goal_items, graph):
+    """Summarize whether emergent KG goals are too weakly connected to pursue."""
+    items = []
+    for node_id in emergent_goal_items:
+        if graph is None or not graph.has_node(node_id):
+            items.append({"goal": node_id, "degree": 0, "source_chunk_count": 0, "weak": True})
+            continue
+        data = graph.nodes[node_id]
+        source_count = len(parse_source_ids(data.get("source_id", "")))
+        degree = int(graph.degree(node_id))
+        items.append(
+            {
+                "goal": node_id,
+                "degree": degree,
+                "source_chunk_count": source_count,
+                "weak": degree <= 1 and source_count <= 1,
+            }
+        )
+    weak_count = sum(1 for item in items if item["weak"])
+    return {
+        "items": items,
+        "weak_count": weak_count,
+        "total": len(items),
+        "all_weak": bool(items) and weak_count == len(items),
+    }
+
+
 def _trace_edges(trace, chunk_to_edges):
     edges = []
     for chunk_id in trace.get("selected_chunk_ids", []):
@@ -831,9 +903,13 @@ def run_deep_evidence_tracing(
     all_traces = []
     all_root_hits = []
     rounds = []
+    initial_query_atoms = list(dict.fromkeys(item for item in goal["query_atoms"] if normalize_text(item)))
     active_goal_items = [query] + goal["query_atoms"] + goal["target_entities"]
     active_goal_items = list(dict.fromkeys(item for item in active_goal_items if normalize_text(item)))[: max(top_k, 1)]
     used_anchor_ids = set()
+    searched_goal_keys = set()
+    stop_reason = "round_budget"
+    goal_status = "searching"
 
     for round_index in range(1, max(association_rounds, 1) + 1):
         round_goal = {
@@ -856,7 +932,10 @@ def run_deep_evidence_tracing(
         timings["anchor_seconds"] += perf_counter() - anchor_start
         new_anchors = [item for item in anchors if item["chunk_id"] not in used_anchor_ids]
         if not new_anchors:
+            stop_reason = "anchor_exhausted"
+            goal_status = "finish"
             break
+        searched_goal_keys.update(_goal_key(item) for item in retained_goal_items if _goal_key(item))
         used_anchor_ids.update(item["chunk_id"] for item in new_anchors)
         all_root_hits.extend(new_anchors)
         round_traces = []
@@ -892,9 +971,46 @@ def run_deep_evidence_tracing(
             embedding_client=embedding_client,
             top_k=top_k,
         )
-        timings["expand_seconds"] += perf_counter() - expand_start
         uncovered = [item for item in retained_goal_items if item not in covered and item != query]
-        next_goal_items = list(dict.fromkeys(uncovered + emergent))[: max(top_k, 1)]
+        all_selected_chunk_ids = list(dict.fromkeys(chunk_id for trace in all_traces for chunk_id in trace["selected_chunk_ids"]))
+        covered_initial_atoms = (
+            _covered_goal_items(
+                all_selected_chunk_ids,
+                initial_query_atoms,
+                dense_index=dense_index,
+                embedding_client=embedding_client,
+            )
+            if initial_query_atoms and all_selected_chunk_ids
+            else set()
+        )
+        initial_atoms_covered = bool(initial_query_atoms) and set(initial_query_atoms).issubset(covered_initial_atoms)
+        new_emergent_goals = _new_goal_items(emergent, searched_goal_keys)
+        emergent_connectivity = _emergent_connectivity_report(new_emergent_goals, graph)
+        next_goal_items = list(dict.fromkeys(uncovered + new_emergent_goals))[: max(top_k, 1)]
+        reseed_top_anchor_ids = _top_anchor_ids_for_goal_items(
+            goal_items=next_goal_items,
+            chunk_retriever=chunk_retriever,
+            chunk_store=chunk_store,
+            chunk_graph=chunk_graph,
+            candidate_pool_size=candidate_pool_size,
+            allowed_doc_ids=allowed_doc_ids,
+        )
+        current_final_chunk_ids = set(all_selected_chunk_ids)
+        anchor_saturated = bool(reseed_top_anchor_ids) and all(
+            chunk_id in current_final_chunk_ids or chunk_id in used_anchor_ids
+            for chunk_id in reseed_top_anchor_ids
+        )
+        round_stop_reason = None
+        if initial_atoms_covered:
+            if not next_goal_items:
+                round_stop_reason = "goal_saturated"
+            elif not uncovered and not new_emergent_goals:
+                round_stop_reason = "no_unsearched_emergent_goals"
+            elif anchor_saturated:
+                round_stop_reason = "reseed_anchor_saturated"
+            elif not uncovered and emergent_connectivity["all_weak"]:
+                round_stop_reason = "weak_emergent_connectivity"
+        timings["expand_seconds"] += perf_counter() - expand_start
         rounds.append(
             {
                 "round": round_index,
@@ -903,11 +1019,34 @@ def run_deep_evidence_tracing(
                 "trace_count": len(round_traces),
                 "selected_chunk_count": len(round_chunk_ids),
                 "covered_goal_items": sorted(covered),
+                "covered_initial_query_atoms": sorted(covered_initial_atoms),
+                "initial_query_atoms_covered": initial_atoms_covered,
                 "uncovered_goal_items": uncovered,
                 "emergent_goal_items": emergent,
+                "new_emergent_goal_items": new_emergent_goals,
+                "next_goal_items": next_goal_items,
+                "reseed_top_anchor_ids": reseed_top_anchor_ids,
+                "reseed_anchor_saturated": anchor_saturated,
+                "emergent_connectivity": emergent_connectivity,
+                "goal_status": "finish" if round_stop_reason else "searching",
+                "stop_reason": round_stop_reason,
             }
         )
+        if round_stop_reason:
+            stop_reason = round_stop_reason
+            goal_status = "finish"
+            break
         if not next_goal_items:
+            stop_reason = "goal_exhausted"
+            goal_status = "finish"
+            rounds[-1]["goal_status"] = goal_status
+            rounds[-1]["stop_reason"] = stop_reason
+            break
+        if round_index == max(association_rounds, 1):
+            stop_reason = "round_budget"
+            goal_status = "budget_stop"
+            rounds[-1]["goal_status"] = goal_status
+            rounds[-1]["stop_reason"] = stop_reason
             break
         active_goal_items = next_goal_items
 
@@ -937,6 +1076,10 @@ def run_deep_evidence_tracing(
     timings["organize_seconds"] += perf_counter() - organize_start
     return {
         "research_goal": goal,
+        "goal_status": goal_status,
+        "stop_reason": stop_reason,
+        "initial_query_atoms": initial_query_atoms,
+        "searched_goal_items": sorted(searched_goal_keys),
         "root_chunk_hits": all_root_hits,
         "root_chunk_ids": [item["chunk_id"] for item in all_root_hits],
         "root_nodes": root_nodes,

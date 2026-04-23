@@ -806,13 +806,16 @@ def _run_query_states_evidence_trace(
             f"{prefix}round={round_info['round']} goals={len(round_info['goal_items'])} "
             f"anchors={round_info['anchor_count']} traces={round_info['trace_count']} "
             f"chunks={round_info['selected_chunk_count']} "
-            f"covered={len(round_info['covered_goal_items'])} emergent={len(round_info['emergent_goal_items'])}"
+            f"covered={len(round_info['covered_goal_items'])} emergent={len(round_info['emergent_goal_items'])} "
+            f"status={round_info.get('goal_status', 'searching')} stop={round_info.get('stop_reason') or '-'}"
         )
     log(
         f"{prefix}done strategy=evidence_trace roots={len(result['root_chunk_ids'])} "
         f"final=({len(result['final_nodes'])}n/{len(result['final_edges'])}e) "
         f"groups={len(result['knowledge_groups'])} sources={prompt_payload['selected_source_chunk_count']} "
-        f"words={prompt_payload['selected_source_word_count']} time={total_elapsed:.2f}s"
+        f"words={prompt_payload['selected_source_word_count']} "
+        f"goal={result.get('goal_status', 'unknown')}/{result.get('stop_reason', '-')} "
+        f"time={total_elapsed:.2f}s"
     )
     return {
         "controller_info": {"mode": "evidence_trace", "source": "fixed"},
@@ -843,6 +846,10 @@ def _build_evidence_trace_record_from_state(query_row, controller_info, trace_re
         "promoted_root_chunks": [],
         "retrieval_strategy": "evidence_trace",
         "research_goal": trace_result["research_goal"],
+        "goal_status": trace_result.get("goal_status"),
+        "stop_reason": trace_result.get("stop_reason"),
+        "initial_query_atoms": trace_result.get("initial_query_atoms", []),
+        "searched_goal_items": trace_result.get("searched_goal_items", []),
         "evidence_traces": trace_result["root_traces"],
         "theme_selected_chunks": {},
         "chunk_roles": [
@@ -873,6 +880,8 @@ def _build_evidence_trace_record_from_state(query_row, controller_info, trace_re
             "top_root_node_count": 0,
             "top_root_edge_count": 0,
             "association_round_count": len(trace_result["rounds"]),
+            "goal_status": trace_result.get("goal_status"),
+            "stop_reason": trace_result.get("stop_reason"),
             "structural_path_count": len(trace_result["root_traces"]),
             "structural_chunk_bridge_count": 0,
             "structural_added_node_count": 0,

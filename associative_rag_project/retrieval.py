@@ -116,6 +116,14 @@ class DenseChunkIndex:
             return []
         allowed_chunk_ids = set(allowed_chunk_ids or [])
         query_vector = np.asarray(query_vector, dtype=np.float32)
+        expected_dim = int(self.normalized_matrix.shape[1])
+        actual_dim = int(query_vector.shape[-1]) if query_vector.ndim else 0
+        if actual_dim != expected_dim:
+            raise ValueError(
+                "Dense query embedding dimension does not match the chunk index: "
+                f"query_dim={actual_dim}, index_dim={expected_dim}. "
+                "Rebuild the LightRAG index with the same embedding model and embedding_dim."
+            )
         query_vector = query_vector / max(np.linalg.norm(query_vector), 1e-12)
         if allowed_chunk_ids:
             candidate_indices = [index for index, chunk_id in enumerate(self.chunk_ids) if chunk_id in allowed_chunk_ids]

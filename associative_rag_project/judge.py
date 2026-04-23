@@ -184,13 +184,6 @@ Baseline answer:
 
 CLAIM_SUPPORT_PROMPT = """For each claim below, decide whether the retrieved corpus snippets support it.
 
-CLAIM_SCORE_BY_LABEL = {{
-    "supported": 1.0,
-    "partially_supported": 0.5,
-    "insufficient_evidence": 0.0,
-    "contradicted": 0.0,
-    "verification_error": 0.0,
-}}
 Rules:
 - Use only the provided snippets.
 - "supported" means the snippets directly support the claim.
@@ -266,7 +259,6 @@ def _claim_support_report(groundedness):
         return json.dumps(
             {
                 "claim_count": 0,
-                "supported_equivalent_claim_count": 0.0,
                 "supported_claim_ratio": 0.0,
                 "label_counts": {},
                 "claims": [],
@@ -284,7 +276,6 @@ def _claim_support_report(groundedness):
         )
     report = {
         "claim_count": groundedness.get("claim_count", len(claims)),
-        "supported_equivalent_claim_count": groundedness.get("supported_equivalent_claim_count", 0.0),
         "supported_claim_ratio": groundedness.get("supported_claim_ratio", 0.0),
         "label_counts": groundedness.get("label_counts", {}),
         "claims": claims,
@@ -427,14 +418,6 @@ CLAIM_DIAGNOSTIC_TABLE_METRICS = [
     "Claim Corpus Support",
 ]
 
-CLAIM_SCORE_BY_LABEL = {
-    "supported": 1.0,
-    "partially_supported": 0.5,
-    "insufficient_evidence": 0.0,
-    "contradicted": 0.0,
-    "verification_error": 0.0,
-}
-
 DEFAULT_CLAIM_RETRIEVAL_TOP_K = 5
 
 
@@ -504,7 +487,13 @@ def load_judge_corpus_resources(corpus_dir):
 
 def _normalize_claim_label(raw_value):
     value = (raw_value or "").strip().lower()
-    if value in CLAIM_SCORE_BY_LABEL:
+    if value in {
+        "supported",
+        "partially_supported",
+        "insufficient_evidence",
+        "contradicted",
+        "verification_error",
+    }:
         return value
     if ("support" in value and value.startswith("un")) or "not supported" in value:
         return "insufficient_evidence"
@@ -862,11 +851,7 @@ def _empty_answer_groundedness(claim_count=0, extraction_failed_or_empty=False):
         "claims": [],
         "claim_count": claim_count,
         "supported_claim_count": 0,
-        "supported_equivalent_claim_count": 0.0,
         "supported_claim_ratio": 0.0,
-        "weighted_groundedness": 0.0,
-        "score": 0.0,
-        "weighted_score": 0.0,
         "label_counts": {
             "supported": 0,
             "partially_supported": 0,
@@ -885,16 +870,12 @@ def _summarize_groundedness_assessments(assessments, extracted_claim_count=0):
         return _empty_answer_groundedness(claim_count=0, extraction_failed_or_empty=True)
 
     counts = Counter()
-    supported_equivalent = 0.0
-
     for item in assessments:
         label = item["label"]
         counts[label] += 1
-        supported_equivalent += CLAIM_SCORE_BY_LABEL.get(label, 0.0)
 
     claim_count = len(assessments)
-    supported_claim_ratio = supported_equivalent / max(claim_count, 1)
-    weighted_groundedness = supported_equivalent * supported_claim_ratio
+    supported_claim_ratio = counts["supported"] / max(claim_count, 1)
     label_counts = {
         "supported": counts["supported"],
         "partially_supported": counts["partially_supported"],
@@ -907,11 +888,7 @@ def _summarize_groundedness_assessments(assessments, extracted_claim_count=0):
         "claims": assessments,
         "claim_count": claim_count,
         "supported_claim_count": counts["supported"],
-        "supported_equivalent_claim_count": round(supported_equivalent, 4),
         "supported_claim_ratio": round(supported_claim_ratio, 4),
-        "weighted_groundedness": round(weighted_groundedness, 4),
-        "score": round(supported_claim_ratio, 4),
-        "weighted_score": round(weighted_groundedness, 4),
         "label_counts": label_counts,
         "supported": counts["supported"],
         "partially_supported": counts["partially_supported"],
@@ -979,21 +956,9 @@ def assess_pair_groundedness(query, candidate_answer, baseline_answer, llm_clien
 
 
 def _groundedness_decision(candidate_groundedness, baseline_groundedness):
-    candidate_value = float(candidate_groundedness.get("weighted_groundedness", 0.0))
-    baseline_value = float(baseline_groundedness.get("weighted_groundedness", 0.0))
-    diff = candidate_value - baseline_value
-    if diff > 0.5:
-        winner = "candidate"
-    elif diff < -0.5:
-        winner = "baseline"
-    else:
-        winner = "tie"
     return {
-        "winner": winner,
-        "candidate_weighted_groundedness": round(candidate_value, 4),
-        "baseline_weighted_groundedness": round(baseline_value, 4),
-        "difference": round(diff, 4),
-        "rule": "compare supported claim volume adjusted by supported-claim ratio; half-claim margin ties",
+        "winner": "tie",
+        "rule": "diagnostic only: claim labels are reported as counts and are not converted into a heuristic winner",
     }
 
 
@@ -1003,9 +968,10 @@ def _empty_groundedness_accumulator():
             "answer_count": 0,
             "claim_count": 0,
             "supported_claim_count": 0,
-            "supported_equivalent_claim_count": 0.0,
-            "weighted_groundedness": 0.0,
-            "supported_claim_ratio_sum": 0.0,
+            "partially_supported_claim_count": 0,
+            "insufficient_evidence_claim_count": 0,
+            "contradicted_claim_count": 0,
+            "verification_error_claim_count": 0,
         }
     )
 
@@ -1014,27 +980,26 @@ def _accumulate_groundedness(accumulator, groundedness):
     accumulator["answer_count"] += 1
     accumulator["claim_count"] += int(groundedness.get("claim_count", 0) or 0)
     accumulator["supported_claim_count"] += int(groundedness.get("supported_claim_count", 0) or 0)
-    accumulator["supported_equivalent_claim_count"] += float(
-        groundedness.get("supported_equivalent_claim_count", 0.0) or 0.0
-    )
-    accumulator["weighted_groundedness"] += float(groundedness.get("weighted_groundedness", 0.0) or 0.0)
-    accumulator["supported_claim_ratio_sum"] += float(groundedness.get("supported_claim_ratio", 0.0) or 0.0)
+    accumulator["partially_supported_claim_count"] += int(groundedness.get("partially_supported", 0) or 0)
+    accumulator["insufficient_evidence_claim_count"] += int(groundedness.get("insufficient_evidence", 0) or 0)
+    accumulator["contradicted_claim_count"] += int(groundedness.get("contradicted", 0) or 0)
+    accumulator["verification_error_claim_count"] += int(groundedness.get("verification_error", 0) or 0)
 
 
 def _summarize_groundedness_accumulator(accumulator):
     answer_count = max(int(accumulator["answer_count"]), 1)
     claim_count = int(accumulator["claim_count"])
-    supported_equivalent = float(accumulator["supported_equivalent_claim_count"])
     return {
         "answer_count": int(accumulator["answer_count"]),
         "claim_count": claim_count,
         "supported_claim_count": int(accumulator["supported_claim_count"]),
-        "supported_equivalent_claim_count": round(supported_equivalent, 4),
-        "supported_claim_ratio": round(supported_equivalent / max(claim_count, 1), 4),
+        "partially_supported_claim_count": int(accumulator["partially_supported_claim_count"]),
+        "insufficient_evidence_claim_count": int(accumulator["insufficient_evidence_claim_count"]),
+        "contradicted_claim_count": int(accumulator["contradicted_claim_count"]),
+        "verification_error_claim_count": int(accumulator["verification_error_claim_count"]),
+        "supported_claim_ratio": round(float(accumulator["supported_claim_count"]) / max(claim_count, 1), 4),
         "average_claim_count": round(claim_count / answer_count, 4),
         "average_supported_claim_count": round(float(accumulator["supported_claim_count"]) / answer_count, 4),
-        "average_weighted_groundedness": round(float(accumulator["weighted_groundedness"]) / answer_count, 4),
-        "average_supported_claim_ratio": round(float(accumulator["supported_claim_ratio_sum"]) / answer_count, 4),
     }
 
 

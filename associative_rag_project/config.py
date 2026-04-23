@@ -48,6 +48,11 @@ def load_llm_config():
     config.setdefault("embedding_model", os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small"))
     config.setdefault("embedding_base_url", os.getenv("OPENAI_EMBEDDING_BASE_URL", config.get("base_url")))
     config.setdefault("embedding_api_key", os.getenv("OPENAI_EMBEDDING_API_KEY", config.get("api_key")))
+    if "embedding_dim" not in config:
+        raw_dim = os.getenv("OPENAI_EMBEDDING_DIM") or os.getenv("EMBEDDING_DIM")
+        config["embedding_dim"] = int(raw_dim) if raw_dim else 1536
+    else:
+        config["embedding_dim"] = int(config["embedding_dim"])
     config.setdefault("local_embedding_model", os.getenv("LOCAL_EMBEDDING_MODEL", "BAAI/bge-m3"))
     config.setdefault("local_embedding_device", os.getenv("LOCAL_EMBEDDING_DEVICE", "auto"))
     config.setdefault("local_embedding_batch_size", _env_int("LOCAL_EMBEDDING_BATCH_SIZE", 16))

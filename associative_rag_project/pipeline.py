@@ -28,6 +28,7 @@ from .data import (
 )
 from .config import load_llm_config
 from .embedding_client import build_embedding_client
+from .evidence_trace import build_evidence_chunk_graph, run_deep_evidence_tracing
 from .logging_utils import log, shorten
 from .llm_client import generate_one_answer_record
 from .organization import (
@@ -245,6 +246,8 @@ def _load_runtime_resources(corpus_dir, cfg):
     corpus_dir = Path(corpus_dir)
     index_dir = resolve_corpus_index_dir(corpus_dir)
     log(f"[pipeline] loading corpus={corpus_dir} index={index_dir}")
+    if cfg.get("retrieval_strategy", "association") == "evidence_trace" and cfg.get("retrieval_mode") != "dense":
+        raise ValueError("Deep Evidence Tracing requires --retrieval-mode dense; BM25/hybrid alternatives are disabled.")
     graph, chunk_store, index_dir = load_graph_corpus(corpus_dir)
     log(f"[pipeline] graph nodes={graph.number_of_nodes()} edges={graph.number_of_edges()} chunks={len(chunk_store)}")
     bm25_index = BM25Index.build(chunk_store)
@@ -271,6 +274,11 @@ def _load_runtime_resources(corpus_dir, cfg):
             f"rows={len(dense_index.chunk_ids) if dense_index else 0} "
             f"provider={llm_cfg.get('embedding_provider', 'openai_compatible')}"
         )
+    if cfg.get("retrieval_strategy", "association") == "evidence_trace":
+        if dense_index is None or dense_index.normalized_matrix.size == 0:
+            raise ValueError("Deep Evidence Tracing requires a non-empty vdb_chunks.json dense index.")
+        if embedding_client is None:
+            raise ValueError("Deep Evidence Tracing requires an embedding client.")
     chunk_retriever = HybridChunkRetriever(
         bm25_index=bm25_index,
         dense_index=dense_index,
@@ -282,6 +290,13 @@ def _load_runtime_resources(corpus_dir, cfg):
     chunk_ids = list(chunk_store.keys())
     chunk_to_nodes, chunk_to_edges, node_to_chunks, edge_to_chunks = build_chunk_mappings(graph, chunk_ids)
     chunk_neighbors = build_chunk_neighborhoods(chunk_store, radius=1)
+    chunk_graph = build_evidence_chunk_graph(
+        chunk_store=chunk_store,
+        chunk_to_nodes=chunk_to_nodes,
+        node_to_chunks=node_to_chunks,
+        chunk_neighbors=chunk_neighbors,
+    )
+    chunk_graph_edge_count = sum(len(neighbors) for neighbors in chunk_graph.values()) // 2
     keyword_index = build_graph_keyword_index(
         graph=graph,
         chunk_to_nodes=chunk_to_nodes,
@@ -293,17 +308,21 @@ def _load_runtime_resources(corpus_dir, cfg):
         f"vocab={len(keyword_index.vocabulary)} ignored={len(keyword_index.ignored_terms)} "
         f"df_threshold={keyword_index.ignored_threshold}"
     )
+    log(f"[pipeline] chunk-graph nodes={len(chunk_graph)} edges={chunk_graph_edge_count}")
     return {
         "corpus_dir": corpus_dir,
         "index_dir": index_dir,
         "graph": graph,
         "chunk_store": chunk_store,
+        "dense_index": dense_index,
+        "embedding_client": embedding_client,
         "chunk_retriever": chunk_retriever,
         "chunk_to_nodes": chunk_to_nodes,
         "chunk_to_edges": chunk_to_edges,
         "node_to_chunks": node_to_chunks,
         "edge_to_chunks": edge_to_chunks,
         "chunk_neighbors": chunk_neighbors,
+        "chunk_graph": chunk_graph,
         "keyword_index": keyword_index,
     }
 
@@ -313,7 +332,9 @@ def _result_paths(corpus_dir, output_dir, cfg, limit_groups):
     output_dir.mkdir(parents=True, exist_ok=True)
     corpus_name = infer_corpus_name(corpus_dir)
     limit_suffix = f"_limit{limit_groups}" if limit_groups is not None else ""
-    stem = f"{corpus_name}_top{cfg['top_chunks']}_hop{cfg['max_hop']}_assoc_project{limit_suffix}"
+    strategy = cfg.get("retrieval_strategy", "association")
+    method_tag = "trace_project" if strategy == "evidence_trace" else "assoc_project"
+    stem = f"{corpus_name}_top{cfg['top_chunks']}_hop{cfg['max_hop']}_{method_tag}{limit_suffix}"
     return {
         "output_dir": output_dir,
         "stem": stem,
@@ -737,6 +758,166 @@ def _run_query_states(
     }
 
 
+def _run_query_states_evidence_trace(
+    *,
+    query_row,
+    graph,
+    chunk_store,
+    chunk_retriever,
+    dense_index,
+    embedding_client,
+    chunk_to_nodes,
+    chunk_to_edges,
+    node_to_chunks,
+    cfg,
+    query_index=None,
+    total_queries=None,
+):
+    """Run the simplified Deep Evidence Tracing path for one query."""
+    prefix = f"[query {query_index}/{total_queries}] " if query_index is not None and total_queries is not None else ""
+    log(f"{prefix}start {query_row['group_id']} :: {query_row['query']}")
+    query_start = _online_stage_clock()
+    allowed_doc_ids = _allowed_doc_ids_for_query(query_row, cfg)
+
+    trace_start = _online_stage_clock()
+    result = run_deep_evidence_tracing(
+        query=query_row["query"],
+        graph=graph,
+        chunk_store=chunk_store,
+        chunk_retriever=chunk_retriever,
+        dense_index=dense_index,
+        embedding_client=embedding_client,
+        chunk_to_nodes=chunk_to_nodes,
+        chunk_to_edges=chunk_to_edges,
+        node_to_chunks=node_to_chunks,
+        chunk_graph=cfg["chunk_graph"],
+        top_k=cfg["top_chunks"],
+        candidate_pool_size=cfg.get("candidate_pool_size", 30),
+        association_rounds=cfg.get("association_rounds", 2),
+        max_steps=cfg.get("max_hop", 4),
+        frontier_edge_top_k=cfg.get("frontier_edge_top_k", cfg.get("semantic_edge_budget", 20)),
+        group_limit=cfg.get("group_limit", 8),
+        max_source_chunks=cfg.get("max_source_chunks", 18),
+        max_source_word_budget=cfg.get("max_source_word_budget", 10000),
+        allowed_doc_ids=allowed_doc_ids,
+        query_row=query_row,
+    )
+    trace_elapsed = _online_stage_clock() - trace_start
+    stage_timings = result.get("timings", {})
+    prompt_payload = result["prompt_payload"]
+    total_elapsed = _online_stage_clock() - query_start
+    for round_info in result["rounds"]:
+        log(
+            f"{prefix}round={round_info['round']} goals={len(round_info['goal_items'])} "
+            f"anchors={round_info['anchor_count']} traces={round_info['trace_count']} "
+            f"chunks={round_info['selected_chunk_count']} "
+            f"covered={len(round_info['covered_goal_items'])} emergent={len(round_info['emergent_goal_items'])}"
+        )
+    log(
+        f"{prefix}done strategy=evidence_trace roots={len(result['root_chunk_ids'])} "
+        f"final=({len(result['final_nodes'])}n/{len(result['final_edges'])}e) "
+        f"groups={len(result['knowledge_groups'])} sources={prompt_payload['selected_source_chunk_count']} "
+        f"words={prompt_payload['selected_source_word_count']} time={total_elapsed:.2f}s"
+    )
+    return {
+        "controller_info": {"mode": "evidence_trace", "source": "fixed"},
+        "trace_result": result,
+        "timings": {
+            "anchor_seconds": stage_timings.get("anchor_seconds", trace_elapsed),
+            "expand_seconds": stage_timings.get("expand_seconds", 0.0),
+            "organize_seconds": stage_timings.get("organize_seconds", 0.0),
+            "query_total_seconds": total_elapsed,
+        },
+        "prefix": prefix,
+    }
+
+
+def _build_evidence_trace_record_from_state(query_row, controller_info, trace_result, timings):
+    prompt_payload = trace_result["prompt_payload"]
+    prompt_context = prompt_payload["context"]
+    prompt_word_count = len(prompt_context.split())
+    prompt_token_count = _true_token_count(prompt_context)
+    root_chunk_hits = trace_result["root_chunk_hits"]
+    final_chunks = trace_result["final_chunk_ids"]
+    return {
+        **query_row,
+        "candidate_root_chunks": root_chunk_hits,
+        "root_chunks": root_chunk_hits,
+        "primary_root_chunks": root_chunk_hits,
+        "diversity_root_chunks": [],
+        "promoted_root_chunks": [],
+        "retrieval_strategy": "evidence_trace",
+        "research_goal": trace_result["research_goal"],
+        "evidence_traces": trace_result["root_traces"],
+        "theme_selected_chunks": {},
+        "chunk_roles": [
+            {
+                "chunk_id": chunk_id,
+                "roles": ["trace-root"] if chunk_id in set(trace_result["root_chunk_ids"]) else ["trace-evidence"],
+                "linked_groups": [
+                    group["group_id"]
+                    for group in trace_result["knowledge_groups"]
+                    if chunk_id in group.get("supporting_chunk_ids", [])
+                ][:6],
+            }
+            for chunk_id in final_chunks
+        ],
+        "organization_mode": "evidence_trace",
+        "stats": {
+            "initial_root_chunk_count": len(root_chunk_hits),
+            "promoted_root_chunk_count": 0,
+            "root_chunk_count": len(root_chunk_hits),
+            "primary_root_chunk_count": len(root_chunk_hits),
+            "diversity_root_chunk_count": 0,
+            "initial_root_basin_count": len(root_chunk_hits),
+            "root_basin_count": len(root_chunk_hits),
+            "anchor_root_top_k": len(root_chunk_hits),
+            "expand_max_hop": max((len(trace.get("selected_chunk_ids", [])) for trace in trace_result["root_traces"]), default=0),
+            "root_node_count": len(trace_result.get("root_nodes", [])),
+            "root_edge_count": len(trace_result.get("root_edges", [])),
+            "top_root_node_count": 0,
+            "top_root_edge_count": 0,
+            "association_round_count": len(trace_result["rounds"]),
+            "structural_path_count": len(trace_result["root_traces"]),
+            "structural_chunk_bridge_count": 0,
+            "structural_added_node_count": 0,
+            "structural_added_edge_count": 0,
+            "semantic_added_node_count": len(trace_result["final_nodes"]),
+            "semantic_added_edge_count": len(trace_result["final_edges"]),
+            "semantic_chunk_coverage_count": len(final_chunks),
+            "final_node_count": len(trace_result["final_nodes"]),
+            "final_edge_count": len(trace_result["final_edges"]),
+            "final_chunk_count": len(final_chunks),
+            "facet_group_count": len(trace_result["knowledge_groups"]),
+            "knowledge_group_count": len(trace_result["knowledge_groups"]),
+            "candidate_point_count": 0,
+            "selected_source_chunk_count": prompt_payload["selected_source_chunk_count"],
+            "selected_source_word_count": prompt_payload["selected_source_word_count"],
+            "prompt_context_word_count": prompt_word_count,
+            "prompt_context_token_estimate": prompt_token_count,
+            "prompt_context_token_count": prompt_token_count,
+            "prompt_context_char_count": len(prompt_context),
+            "anchor_seconds": round(timings["anchor_seconds"], 4),
+            "expand_seconds": round(timings["expand_seconds"], 4),
+            "organize_seconds": round(timings["organize_seconds"], 4),
+            "query_total_seconds": round(timings["query_total_seconds"], 4),
+        },
+        "top_root_nodes": [],
+        "top_root_edges": [],
+        "rounds": trace_result["rounds"],
+        "structural_association": {"selected_paths": []},
+        "semantic_association": {
+            "selected_edges": [{"edge": edge_id} for edge_id in trace_result["final_edges"]],
+            "selected_nodes": [{"id": node_id} for node_id in trace_result["final_nodes"]],
+        },
+        "candidate_points": [],
+        "facet_groups": trace_result["knowledge_groups"],
+        "knowledge_groups": trace_result["knowledge_groups"],
+        "prompt_context": prompt_context,
+        "controller_info": controller_info,
+    }
+
+
 def _build_query_record_from_states(query_row, controller_info, anchor_state, expand_state, organize_state, timings):
     expansion = expand_state["expansion"]
     prompt_payload = organize_state["prompt_payload"]
@@ -850,35 +1031,52 @@ def run_query_online(
     对单条问题执行线上检索和答案生成全流程。
     """
     query_wall_start = perf_counter()
-    query_state = _run_query_states(
-        query_row=query_row,
-        graph=graph,
-        chunk_store=chunk_store,
-        chunk_retriever=chunk_retriever,
-        chunk_to_nodes=chunk_to_nodes,
-        chunk_to_edges=chunk_to_edges,
-        node_to_chunks=node_to_chunks,
-        edge_to_chunks=edge_to_chunks,
-        keyword_index=keyword_index,
-        cfg=cfg,
-        query_index=query_index,
-        total_queries=total_queries,
-    )
-    controller_info = query_state["controller_info"]
-    anchor_state = query_state["anchor_state"]
-    expand_state = query_state["expand_state"]
-    organize_state = query_state["organize_state"]
-    timings = dict(query_state["timings"])
-    prefix = query_state["prefix"]
-
-    retrieval_record = _build_query_record_from_states(
-        query_row,
-        controller_info,
-        anchor_state,
-        expand_state,
-        organize_state,
-        timings,
-    )
+    if cfg.get("retrieval_strategy", "association") == "evidence_trace":
+        query_state = _run_query_states_evidence_trace(
+            query_row=query_row,
+            graph=graph,
+            chunk_store=chunk_store,
+            chunk_retriever=chunk_retriever,
+            dense_index=cfg.get("dense_index"),
+            embedding_client=cfg.get("embedding_client"),
+            chunk_to_nodes=chunk_to_nodes,
+            chunk_to_edges=chunk_to_edges,
+            node_to_chunks=node_to_chunks,
+            cfg=cfg,
+            query_index=query_index,
+            total_queries=total_queries,
+        )
+        retrieval_record = _build_evidence_trace_record_from_state(
+            query_row,
+            query_state["controller_info"],
+            query_state["trace_result"],
+            dict(query_state["timings"]),
+        )
+        prefix = query_state["prefix"]
+    else:
+        query_state = _run_query_states(
+            query_row=query_row,
+            graph=graph,
+            chunk_store=chunk_store,
+            chunk_retriever=chunk_retriever,
+            chunk_to_nodes=chunk_to_nodes,
+            chunk_to_edges=chunk_to_edges,
+            node_to_chunks=node_to_chunks,
+            edge_to_chunks=edge_to_chunks,
+            keyword_index=keyword_index,
+            cfg=cfg,
+            query_index=query_index,
+            total_queries=total_queries,
+        )
+        retrieval_record = _build_query_record_from_states(
+            query_row,
+            query_state["controller_info"],
+            query_state["anchor_state"],
+            query_state["expand_state"],
+            query_state["organize_state"],
+            dict(query_state["timings"]),
+        )
+        prefix = query_state["prefix"]
     retrieval_record["task_mode"] = cfg.get("task_mode", "qfs")
     retrieval_record["context_constraint"] = cfg.get("context_constraint", "none")
     answer_start = perf_counter()
@@ -932,28 +1130,50 @@ def run_query(
     chunk retrieval -> diverse root selection -> grounded graph association ->
     query-aware organization -> final prompt context assembly
     """
-    query_state = _run_query_states(
-        query_row=query_row,
-        graph=graph,
-        chunk_store=chunk_store,
-        chunk_retriever=chunk_retriever,
-        chunk_to_nodes=chunk_to_nodes,
-        chunk_to_edges=chunk_to_edges,
-        node_to_chunks=node_to_chunks,
-        edge_to_chunks=edge_to_chunks,
-        keyword_index=keyword_index,
-        cfg=cfg,
-        query_index=query_index,
-        total_queries=total_queries,
-    )
-    record = _build_query_record_from_states(
-        query_row,
-        query_state["controller_info"],
-        query_state["anchor_state"],
-        query_state["expand_state"],
-        query_state["organize_state"],
-        query_state["timings"],
-    )
+    if cfg.get("retrieval_strategy", "association") == "evidence_trace":
+        query_state = _run_query_states_evidence_trace(
+            query_row=query_row,
+            graph=graph,
+            chunk_store=chunk_store,
+            chunk_retriever=chunk_retriever,
+            dense_index=cfg.get("dense_index"),
+            embedding_client=cfg.get("embedding_client"),
+            chunk_to_nodes=chunk_to_nodes,
+            chunk_to_edges=chunk_to_edges,
+            node_to_chunks=node_to_chunks,
+            cfg=cfg,
+            query_index=query_index,
+            total_queries=total_queries,
+        )
+        record = _build_evidence_trace_record_from_state(
+            query_row,
+            query_state["controller_info"],
+            query_state["trace_result"],
+            query_state["timings"],
+        )
+    else:
+        query_state = _run_query_states(
+            query_row=query_row,
+            graph=graph,
+            chunk_store=chunk_store,
+            chunk_retriever=chunk_retriever,
+            chunk_to_nodes=chunk_to_nodes,
+            chunk_to_edges=chunk_to_edges,
+            node_to_chunks=node_to_chunks,
+            edge_to_chunks=edge_to_chunks,
+            keyword_index=keyword_index,
+            cfg=cfg,
+            query_index=query_index,
+            total_queries=total_queries,
+        )
+        record = _build_query_record_from_states(
+            query_row,
+            query_state["controller_info"],
+            query_state["anchor_state"],
+            query_state["expand_state"],
+            query_state["organize_state"],
+            query_state["timings"],
+        )
     record["task_mode"] = cfg.get("task_mode", "qfs")
     record["context_constraint"] = cfg.get("context_constraint", "none")
     return record
@@ -990,7 +1210,13 @@ def retrieve_corpus_queries(
         limit_groups=limit_groups,
     )
     log(f"[retrieve] queries={len(query_rows)} retrieval_mode={cfg['retrieval_mode']}")
-    online_cfg = {**cfg, "chunk_neighbors": runtime["chunk_neighbors"]}
+    online_cfg = {
+        **cfg,
+        "chunk_neighbors": runtime["chunk_neighbors"],
+        "chunk_graph": runtime["chunk_graph"],
+        "dense_index": runtime["dense_index"],
+        "embedding_client": runtime["embedding_client"],
+    }
     results = [
         run_query(
             query_row=row,
@@ -1058,7 +1284,13 @@ def run_corpus_queries_online(
         f"[run-online] queries={len(query_rows)} retrieval_mode={cfg['retrieval_mode']} "
         f"workers={max_workers}"
     )
-    online_cfg = {**cfg, "chunk_neighbors": runtime["chunk_neighbors"]}
+    online_cfg = {
+        **cfg,
+        "chunk_neighbors": runtime["chunk_neighbors"],
+        "chunk_graph": runtime["chunk_graph"],
+        "dense_index": runtime["dense_index"],
+        "embedding_client": runtime["embedding_client"],
+    }
     retrieval_records = [None] * len(query_rows)
     answer_records = [None] * len(query_rows)
 

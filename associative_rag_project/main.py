@@ -37,6 +37,12 @@ def build_parser():
     common.add_argument("--chunk-candidate-multiplier", type=int, default=3)
     common.add_argument("--candidate-pool-size", type=int, default=30)
     common.add_argument("--retrieval-mode", choices=["bm25", "dense", "hybrid"], default="dense")
+    common.add_argument(
+        "--retrieval-strategy",
+        choices=["association", "evidence_trace"],
+        default="evidence_trace",
+        help="association runs the legacy bridge/support pipeline; evidence_trace runs the deep evidence tracing prototype.",
+    )
     common.add_argument("--dense-weight", type=float, default=0.75)
     common.add_argument("--bm25-weight", type=float, default=0.25)
     common.add_argument(
@@ -64,6 +70,12 @@ def build_parser():
     common.add_argument("--semantic-edge-min-score", type=float, default=0.03)
     common.add_argument("--semantic-node-min-score", type=float, default=0.03)
     common.add_argument("--association-rounds", type=int, default=2)
+    common.add_argument(
+        "--frontier-edge-top-k",
+        type=int,
+        default=20,
+        help="For evidence_trace, prune each trace frontier to the top shared-node links.",
+    )
     common.add_argument("--group-limit", type=int, default=8)
     common.add_argument("--max-source-chunks", type=int, default=18)
     common.add_argument("--max-source-word-budget", type=int, default=10000)
@@ -132,6 +144,7 @@ def retrieval_config_from_args(args):
         "chunk_candidate_multiplier": args.chunk_candidate_multiplier,
         "candidate_pool_size": args.candidate_pool_size,
         "retrieval_mode": args.retrieval_mode,
+        "retrieval_strategy": args.retrieval_strategy,
         "dense_weight": args.dense_weight,
         "bm25_weight": args.bm25_weight,
         "embedding_provider": args.embedding_provider,
@@ -152,6 +165,7 @@ def retrieval_config_from_args(args):
         "semantic_edge_min_score": args.semantic_edge_min_score,
         "semantic_node_min_score": args.semantic_node_min_score,
         "association_rounds": args.association_rounds,
+        "frontier_edge_top_k": args.frontier_edge_top_k,
         "group_limit": args.group_limit,
         "max_source_chunks": args.max_source_chunks,
         "max_source_word_budget": args.max_source_word_budget,

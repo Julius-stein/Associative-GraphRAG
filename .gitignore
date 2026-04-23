@@ -57,3 +57,8 @@ notes/
 llm_config.py
 *.xlsx
 tools/
+!tools/
+tools/*
+!tools/build_assoc_index.py
+!tools/prepare_multihopqa_datasets.py
+!tools/evaluate_multihopqa_official.py
